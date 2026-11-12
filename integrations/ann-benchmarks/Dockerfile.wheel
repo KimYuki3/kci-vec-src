@@ -1,0 +1,9 @@
+FROM ann-benchmarks
+
+# (2026-11-09) kci_vec from the distributed wheel (no sources): for third parties who want to rerun the numbers.
+# Put kci_vec-<version>-py3-none-manylinux_2_35_x86_64.whl next to this file (ann_benchmarks/algorithms/kci_vec/),
+# rename this file to Dockerfile, then `python install.py --algorithm kci_vec` as for any algorithm. The wheel holds
+# an AVX-512 and an AVX2 library (cosine only); module.py finds it through the kci_vec package.
+COPY ann_benchmarks/algorithms/kci_vec/kci_vec-*.whl /tmp/
+RUN pip3 install /tmp/kci_vec-*.whl && \
+    python3 -c "import kci_vec, ctypes; p = kci_vec._find_lib(); ctypes.CDLL(p); print('kci_vec wheel OK:', p)"

@@ -1,0 +1,116 @@
+float:
+  # kci_vec is a cosine engine; euclidean (2026-11-08) goes through kci_vec_new_l2 (module.py).
+  # One setting per run group: ann-benchmarks passes each dict in arg_groups as a
+  # separate constructor argument (2026-11-01: two dicts in one group made
+  # KciVec() fail with "takes 3 positional arguments but 4 were given").
+  angular:
+    # int8 HNSW graph. rerank: 1 = re-score the ef-sized int8 shortlist in float.
+    - base_args: ['@metric']
+      constructor: KciVec
+      disabled: false
+      docker_tag: ann-benchmarks-kci_vec
+      module: ann_benchmarks.algorithms.kci_vec
+      name: kci_vec
+      run_groups:
+        int8-M16:
+          arg_groups: [{M: 16, efConstruction: 200, rerank: 0}]
+          args: {}
+          query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
+        int8-M32:
+          arg_groups: [{M: 32, efConstruction: 400, rerank: 0}]
+          args: {}
+          query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
+        int8-rerank-M16:
+          arg_groups: [{M: 16, efConstruction: 200, rerank: 1}]
+          args: {}
+          query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
+        int8-rerank-M32:
+          arg_groups: [{M: 32, efConstruction: 400, rerank: 1}]
+          args: {}
+          query_args: [[10, 20, 40, 80, 120, 200, 400, 800]]
+        # (2026-11-09) exploration radius (kci_vec_searcher_set_eps): query args = ef (result set) x eps
+        int8-eps-M16:
+          arg_groups: [{M: 16, efConstruction: 200, rerank: 0}]
+          args: {}
+          query_args: [[10, 20, 30], [0.08, 0.1, 0.12, 0.15, 0.18, 0.2, 0.25]]
+        int8-eps-rerank-M16:
+          arg_groups: [{M: 16, efConstruction: 200, rerank: 1}]
+          args: {}
+          query_args: [[10, 20, 30], [0.08, 0.1, 0.12, 0.15, 0.18, 0.2, 0.25]]
+        # (2026-11-10) quantized graph (kci_vec_build_qg; qg = dims per 4-bit code): ef (result set) x eps, ef larger than
+        # above because the ef-th best is a 4-bit estimate
+        int8-qg-rerank-M16:
+          arg_groups: [{M: 16, efConstruction: 200, rerank: 1, qg: 1}]
+          args: {}
+          query_args: [[20, 30, 50], [0.1, 0.12, 0.15, 0.18, 0.2, 0.25]]
+        int8-qg-M16:
+          arg_groups: [{M: 16, efConstruction: 200, rerank: 0, qg: 1}]
+          args: {}
+          query_args: [[20, 30, 50], [0.1, 0.12, 0.15, 0.18, 0.2, 0.25]]
+        # (2026-11-10) denser layer 0 (M 32 -> 64 neighbours a hop, 2 blocks): fewer hops, +40 % at recall 0.90-0.95 and 2x at 0.99
+        # on the 9950X (own harness, efC 200); eps smaller than with M 16
+        int8-qg-rerank-M32:
+          arg_groups: [{M: 32, efConstruction: 400, rerank: 1, qg: 1}]
+          args: {}
+          query_args: [[20, 30, 50], [0.05, 0.08, 0.1, 0.12, 0.15, 0.2]]
+    # partitioned lists + 4-bit table lookup (2026-11-01). query args: nprobe x rerank.
+    - base_args: ['@metric']
+      constructor: KciVecIvf
+      disabled: false
+      docker_tag: ann-benchmarks-kci_vec
+      module: ann_benchmarks.algorithms.kci_vec
+      name: kci_vec-ivf
+      run_groups:
+        ivf-1024:
+          arg_groups: [{nlist: 1024}]
+          args: {}
+          query_args: [[4, 8, 16, 32, 64, 128, 256], [50, 100, 200, 400, 800]]
+        ivf-2048:
+          arg_groups: [{nlist: 2048}]
+          args: {}
+          query_args: [[8, 16, 32, 64, 128, 256, 512], [50, 100, 200, 400, 800]]
+        ivf-4096:
+          arg_groups: [{nlist: 4096}]
+          args: {}
+          query_args: [[16, 32, 64, 128, 256, 512, 1024], [50, 100, 200, 400, 800]]
+        # (2026-11-08) third query arg: probe gap (lists within gap of the nearest centroid's score, at least 8)
+        ivf-2048-gap:
+          arg_groups: [{nlist: 2048}]
+          args: {}
+          query_args: [[64, 128, 256, 512], [100, 200, 400], [0.2, 0.25, 0.3, 0.35]]
+        # (2026-11-08) train: 1 = centroids from all vectors, 30 k-means iterations (recall +0.01 at the same settings, build 8x)
+        ivf-2048-train:
+          arg_groups: [{nlist: 2048, train: 1}]
+          args: {}
+          query_args: [[32, 64, 128, 256, 512], [100, 200, 400]]
+        ivf-4096-train-gap:
+          arg_groups: [{nlist: 4096, train: 1}]
+          args: {}
+          query_args: [[128, 256, 512, 1024], [100, 200, 400], [0.2, 0.25, 0.3, 0.35]]
+        # (2026-11-08) small re-rank: low dims (glove-25) code one dim per 4 bits and need R 30-50 only
+        ivf-2048-lowR:
+          arg_groups: [{nlist: 2048}]
+          args: {}
+          query_args: [[8, 12, 16, 24, 32, 48, 64, 128, 256], [20, 30, 50]]
+  # (2026-11-08) euclidean: the same lists, the vectors kept at their length (kci_vec_new_l2)
+  euclidean:
+    - base_args: ['@metric']
+      constructor: KciVecIvf
+      disabled: false
+      docker_tag: ann-benchmarks-kci_vec
+      module: ann_benchmarks.algorithms.kci_vec
+      name: kci_vec-ivf
+      run_groups:
+        ivf-1024:
+          arg_groups: [{nlist: 1024}]
+          args: {}
+          query_args: [[4, 8, 16, 32, 64, 128, 256], [50, 100, 200, 400, 800]]
+        ivf-2048:
+          arg_groups: [{nlist: 2048}]
+          args: {}
+          query_args: [[8, 16, 32, 64, 128, 256, 512], [50, 100, 200, 400, 800]]
+        ivf-2048-gap:
+          arg_groups: [{nlist: 2048}]
+          args: {}
+          # gap: L2 centroid scores sit closer together (sift-128: 0.05 / 0.1 at 128:200 = recall 0.915 / 0.995)
+          query_args: [[32, 64, 128, 256, 512], [100, 200, 400], [0.04, 0.06, 0.08, 0.1]]

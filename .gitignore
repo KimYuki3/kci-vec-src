@@ -1,0 +1,12 @@
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+example_kci_vec
+test_*
+!tests/test_*.c
+!clients/python/test_*.py
+__pycache__/
+*.kv
+!tests/data/*.kv

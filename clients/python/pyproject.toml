@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kci-vec"
+version = "0.2.1"
+description = "Embedded vector search — in-process, int8, optional AES-256 encryption at rest, no server"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
+authors = [{ name = "Yukihiro Kimura" }]
+keywords = ["vector-search", "ann", "hnsw", "int8", "embedded", "rag", "encrypted", "on-device"]
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+rag = ["sentence-transformers>=2.2"]
+
+[tool.setuptools]
+packages = ["kci_vec"]
+
+[tool.setuptools.package-data]
+kci_vec = ["*.dll", "*.so", "*.dylib"]
