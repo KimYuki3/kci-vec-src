@@ -29,8 +29,8 @@ extern "C" {
 
 typedef struct KciVec KciVec;
 
-/* Create an empty index. `dim` is the vector dimension (must be a multiple of
- * 4). M / efc are HNSW build parameters (M=16, efc=200 are good defaults;
+/* Create an empty index. `dim` is the vector dimension (any length; the
+ * kernels handle the remainder). M / efc are HNSW build parameters (M=16, efc=200 are good defaults;
  * pass 0 to use them). Returns NULL on bad args / OOM. */
 KciVec *kci_vec_new(int dim, int M, int efc);
 /* L2 (Euclidean) distance: available in the evaluation wheel (kci_vec_new_l2 / kci_vec_is_l2); its source is not part

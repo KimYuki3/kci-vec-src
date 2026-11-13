@@ -214,6 +214,7 @@ int n = kci_vec_search(v, query, 10, 100, ids, scores);  /* 上位 10、ef 100�
 kci_vec_save(v, "index.kv", key, keylen);                /* 鍵を渡せば暗号化 */
 ```
 
+**使い方 (Python と C)、始めるときの設定、守る決まりは [docs/API_ja.md](docs/API_ja.md) にまとめました。**
 API の全体と、各選択肢の意味、既定値の根拠になった計測は `kci_vec.h` の注釈にあります。
 `kci_vec.c` の注釈が参照している計測の記録 (`bench/results_*.txt`) は、この版には入っていません。主な数字は kci-vec-dist の README にあります。
 

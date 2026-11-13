@@ -229,6 +229,7 @@ int n = kci_vec_search(v, query, 10, 100, ids, scores);  /* top 10, ef 100; scor
 kci_vec_save(v, "index.kv", key, keylen);                /* encrypted when a key is given */
 ```
 
+**How to use it (Python and C), which settings to start from, and the rules to keep: [docs/API.md](docs/API.md).**
 The full API, with what each option does and the measurements behind the defaults, is commented in `kci_vec.h`.
 Comments in `kci_vec.c` refer to measurement records (`bench/results_*.txt`) that are not part of this release; the
 figures that matter are in the kci-vec-dist README.

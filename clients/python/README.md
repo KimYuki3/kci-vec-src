@@ -2,8 +2,7 @@
 
 Embedded Python binding for the kci_vec vector engine — in-process, no server, nothing
 leaves the machine. Two ways to search (an int8 HNSW graph, and partitioned lists with
-4-bit table lookup — the fast one, ahead of Google ScaNN on the official ann-benchmarks
-glove-100 run), exact or int8 re-rank, metadata filters, incremental updates, and
+4-bit table lookup), exact or int8 re-rank, metadata filters, incremental updates, and
 snapshots encrypted at rest (AES-256-CTR + AES-256-CMAC).
 
 ```sh
@@ -37,4 +36,4 @@ w = KciVec.load("index.kv", key=b"secret")
   ```
 - Tests without a model: `KCI_VEC_LIB=/path/libkci_vec.so python clients/python/test_smoke.py`, `test_hybrid.py`.
 
-See the repository root README for the C API and the benchmark numbers.
+Full guide: [docs/API.md](../../docs/API.md) (日本語: [docs/API_ja.md](../../docs/API_ja.md)). Benchmark numbers: the repository root README.
