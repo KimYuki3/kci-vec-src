@@ -44,7 +44,7 @@ int main(void) {
     printf("search top-%d:\n", n);
     for (int i = 0; i < n; i++) printf("  id=%llu  cosine=%.4f\n", (unsigned long long)ids[i], sc[i]);
 
-    /* 5. save an ENCRYPTED snapshot (AES-256-CTR + AES-256-CMAC). The key is required to load. */
+    /* 5. save an ENCRYPTED snapshot (ChaCha20 (RFC 8439)). The key is required to load. */
     const char *key = "my-secret-key";
     if (kci_vec_save(v, "index.kv", (const uint8_t*)key, (int)strlen(key)) != 0) {
         fprintf(stderr, "save failed\n"); return 1;

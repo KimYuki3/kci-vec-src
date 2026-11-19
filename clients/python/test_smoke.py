@@ -74,5 +74,23 @@ try:
 except RuntimeError:
     check(True, "wrong key refused")
 os.remove(path)
+
+g = KciVec(d, M=16, efc=100, rerank=50)
+g.add_many(ids, X); g.build()
+g.build_qg(dims_per_code=2, code_dims=32); g.set_qg_exact(2)
+img = os.path.join(tempfile.gettempdir(), "kci_vec_smoke.kvimg")
+check(g.save_image(img), "save_image")
+a = KciVec.attach(img, rerank=50); a.set_qg_exact(2)
+check(a.count == g.count and a.qg and a.is_built(), f"attach: count {a.count}, quantized graph {a.qg}")
+check(all(g.search(q, k=10, ef=80, method="graph") == a.search(q, k=10, ef=80, method="graph") for q in Q[:30]), "attached index answers as the saved one")
+ra, rg = recall(a, ef=120, method="graph"), recall(g, ef=120, method="graph")
+check(ra == rg and ra >= 0.5,   # short codes on clustered random data: about 0.62
+      f"attached index: recall {ra:.3f}, the saved index {rg:.3f}")
+check(a.delete(int(ids[0])) is False, "delete on an attached index is refused")
+try:
+    KciVec.attach(img + ".missing"); check(False, "a missing image must be refused")
+except RuntimeError:
+    check(True, "missing image refused")
+a.close(); g.close(); os.remove(img)
 print("ALL PASS" if fails == 0 else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

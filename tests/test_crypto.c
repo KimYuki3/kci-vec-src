@@ -167,12 +167,112 @@ static void test_snapshots(void) {
     CHECK(kci_vec_load("tests/data/kcivec04_chacha.kv", (const uint8_t *)"wrong", 5) == NULL, "KCIVEC04 wrong key refused");
 }
 
+static void test_damaged(void) {
+    enum { N = 2000, D = 32 };
+    srand(7); int r0 = rand(); srand(7);
+    KciVec *v = kci_vec_new(D, 8, 60); float x[D]; uint32_t s = 99;
+    for (int i = 0; i < N; i++) { for (int d = 0; d < D; d++) { s = s * 1664525u + 1013904223u; x[d] = (float)((s >> 8) & 0xFFFF) / 65536.0f - 0.5f; } kci_vec_add(v, (uint64_t)i + 1, x); }
+    kci_vec_build(v, 1, NULL);
+    CHECK(rand() == r0, "kci_vec_build changed the program's rand() sequence");
+    CHECK(kv_graph_ok(v, v->count, v->ep, (uint32_t)v->maxlevel) == 1, "a built graph is sound");
+    CHECK(kci_vec_save(v, "_d4.kv", NULL, 0) == 0, "plaintext save");
+    FILE *f = fopen("_d4.kv", "rb"); fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *buf = malloc(len), *alt = malloc(len); CHECK(fread(buf, 1, len, f) == (size_t)len, "read the file back"); fclose(f);
+    size_t rowb = (size_t)(v->M0 + 1) * sizeof(uint32_t); long l0 = -1;
+    for (long o = 0; o + (long)rowb <= len; o++) if (memcmp(buf + o, v->l0, rowb) == 0) { l0 = o; break; }
+    CHECK(l0 > 0 && v->l0[0] > 0, "layer 0 not found in the file");
+    #define TRY(name, edit) do { memcpy(alt, buf, len); edit; FILE *g = fopen("_d4x.kv", "wb"); fwrite(alt, 1, len, g); fclose(g); \
+        KciVec *w = kci_vec_load("_d4x.kv", NULL, 0); CHECK(w == NULL, "%s loaded", name); if (w) kci_vec_free(w); } while (0)
+    { KciVec *w = kci_vec_load("_d4.kv", NULL, 0); CHECK(w != NULL && kci_vec_count(w) == N, "the untouched file loads"); if (w) kci_vec_free(w); }
+    TRY("count 0xF0000000", { uint32_t c = 0xF0000000u; memcpy(alt + 24, &c, 4); });
+    TRY("count 2^31 + 5", { uint32_t c = 0x80000005u; memcpy(alt + 24, &c, 4); });
+    TRY("count + 1", { uint32_t c = N + 1; memcpy(alt + 24, &c, 4); });
+    TRY("dim 0", { uint32_t c = 0; memcpy(alt + 12, &c, 4); });
+    if (l0 > 0) {
+        TRY("link count 1000", { uint32_t c = 1000; memcpy(alt + l0, &c, 4); });
+        TRY("neighbour past the rows", { uint32_t c = 0xFFFFFFF0u; memcpy(alt + l0 + 4, &c, 4); });
+        TRY("neighbour = count", { uint32_t c = N; memcpy(alt + l0 + 4, &c, 4); });
+    }
+    TRY("entry point past the rows", { uint32_t c = N; memcpy(alt + 32, &c, 4); });
+    CHECK(kci_vec_load_ex("_d4.kv", NULL, 0, KCI_VEC_LOAD_AUTH_ONLY) == NULL, "auth only: a plaintext file loaded");
+    CHECK(kci_vec_load_ex("tests/data/kcivec04_chacha.kv", (const uint8_t *)"legacy key", 10, KCI_VEC_LOAD_AUTH_ONLY) == NULL, "auth only: a ChaCha20 file loaded");
+    CHECK(kci_vec_save(v, "_d5.kv", (const uint8_t *)"k", 1) == 0, "encrypted save");
+    { KciVec *w = kci_vec_load_ex("_d5.kv", (const uint8_t *)"k", 1, KCI_VEC_LOAD_AUTH_ONLY); CHECK(w != NULL && kci_vec_count(w) == N, "auth only: an AES + CMAC file refused"); if (w) kci_vec_free(w); }
+    CHECK(kci_vec_load_ex("_d5.kv", (const uint8_t *)"x", 1, KCI_VEC_LOAD_AUTH_ONLY) == NULL, "auth only: wrong key loaded");
+    remove("_d5.kv");
+    #undef TRY
+    free(buf); free(alt); kci_vec_free(v); remove("_d4.kv"); remove("_d4x.kv");
+}
+
+static int qg_answers(KciVec *v, const float *Q, int nq, int d, uint64_t *ids, float *sc) {
+    KciVecSearcher *s = kci_vec_searcher_new(v); if (!s) return -1;
+    if (kci_vec_searcher_set_qg(s, 1) != 0) { kci_vec_searcher_free(s); return -2; }
+    kci_vec_searcher_set_qg_exact(s, 2);
+    int bad = 0;
+    for (int q = 0; q < nq; q++) if (kci_vec_search_rerank(s, Q + (size_t)q * d, 10, 80, 40, ids + (size_t)q * 10, sc + (size_t)q * 10) != 10) bad++;
+    kci_vec_searcher_free(s); return bad;
+}
+static void test_qg_snapshot(void) {
+    enum { N = 6000, D = 48, NQ = 30 };
+    static float X[N * D], Q[NQ * D]; uint32_t s = 4242;
+    for (int i = 0; i < N * D; i++) { s = s * 1664525u + 1013904223u; X[i] = (float)((s >> 8) & 0xFFFF) / 65536.0f - 0.5f; }
+    for (int i = 0; i < NQ * D; i++) { s = s * 1664525u + 1013904223u; Q[i] = (float)((s >> 8) & 0xFFFF) / 65536.0f - 0.5f; }
+    static uint64_t i0[NQ * 10], i1[NQ * 10]; static float s0[NQ * 10], s1[NQ * 10];
+    for (int hv = 0; hv < 2; hv++) {           /* 0: floats, 1: halves */
+        KciVec *v = kci_vec_new(D, 16, 100); kci_vec_keep_float(v, 1);
+        for (int i = 0; i < N; i++) kci_vec_add(v, (uint64_t)i + 1, X + (size_t)i * D);
+        kci_vec_build(v, 1, NULL);
+        CHECK(kci_vec_build_qg_ex(v, 2, 16, 1) == 0, "build_qg_ex");
+        if (hv) CHECK(kci_vec_half_floats(v) == 0, "half_floats");
+        CHECK(qg_answers(v, Q, NQ, D, i0, s0) == 0, "answers of the built index");
+        for (int enc = 0; enc < 2; enc++) {
+            const uint8_t *key = enc ? (const uint8_t *)"qg key" : NULL; int kl = enc ? 6 : 0;
+            CHECK(kci_vec_save(v, "_q5.kv", key, kl) == 0, "save with a quantized graph (halves %d, enc %d)", hv, enc);
+            KciVec *w = kci_vec_load("_q5.kv", key, kl);
+            CHECK(w != NULL && kci_vec_qg_bytes(w) == kci_vec_qg_bytes(v) && kci_vec_qg_bytes(w) > 0, "load keeps the quantized graph (halves %d, enc %d)", hv, enc);
+            if (w) { CHECK(qg_answers(w, Q, NQ, D, i1, s1) == 0, "answers of the loaded index");
+                CHECK(memcmp(i0, i1, sizeof i0) == 0 && memcmp(s0, s1, sizeof s0) == 0, "loaded index answers differently (halves %d, enc %d)", hv, enc);
+                CHECK((w->vh != NULL) == (hv != 0), "halves in the loaded index: %d", w->vh != NULL);
+                kci_vec_free(w); }
+            FILE *f = fopen("_q5.kv", "rb"); fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+            uint8_t *buf = malloc(len), *alt = malloc(len); CHECK(fread(buf, 1, len, f) == (size_t)len, "read back"); fclose(f);
+            #define TRYQ(name, edit, n2, want_null) do { memcpy(alt, buf, len); edit; FILE *g2 = fopen("_q5x.kv", "wb"); fwrite(alt, 1, (n2), g2); fclose(g2); \
+                KciVec *t = kci_vec_load("_q5x.kv", key, kl); CHECK((t == NULL) == (want_null), "%s (halves %d, enc %d): %s", name, hv, enc, t ? "loaded" : "refused"); \
+                if (t && !(want_null)) { CHECK(kci_vec_qg_bytes(t) == 0, "%s: a quantized graph came out", name); \
+                    uint64_t ii[10]; float ss[10]; KciVecSearcher *z = kci_vec_searcher_new(t); \
+                    CHECK(kci_vec_searcher_set_qg(z, 1) != 0 && kci_vec_search_r(z, Q, 10, 80, ii, ss) == 10, "%s: plain graph search", name); kci_vec_searcher_free(z); } \
+                if (t) kci_vec_free(t); } while (0)
+            if (enc) {
+                CHECK(kci_vec_load("_q5.kv", (const uint8_t *)"wrong!", 6) == NULL, "wrong key loaded");
+                TRYQ("a byte altered in the section", alt[len - 200] ^= 1, len, 1);
+                TRYQ("cut short", (void)0, len - 64, 1);
+            } else {
+                long sec = -1; for (long o = len - 8; o >= 0; o--) if (memcmp(buf + o, "KVQG", 4) == 0 && buf[o + 5] == 0 && buf[o + 6] == 0 && buf[o + 7] == 0) { sec = o; break; }
+                CHECK(sec > 0, "section not found");
+                if (sec > 0) {
+                    TRYQ("section magic damaged", alt[sec] ^= 0xFF, len, 1);
+                    TRYQ("section M damaged", { uint32_t m; memcpy(&m, alt + sec + 8, 4); m += 2; memcpy(alt + sec + 8, &m, 4); }, len, 1);
+                    TRYQ("unknown part bit", alt[sec + 4] |= 0x40, len, 1);
+                }
+                TRYQ("cut short", (void)0, len - 64, 1);
+                TRYQ("flag cleared (a reader from before)", { uint32_t fl; memcpy(&fl, alt + 8, 4); fl &= ~64u; memcpy(alt + 8, &fl, 4); }, len, 0);
+            }
+            #undef TRYQ
+            free(buf); free(alt);
+        }
+        kci_vec_free(v);
+    }
+    remove("_q5.kv"); remove("_q5x.kv");
+}
+
 int main(void) {
     KvAes probe; uint8_t z[32] = {0}; kv_aes_init(&probe, z);
     printf("AES path on this machine: %s\n", probe.path == 1 ? "AES-NI" : probe.path == 2 ? "ARMv8 AES" : "portable");
     test_kat(0);
     if (probe.path) { test_kat(probe.path); test_paths_agree(probe.path); }
     test_snapshots();
+    test_damaged();
+    test_qg_snapshot();
     printf("%s\n", g_fail ? "FAIL" : "ALL PASS");
     return g_fail;
 }

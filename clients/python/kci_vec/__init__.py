@@ -16,6 +16,7 @@ AES-256-CMAC) — all inside your process, no data leaving the machine.
     v.search(query_vec, k=5, filter=lambda id: id in allowed)   # metadata / ACL
     v.save("index.kv", key=b"secret")       # encrypted at rest
     w = KciVec(dim=128, rerank=200, metric="l2")   # Euclidean: scores are |q - x|^2, smallest first
+    u = KciVec(dim=128, rerank=400, metric="ip")   # inner product: scores are q.x, largest first
     v2 = KciVec.load("index.kv", key=b"secret")
 
 Build the library first:
@@ -69,6 +70,8 @@ def _bind(lib):
     s.kci_vec_new.restype = C.c_void_p;            s.kci_vec_new.argtypes = [C.c_int, C.c_int, C.c_int]
     s.kci_vec_free.argtypes = [C.c_void_p]
     s.kci_vec_keep_float.argtypes = [C.c_void_p, C.c_int]
+    if hasattr(s, "kci_vec_half_floats"):
+        s.kci_vec_half_floats.restype = C.c_int; s.kci_vec_half_floats.argtypes = [C.c_void_p]
     s.kci_vec_reserve.argtypes = [C.c_void_p, C.c_uint32]
     s.kci_vec_add.restype = C.c_int64;             s.kci_vec_add.argtypes = [C.c_void_p, C.c_uint64, c_f32p]
     s.kci_vec_build.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_double)]
@@ -86,6 +89,15 @@ def _bind(lib):
         s.kci_vec_build_qg.restype = C.c_int;      s.kci_vec_build_qg.argtypes = [C.c_void_p, C.c_int, C.c_int]
         s.kci_vec_qg_bytes.restype = C.c_int64;    s.kci_vec_qg_bytes.argtypes = [C.c_void_p]
         s.kci_vec_searcher_set_qg.restype = C.c_int; s.kci_vec_searcher_set_qg.argtypes = [C.c_void_p, C.c_int]
+    if hasattr(s, "kci_vec_build_qg_ex"):
+        s.kci_vec_build_qg_ex.restype = C.c_int; s.kci_vec_build_qg_ex.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int]
+    if hasattr(s, "kci_vec_image_save"):
+        s.kci_vec_image_save.restype = C.c_int;    s.kci_vec_image_save.argtypes = [C.c_void_p, C.c_char_p]
+        s.kci_vec_attach.restype = C.c_void_p;     s.kci_vec_attach.argtypes = [C.c_char_p]
+    if hasattr(s, "kci_vec_build_qg_gate"):
+        s.kci_vec_build_qg_gate.restype = C.c_int; s.kci_vec_build_qg_gate.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int]
+    if hasattr(s, "kci_vec_searcher_set_qg_exact"):
+        s.kci_vec_searcher_set_qg_exact.restype = C.c_int; s.kci_vec_searcher_set_qg_exact.argtypes = [C.c_void_p, C.c_int]
     s.kci_vec_search_r.restype = C.c_int;          s.kci_vec_search_r.argtypes = [C.c_void_p, c_f32p, C.c_int, C.c_int, c_u64p, c_f32p]
     s.kci_vec_search_rerank.restype = C.c_int;     s.kci_vec_search_rerank.argtypes = [C.c_void_p, c_f32p, C.c_int, C.c_int, C.c_int, c_u64p, c_f32p]
     s.kci_vec_search_filtered.restype = C.c_int;   s.kci_vec_search_filtered.argtypes = [C.c_void_p, c_f32p, C.c_int, C.c_int, C.c_int, _FILTER, C.c_void_p, c_u64p, c_f32p]
@@ -111,6 +123,23 @@ def _bind(lib):
     if hasattr(s, "kci_vec_new_l2"):
         s.kci_vec_new_l2.restype = C.c_void_p;     s.kci_vec_new_l2.argtypes = [C.c_int, C.c_int, C.c_int, C.c_float]
         s.kci_vec_is_l2.restype = C.c_int;         s.kci_vec_is_l2.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_new_ip"):
+        s.kci_vec_new_ip.restype = C.c_void_p;     s.kci_vec_new_ip.argtypes = [C.c_int, C.c_int, C.c_int, C.c_float]
+    if hasattr(s, "kci_vec_learn"):
+        s.kci_vec_learn.restype = C.c_int
+        s.kci_vec_learn.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.POINTER(C.c_float)]
+        s.kci_vec_has_learned.restype = C.c_int;   s.kci_vec_has_learned.argtypes = [C.c_void_p]
+        if hasattr(s, "kci_vec_learn_pack"):
+            s.kci_vec_learn_pack.restype = C.c_int; s.kci_vec_learn_pack.argtypes = [C.c_void_p]
+        for f in ("kci_vec_searcher_set_learned_seeds", "kci_vec_searcher_set_learned_pages", "kci_vec_searcher_set_learned_hot"):
+            if hasattr(s, f):
+                getattr(s, f).restype = C.c_int; getattr(s, f).argtypes = [C.c_void_p, C.c_int]
+        s.kci_vec_search_learned.restype = C.c_int
+        s.kci_vec_search_learned.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p]
+    if hasattr(s, "kci_vec_set_ip_centre"):
+        s.kci_vec_set_ip_centre.restype = C.c_int; s.kci_vec_set_ip_centre.argtypes = [C.c_void_p, C.c_int]
+    if hasattr(s, "kci_vec_metric"):
+        s.kci_vec_metric.restype = C.c_int;        s.kci_vec_metric.argtypes = [C.c_void_p]
     s.kci_vec_is_built.restype = C.c_int;          s.kci_vec_is_built.argtypes = [C.c_void_p]
     return s
 
@@ -141,25 +170,35 @@ def _make_filter(filt):
 class KciVec:
     """One index."""
 
-    def __init__(self, dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, _handle=None):
+    def __init__(self, dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, centre=False, _handle=None):
         self.lib = _lib()
         self.dim = dim
         self.rerank = rerank
-        if metric not in ("cosine", "l2"):
-            raise ValueError("metric must be 'cosine' or 'l2'")
+        if metric not in ("cosine", "l2", "ip"):
+            raise ValueError("metric must be 'cosine', 'l2' or 'ip'")
         if _handle is not None:
             self._v = _handle
-            self.metric = "l2" if hasattr(self.lib, "kci_vec_is_l2") and self.lib.kci_vec_is_l2(_handle) else "cosine"
+            if hasattr(self.lib, "kci_vec_metric"):
+                self.metric = ("cosine", "l2", "ip")[self.lib.kci_vec_metric(_handle)]
+            else:
+                self.metric = "l2" if hasattr(self.lib, "kci_vec_is_l2") and self.lib.kci_vec_is_l2(_handle) else "cosine"
         else:
             self.metric = metric
             if metric == "l2":
                 if not hasattr(self.lib, "kci_vec_new_l2"):
                     raise RuntimeError("this libkci_vec has no L2 (a cosine-only build, or one from before 2026-11-08)")
                 self._v = self.lib.kci_vec_new_l2(dim, M, efc, float(max_norm))
+            elif metric == "ip":
+                if not hasattr(self.lib, "kci_vec_new_ip"):
+                    raise RuntimeError("this libkci_vec has no inner product (a cosine-only build, or one from before 2026-11-16)")
+                self._v = self.lib.kci_vec_new_ip(dim, M, efc, float(max_norm))
+                if centre and self._v:
+                    if not hasattr(self.lib, "kci_vec_set_ip_centre") or self.lib.kci_vec_set_ip_centre(self._v, 1) != 0:
+                        raise RuntimeError("centre=True is not available in this libkci_vec")
             else:
                 self._v = self.lib.kci_vec_new(dim, M, efc)
             if not self._v:
-                raise RuntimeError("kci_vec_new failed (dim must be > 0; l2: max_norm >= 0)")
+                raise RuntimeError("kci_vec_new failed (dim must be > 0; l2 / ip: max_norm >= 0)")
             if rerank:
                 self.lib.kci_vec_keep_float(self._v, 1)
         self._s = None
@@ -169,7 +208,9 @@ class KciVec:
         self.rerank_mode = "float"
         self.probe_gap = (0.0, 8)
         self.eps = 0.0
+        self.qg_exact = False
         self.qg = False
+        self.attached = False
         self._ob = (C.c_uint64 * 4096)()
         self._os = (C.c_float * 4096)()
 
@@ -197,13 +238,24 @@ class KciVec:
         self._searcher(reset=True)
         return secs.value
 
-    def build_qg(self, dims_per_code=1, threads=0):
+    def build_qg(self, dims_per_code=1, threads=0, code_dims=0, gate_dims=0):
         """Quantized graph lay layer 0 out as blocks of the neighbours' 4-bit codes, so a hop reads one block and scores
         every neighbour with table lookups. Dropped by insert() / compact() / build(); call again after. Returns the
-        bytes it takes."""
+        bytes it takes. code_dims > 0 the codes cover the top code_dims principal directions only (even, 8..dim-1), a
+        smaller block per node."""
         if not hasattr(self.lib, "kci_vec_build_qg"):
             raise RuntimeError("this libkci_vec has no kci_vec_build_qg (rebuild the library)")
-        if self.lib.kci_vec_build_qg(self._v, int(dims_per_code), int(threads)) != 0:
+        if int(gate_dims):
+            if not hasattr(self.lib, "kci_vec_build_qg_gate"):
+                raise RuntimeError("this libkci_vec has no kci_vec_build_qg_gate (rebuild the library)")
+            if self.lib.kci_vec_build_qg_gate(self._v, int(dims_per_code), int(code_dims), int(gate_dims), int(threads)) != 0:
+                raise RuntimeError("kci_vec_build_qg_gate failed (no graph yet? gate_dims must be even, 8..code_dims; out of memory?)")
+        elif int(code_dims):
+            if not hasattr(self.lib, "kci_vec_build_qg_ex"):
+                raise RuntimeError("this libkci_vec has no kci_vec_build_qg_ex (rebuild the library)")
+            if self.lib.kci_vec_build_qg_ex(self._v, int(dims_per_code), int(code_dims), int(threads)) != 0:
+                raise RuntimeError("kci_vec_build_qg_ex failed (no graph yet? code_dims must be even, 8..dim-1; out of memory?)")
+        elif self.lib.kci_vec_build_qg(self._v, int(dims_per_code), int(threads)) != 0:
             raise RuntimeError("kci_vec_build_qg failed (no graph yet? dims_per_code must be 1 or 2; out of memory?)")
         self.qg = True
         self._searcher(reset=True)
@@ -266,6 +318,16 @@ class KciVec:
         if self._s:
             self.lib.kci_vec_searcher_set_eps(self._s, self.eps)
 
+    def set_qg_exact(self, on=True):
+        """Worth trying at high dimensions with dims_per_code 2. Off by default. on=2: with build_qg(code_dims=...) score
+        them with short int8 rows (code_dims bytes) instead; less to read per hop, a little coarser, so search with a
+        wider rerank_n. Without code_dims the same as True."""
+        if not hasattr(self.lib, "kci_vec_searcher_set_qg_exact"):
+            raise RuntimeError("this libkci_vec has no kci_vec_searcher_set_qg_exact (rebuild the library)")
+        self.qg_exact = 2 if (on == 2 and on is not True) else (1 if on else 0)
+        if self._s:
+            self.lib.kci_vec_searcher_set_qg_exact(self._s, self.qg_exact)
+
     def _searcher(self, reset=False):
         if (reset or self._dirty) and self._s:
             self.lib.kci_vec_searcher_free(self._s); self._s = None
@@ -280,6 +342,8 @@ class KciVec:
                 self.lib.kci_vec_searcher_set_eps(self._s, self.eps)
             if self.qg:
                 self.lib.kci_vec_searcher_set_qg(self._s, 1)
+            if self.qg_exact:
+                self.lib.kci_vec_searcher_set_qg_exact(self._s, int(self.qg_exact))
         return self._s
 
     def _query(self, q, k, ef, nprobe, rn, cb, method):
@@ -317,6 +381,103 @@ class KciVec:
                 ids[i, j] = vid; scores[i, j] = sc
         return ids, scores
 
+    def learn(self, queries, answers, nclusters=0, list_cap=0, threads=0, pack=False):
+        """Learn lists from a query sample, for data whose queries come from another distribution than the vectors and
+        whose answers concentrate on few vectors (e.g. the queries and keys of an attention head). queries: float32
+        [nq, dim]; answers: ids [nq, per_query], the (true or approximate) nearest of each query. Needs a built index
+        (build() or build_lists()) and rerank > 0."""
+        if not hasattr(self.lib, "kci_vec_learn"):
+            raise RuntimeError("this libkci_vec has no kci_vec_learn (from before 2026-11-16)")
+        Qs = np.ascontiguousarray(queries, dtype=np.float32); A = np.ascontiguousarray(answers, dtype=np.uint64)
+        if Qs.ndim != 2 or A.ndim != 2 or len(Qs) != len(A) or Qs.shape[1] != self.dim:
+            raise ValueError("queries must be [nq, dim] and answers [nq, per_query]")
+        top5 = C.c_float(0.0)
+        if self.lib.kci_vec_learn(self._v, Qs.ctypes.data, len(Qs), A.ctypes.data, A.shape[1], int(nclusters), int(list_cap),
+                                  int(threads), C.byref(top5)) != 0:
+            raise RuntimeError("kci_vec_learn failed (index not built? no answer id is in the index? out of memory?)")
+        if pack:
+            if not hasattr(self.lib, "kci_vec_learn_pack") or self.lib.kci_vec_learn_pack(self._v) != 0:
+                raise RuntimeError("kci_vec_learn_pack failed (out of memory, or a libkci_vec without it)")
+        return float(top5.value)
+
+    def search_learned(self, query, k=10, nclusters=4, per_list=1000, ef=0, seeds=0, pages=0, hot=0):
+        """Top-k through the learned lists: the nclusters (1..64) nearest query clusters, the first per_list vectors of
+        each. ef = 0: those are scored exactly and the best k returned (fast; no fallback for a query unlike the sample).
+        ef > 0: they start the graph search (needs build()), which completes what the lists miss.
+        ef < 0 (after learn(pack=True)): the lists' int8 copies are scanned and only the -ef best (150 - 500) scored exactly.
+        seeds > 0 (ef > 0, packed): only the `seeds` best of the int8 scan start the graph (0: every vector of the prefixes).
+        pages > 0: the clusters are chosen in two stages, through the nearest `pages` groups of them (cheaper when
+        nclusters is small; 0: compare with every cluster).
+        hot > 0: also the first `hot` of the rows most often an answer over the whole sample (learn() keeps up to a
+        quarter of the index); for the last answers the nearest lists miss, when the answers are concentrated."""
+        _, q = _f32(np.reshape(query, -1))
+        for f, x in (("kci_vec_searcher_set_learned_seeds", seeds), ("kci_vec_searcher_set_learned_pages", pages),
+                     ("kci_vec_searcher_set_learned_hot", hot)):
+            if hasattr(self.lib, f):
+                if getattr(self.lib, f)(self._searcher(), int(x)) != 0:
+                    raise ValueError(f + ": negative value")
+            elif x:
+                raise RuntimeError(f + ": this libkci_vec does not have it")
+        n = self.lib.kci_vec_search_learned(self._searcher(), q, int(k), int(nclusters), int(per_list), int(ef), self._ob, self._os)
+        if n == -2:
+            raise RuntimeError("nothing learned (call learn(); build() and compact() drop it; ef < 0 needs learn(pack=True))")
+        if n < 0:
+            raise RuntimeError("search_learned failed (rerank=... needed; ef > 0 needs build())")
+        return [(int(self._ob[i]), float(self._os[i])) for i in range(n)]
+
+    def vote_set(self, answers):
+        """For data whose queries come from another distribution and whose answers are NOT concentrated (learn() returns
+        a low share): keep the answers of a query sample, answers = ids [nq, per_query], and an int8 copy of every
+        vector (dim bytes each). search_voted() then takes the numbers (0 .. nq-1) of the sample queries nearest to a
+        query, which the caller finds, for instance with a second KciVec holding the sample queries. Needs a built
+        index and rerank > 0. build() and compact() drop it; it is not saved."""
+        if not hasattr(self.lib, "kci_vec_vote_set"):
+            raise RuntimeError("this libkci_vec has no kci_vec_vote_set (from before 2026-11-17)")
+        A = np.ascontiguousarray(answers, dtype=np.uint64)
+        if A.ndim != 2:
+            raise ValueError("answers must be [nq, per_query]")
+        self.lib.kci_vec_vote_set.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_int]
+        if self.lib.kci_vec_vote_set(self._v, A.ctypes.data, A.shape[0], A.shape[1]) != 0:
+            raise RuntimeError("kci_vec_vote_set failed (index not built? rerank=... needed; out of memory?)")
+
+    def vote_short(self, ids, rows):
+        """Optional, after vote_set(): one short vector per stored vector (rows float32 [count, sdim], in the order of
+        ids), chosen by the caller so that short query . short row orders the candidates like the score. Kept as int8;
+        search_voted(short_query=...) ranks the candidates by it first. For high dimensions."""
+        I = np.ascontiguousarray(ids, dtype=np.uint64); R = np.ascontiguousarray(rows, dtype=np.float32)
+        if R.ndim != 2 or I.ndim != 1 or len(I) != len(R):
+            raise ValueError("rows must be [count, sdim] and ids [count]")
+        if not hasattr(self.lib, "kci_vec_vote_short"):
+            raise RuntimeError("this libkci_vec has no kci_vec_vote_short (from before 2026-11-17)")
+        self.lib.kci_vec_vote_short.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_uint32, C.c_int]
+        if self.lib.kci_vec_vote_short(self._v, I.ctypes.data, R.ctypes.data, len(I), R.shape[1]) != 0:
+            raise RuntimeError("kci_vec_vote_short failed (vote_set() first; every id of the index exactly once; sdim 1..4096)")
+        self._vote_sdim = R.shape[1]
+
+    def search_voted(self, query, voters, k=10, rerank=200, short_query=None, keep=1000):
+        """Top-k among the answers of the sample queries numbered in `voters` (see vote_set): the union is scanned on
+        int8 copies and the `rerank` best (at most 4096) are scored exactly. With short_query (after vote_short) the
+        union is ranked by the short codes first and only the `keep` best go on. No fallback for a query unlike the sample."""
+        _, q = _f32(np.reshape(query, -1))
+        V = np.ascontiguousarray(voters, dtype=np.uint32).reshape(-1)
+        if len(V) == 0:
+            return []
+        k = min(int(k), len(self._ob))
+        if short_query is None:
+            self.lib.kci_vec_search_voted.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p]
+            n = self.lib.kci_vec_search_voted(self._searcher(), q, V.ctypes.data, len(V), k, int(rerank), self._ob, self._os)
+        else:
+            qs = np.ascontiguousarray(np.reshape(short_query, -1), dtype=np.float32)
+            if len(qs) != getattr(self, "_vote_sdim", -1):
+                raise ValueError("short_query must have the sdim given to vote_short()")
+            self.lib.kci_vec_search_voted_short.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_void_p, C.c_void_p]
+            n = self.lib.kci_vec_search_voted_short(self._searcher(), q, qs.ctypes.data, int(keep), V.ctypes.data, len(V), k, int(rerank), self._ob, self._os)
+        if n == -2:
+            raise RuntimeError("nothing set (call vote_set(); build() and compact() drop it; short_query needs vote_short())")
+        if n < 0:
+            raise RuntimeError("search_voted failed")
+        return [(int(self._ob[i]), float(self._os[i])) for i in range(n)]
+
     def search_exact(self, query, k=10, threads=0):
         """Brute force (ground truth / tiny indexes)."""
         _, q = _f32(np.reshape(query, -1))
@@ -330,7 +491,8 @@ class KciVec:
         if r == -2:
             raise RuntimeError("insert requires rerank=… (retained floats)")
         if r < 0:
-            raise RuntimeError("insert failed" + (" (l2: longer or much shorter than the vectors at the build?)" if self.metric == "l2" else ""))
+            raise RuntimeError("insert failed" + (" (l2: longer or much shorter than the vectors at the build?)" if self.metric == "l2" else
+                                                " (ip: longer than the longest vector at the build?)" if self.metric == "ip" else ""))
         self._dirty = True
         self.qg = False
         return r
@@ -354,6 +516,7 @@ class KciVec:
         if not h:
             raise RuntimeError("load failed (wrong key, damaged file, or file missing)")
         v = cls(lib.kci_vec_dim(h), _handle=h, rerank=rerank)
+        v.qg = hasattr(lib, "kci_vec_qg_bytes") and lib.kci_vec_qg_bytes(h) > 0
         # the file carries the lists when they were built; a probe tells which path is available
         try:
             s = lib.kci_vec_searcher_new(h); z = np.zeros(v.dim, dtype=np.float32)
@@ -362,6 +525,48 @@ class KciVec:
         except Exception:
             v._lists = False
         return v
+
+    def save_image(self, path):
+        """Write the index as a read-only image (kci_vec_image_save): a flat, plaintext file that KciVec.attach() opens
+        without parsing or copying. It carries the rows, the floats, the lists, and for an index with a graph the
+        graph, the quantized graph (build_qg) and the halves (half_floats). Not encrypted: for an encrypted file use
+        save(path, key). For the machine that wrote it (byte order). Returns True, or raises."""
+        if not hasattr(self.lib, "kci_vec_image_save"):
+            raise RuntimeError("this libkci_vec has no kci_vec_image_save (rebuild the library)")
+        if self.lib.kci_vec_image_save(self._v, os.fsencode(path)) != 0:
+            raise RuntimeError("kci_vec_image_save failed (cannot write the file, or the floats are mapped from a file)")
+        return True
+
+    @classmethod
+    def attach(cls, path, rerank=100):
+        """Anything that writes (add, insert, delete, build, build_qg...) fails or is refused. rerank: the default
+        shortlist for search, as in load(). Missing, damaged or foreign file -> RuntimeError."""
+        lib = _lib()
+        if not hasattr(lib, "kci_vec_attach"):
+            raise RuntimeError("this libkci_vec has no kci_vec_attach (rebuild the library)")
+        h = lib.kci_vec_attach(os.fsencode(path))
+        if not h:
+            raise RuntimeError("attach failed (file missing, not an image, or damaged)")
+        v = cls(lib.kci_vec_dim(h), _handle=h, rerank=rerank)
+        v.attached = True
+        try:
+            s = lib.kci_vec_searcher_new(h); z = np.zeros(v.dim, dtype=np.float32)
+            v._lists = lib.kci_vec_search_ivf(s, z.ctypes.data_as(c_f32p), 1, 1, 1, v._ob, v._os) >= 0
+            lib.kci_vec_searcher_free(s)
+        except Exception:
+            v._lists = False
+        v.qg = hasattr(lib, "kci_vec_qg_bytes") and lib.kci_vec_qg_bytes(h) > 0
+        return v
+
+    def half_floats(self):
+        """Turn the retained floats into 16-bit halves (kci_vec_half_floats): half the memory for them, and
+        search_rerank's float pass reads half as much (cosine scores within 1e-4 of the floats'; inner-product / L2
+        scores are off by the same relative amount). One way; afterwards the index is as one without floats for
+        everything but search_rerank (no insert, a save has no floats). Call after build() and build_qg()."""
+        if not hasattr(self.lib, "kci_vec_half_floats"):
+            raise RuntimeError("this libkci_vec has no kci_vec_half_floats (rebuild the library)")
+        if self.lib.kci_vec_half_floats(self._v) != 0:
+            raise RuntimeError("kci_vec_half_floats failed (needs a built index with floats kept in RAM)")
 
     def plain_bytes(self):
         """Plaintext bytes of the index in RAM, by kind (kci_vec_plain_bytes): codes, floats, derived (centroids,

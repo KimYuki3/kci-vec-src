@@ -29,12 +29,35 @@ extern "C" {
 
 typedef struct KciVec KciVec;
 
-/* Create an empty index. `dim` is the vector dimension (any length; the
- * kernels handle the remainder). M / efc are HNSW build parameters (M=16, efc=200 are good defaults;
+/* Create an empty index. `dim` is the vector dimension (must be a multiple of
+ * 4). M / efc are HNSW build parameters (M=16, efc=200 are good defaults;
  * pass 0 to use them). Returns NULL on bad args / OOM. */
 KciVec *kci_vec_new(int dim, int M, int efc);
-/* L2 (Euclidean) distance: available in the evaluation wheel (kci_vec_new_l2 / kci_vec_is_l2); its source is not part
- * of this release yet. */
+/* An index by L2 (Euclidean) distance instead of cosine. Vectors keep their length (not normalized); every search
+ * returns the nearest by |q - x| and out_scores holds the squared distance |q - x|^2, smallest first. Inside it is
+ * the cosine index of dim+2 dims (each vector gets two more coordinates that turn the L2 order into a cosine order
+ * exactly), so the graph, the lists, the re-rank, save and load all work as for cosine. max_norm: the largest |x|
+ * that will ever be added. That first build also fixes the range of lengths: afterwards, adding or inserting a
+ * vector much longer or shorter than those (outside twice their spread of |x|^2) returns -1; build a new index for
+ * it. A max_norm far above the real lengths wastes precision. Not for L2: kci_vec_add_i8 and
+ * kci_vec_set_float_source (both return -1). kci_vec_dim returns dim, and kci_vec_get_float the vector as given.
+ * Returns NULL on bad args (dim <= 0, max_norm < 0 or not finite) / OOM. */
+KciVec *kci_vec_new_l2(int dim, int M, int efc, float max_norm);
+int     kci_vec_is_l2(const KciVec *v);   /* 1 = made by kci_vec_new_l2 (or loaded from such a file) */
+/* An index by inner product (maximum inner product search) instead of cosine. Vectors keep their length; every
+ * search returns the vectors with the largest q.x and out_scores holds q.x, largest first. Inside it is the cosine
+ * index of dim+1 dims: each vector is scaled to length <= 1 and gets one more coordinate that brings its length to
+ * 1, the query gets a 0 there (the published reduction of Bachrach et al. 2014). It changes no ranking (every
+ * score moves by the same q.mean, which is added back) and lets the int8 rows and the codes describe what differs
+ * between the vectors instead of what they share. 0 / -1 (not an inner-product index, or already built). max_norm:
+ * the largest |x| that will ever be added. Afterwards a longer vector (centred: one farther from the mean than the
+ * farthest at that build; with max_norm: any vector longer than max_norm) returns -1 from add / insert. Not for
+ * inner product: kci_vec_add_i8 and kci_vec_set_float_source (both return -1). kci_vec_dim returns dim,
+ * kci_vec_get_float the vector as given. Not in a KCI_VEC_NO_L2 build. Returns NULL on bad args (dim <= 0,
+ * max_norm < 0 or not finite) / OOM. */
+KciVec *kci_vec_new_ip(int dim, int M, int efc, float max_norm);
+int     kci_vec_set_ip_centre(KciVec *v, int on);
+int     kci_vec_metric(const KciVec *v);  /* 0 = cosine, 1 = L2, 2 = inner product; -1 = NULL */
 void    kci_vec_free(KciVec *v);
 
 /* Reserve capacity for `n` vectors up front (avoids realloc churn). */
@@ -181,13 +204,32 @@ int kci_vec_searcher_set_eps(KciVecSearcher *s, float eps);
  * dropped by kci_vec_insert, kci_vec_compact and kci_vec_build (build it again after). Returns 0, or -1 (no graph,
  * bad args, out of memory). */
 int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads);
+/* The same with the neighbours' codes over the top code_dims principal directions only (even, 8..dim-1; 0 = all
+ * dimensions, as kci_vec_build_qg). A smaller block per node: less memory and a cheaper hop, coarser estimates.
+ * Returns 0, or -1 (as kci_vec_build_qg, or a bad code_dims). */
+int kci_vec_build_qg_ex(KciVec *v, int dims_per_code, int code_dims, int threads);
+/* As kci_vec_build_qg_ex, with the neighbours' codes over the first gate_dims of the code_dims directions only
+ * (even, 8..code_dims; 0 = code_dims, the same as kci_vec_build_qg_ex). The short rows of
+ * kci_vec_searcher_set_qg_exact(s, 2) keep all code_dims coordinates, so the block per node shrinks while the
+ * ranking inside the search stays as fine. Use it for the memory, with set_qg_exact(s, 2). Returns 0, or -1 (as
+ * kci_vec_build_qg_ex, or a bad gate_dims). */
+int kci_vec_build_qg_gate(KciVec *v, int dims_per_code, int code_dims, int gate_dims, int threads);
 /* Bytes the quantized graph takes (0 = none). */
 int64_t kci_vec_qg_bytes(const KciVec *v);
 /* Search over the quantized graph (on = 1): kci_vec_search_r re-scores the result set with the int8 rows,
- * kci_vec_search_rerank with the floats. Use a small ef (k..3k) with kci_vec_searcher_set_eps, since the ef-th best is
- * an estimate now. kci_vec_search_filtered and the plain kci_vec_search do not use it yet. Returns 0, -1 (no
- * searcher), -2 (the index has no quantized graph: kci_vec_build_qg first). */
+ * kci_vec_search_rerank with the floats. Use a small ef (k..3k) with kci_vec_searcher_set_eps, since the ef-th
+ * best is an estimate now. kci_vec_search_filtered uses it too rows that fail the filter are walked through and
+ * left out of the result, as on the plain graph); the plain kci_vec_search does not. Returns 0, -1 (no searcher),
+ * -2 (the index has no quantized graph: kci_vec_build_qg first). on = -1: automatic, and the default of a new
+ * searcher: the quantized graph is used whenever the index has one (built, loaded from a file or attached from an
+ * image), with the short rows if it has them (as kci_vec_searcher_set_qg_exact(s, 2); that switch takes -1 for
+ * automatic too). */
 int kci_vec_searcher_set_qg(KciVecSearcher *s, int on);
+/* Worth it where the estimates are coarse (high dimensions, 2 dims a code); off by default. Returns 0, or -1 (no
+ * searcher). on = 2: with a graph built by kci_vec_build_qg_ex (code_dims > 0), score them with short int8 rows
+ * instead (the code_dims coordinates, code_dims bytes a row; the graph keeps them, count x code_dims bytes).
+ * Without code_dims, 2 is the same as 1. */
+int kci_vec_searcher_set_qg_exact(KciVecSearcher *s, int on);
 /* Search the lists: score the centroids, scan the best `nprobe` lists with the 4-bit tables, keep the best
  * `rerank_n` and re-score them with the float vectors. Scores are cosine. Returns the hit count, or -1 if the
  * index has no lists. */
@@ -203,7 +245,10 @@ int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, in
 /* On-disk snapshot. If key != NULL (keylen bytes), the serialized index is encrypted at rest (format KCIVEC05:
  * AES-256-CTR, key from PBKDF2-HMAC-SHA256 with a per-save salt, and an AES-256-CMAC tag over the whole file);
  * pass the same key to _load. With key=NULL the snapshot is plaintext (KCIVEC04). The graph is saved too, so _load
- * needs no rebuild. Older KCIVEC04 files encrypted with ChaCha20 (no tag) still load. */
+ * needs no rebuild. Older KCIVEC04 files encrypted with ChaCha20 (no tag) still load. The quantized graph
+ * (kci_vec_build_qg*, with its short rows) and the halves (kci_vec_half_floats) are saved too, inside the
+ * encrypted and authenticated part: the loaded index answers kci_vec_search_rerank through the quantized graph
+ * without building it again (kci_vec_searcher_set_qg as usual). */
 int     kci_vec_save(KciVec *v, const char *path, const uint8_t *key, int keylen);
 KciVec *kci_vec_load(const char *path, const uint8_t *key, int keylen);
 /* kci_vec_save with options. KCI_VEC_SAVE_NO_FLOAT leaves the retained floats out of the file (for a caller that
@@ -213,20 +258,83 @@ KciVec *kci_vec_load(const char *path, const uint8_t *key, int keylen);
  * Use it only with a key of full strength (32 random bytes). */
 #define KCI_VEC_SAVE_RAW_KEY 2
 #define KCI_VEC_LOAD_RAW_KEY 2
+/* KCI_VEC_LOAD_AUTH_ONLY: kci_vec_load_ex accepts only a file that is encrypted with the authentication tag
+ * (AES-256-CTR + CMAC: saved with a key by this library since . A plaintext file and an old ChaCha20 file (no tag)
+ * return NULL, whatever key is given. For indexes that arrive from outside: a file without a tag can be altered
+ * without the load noticing. Combine with KCI_VEC_LOAD_RAW_KEY by |. */
+#define KCI_VEC_LOAD_AUTH_ONLY 4
 int     kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen, int flags);
 KciVec *kci_vec_load_ex(const char *path, const uint8_t *key, int keylen, int flags);
 /* Set the retained float of the vector with this id (after a KCI_VEC_SAVE_NO_FLOAT load). 0, or -1 (unknown id, no
  * float store). */
 int     kci_vec_set_float(KciVec *v, uint64_t id, const float *vec);
 
+/* Lists learned from a query sample, for data whose queries come from another distribution than the vectors (text
+ * queries over images, the queries and keys of an attention head) and whose answers concentrate on few vectors.
+ * kci_vec_learn: `queries` = nq sample queries (dim floats each, the caller's dim), `answers` = their true or
+ * approximate nearest ids, per_query each (an id not in the index is skipped). Needs a built index (graph or
+ * lists). 0 / -1. The learned lists name rows: kci_vec_build and kci_vec_compact drop them (learn again), inserts
+ * keep them (new vectors are just not in them), they are not saved. kci_vec_search_learned: the `nclusters`
+ * (1..64) nearest clusters, the first `per_list` vectors of each, then ef = 0 : those are scored exactly on the
+ * kept floats and the best k returned. Fast; a query unlike the sample gets a poor answer, there is no fallback;
+ * ef > 0 : they are added as starting points of the graph search (ef as in kci_vec_search_rerank, re-rank of the
+ * ef best), so the graph completes what the lists miss. Needs the graph (kci_vec_build). ef < 0 : needs
+ * kci_vec_learn_pack. The lists' own int8 copies are scanned in order and only the -ef best (150 - 500) are scored
+ * exactly. The fastest form when a query reads thousands of list entries; like ef = 0 it has no fallback for a
+ * query unlike the sample. kci_vec_learn_pack (after kci_vec_learn): gives every list an int8 copy of its vectors
+ * (dim bytes per list entry), centred on the mean of all vectors, which changes no ranking and is what lets one
+ * byte per dimension tell them apart. 0 / -1. Dropped with the lists. Needs kci_vec_keep_float. Returns the count,
+ * -1 on error, -2 if nothing is learned (or it was dropped; ef < 0: not packed). Same scores as the other searches
+ * (cosine, |q-x|^2 for L2, q.x for inner product). */
+int kci_vec_learn(KciVec *v, const float *queries, uint32_t nq, const uint64_t *answers, int per_query,
+                  int nclusters, int list_cap, int threads, float *out_top5);
+int kci_vec_has_learned(const KciVec *v);   /* 1 = kci_vec_search_learned can be used */
+int kci_vec_learn_pack(KciVec *v);
+/* For ef > 0 on packed lists: start the graph from the `best` rows of the int8 scan of the list prefixes instead
+ * of from all of them (0 = all, the default). Fewer, better starting points. 0 / -1. */
+int kci_vec_searcher_set_learned_seeds(KciVecSearcher *s, int best);
+/* Choose the lists in two stages: kci_vec_learn also groups its clusters into sqrt(nclusters) pages; with pages >
+ * 0 a search compares the query with the pages, then only with the clusters of the nearest `pages` of them (0 =
+ * compare with every cluster, the default). Cheaper when few lists are read; with too few pages a list is missed.
+ * No effect below 64 clusters. 0 / -1. */
+int kci_vec_searcher_set_learned_pages(KciVecSearcher *s, int pages);
+/* Also read the first `rows` of the hot rows: kci_vec_learn keeps, besides the lists, the rows most often an
+ * answer over the whole sample (at most a quarter of the index, most frequent first; packed with the lists). For
+ * the last answers that the nearest lists miss, on data whose answers are concentrated. 0 = off, the default. 0 /
+ * -1. */
+int kci_vec_searcher_set_learned_hot(KciVecSearcher *s, int rows);
+int kci_vec_search_learned(KciVecSearcher *s, const float *query, int k, int nclusters, int per_list, int ef,
+                           uint64_t *out_ids, float *out_scores);
+/* For data whose answers are not concentrated (kci_vec_learn's concentration is low): the sample queries
+ * themselves are the index. kci_vec_vote_set keeps the answers of the nq sample queries (ids of this index,
+ * per_query each) and an int8 copy of every vector centred on the mean (dim bytes per vector). 0 / -1. Needs
+ * kci_vec_keep_float and a built index; dropped by kci_vec_build / kci_vec_compact (set again), not saved.
+ * kci_vec_search_voted: `voters` are numbers (0 .. nq-1) of the sample queries nearest to the query, found by the
+ * caller (for instance with a second KciVec holding the sample queries). The union of their answers is scanned on
+ * the int8 copies and the `rerank` best (at least k, at most 4096) are scored exactly. Returns the count, -1 on
+ * error, -2 if nothing is set. A query unlike the sample gets a poor answer; there is no fallback. Related work:
+ * MLANN. */
+int kci_vec_vote_set(KciVec *v, const uint64_t *answers, uint32_t nq, int per_query);
+int kci_vec_search_voted(KciVecSearcher *s, const float *query, const uint32_t *voters, int nvoters, int k, int rerank,
+                         uint64_t *out_ids, float *out_scores);
+/* Optional short codes for the scan of the union, for high dimensions. kci_vec_vote_short (after
+ * kci_vec_vote_set): `rows` holds one short vector (sdim floats, at most 4096) for each of the n = count vectors,
+ * in the order of `ids`; the caller chooses the map (short query . short row should approximate the score, up to a
+ * constant per query). Kept as int8 centred on the mean, sdim bytes per vector. 0 / -1.
+ * kci_vec_search_voted_short: the union is ranked by qshort . short row, the `keep` best (at least `rerank`) go
+ * through the full int8 rows, and the `rerank` best of those are scored exactly. -2 without short codes. */
+int kci_vec_vote_short(KciVec *v, const uint64_t *ids, const float *rows, uint32_t n, int sdim);
+int kci_vec_search_voted_short(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
+                               int k, int rerank, uint64_t *out_ids, float *out_scores);
+
 /* Plain, not encrypted: keep the file where the tables are. On an attached index the searches work
  * (kci_vec_search_ivf*, kci_vec_search_exact, kci_vec_get_float); anything that writes (add, insert, delete,
  * forget, compact, build*, keep_float, set_float, float_mmap, protect, reserve) returns -1 (compact: the count).
- * The graph is not in the image, so kci_vec_search / _search_r return -1. kci_vec_save works (an encrypted copy of
- * an attached index). kci_vec_free unmaps the file. kci_vec_attach_mem does the same over memory the caller mapped
- * (a shared segment); it must outlive the index. image_save: 0 / -1 (write error, floats mmap'd). attach: NULL (no
- * file, not an image, truncated or inconsistent, an index kind this release does not have). The file is for the
- * machine that wrote it (byte order, alignment). */
+ * An index with a graph (kci_vec_build) takes it into the image, with the quantized graph (kci_vec_build_qg*, its
+ * short rows) and the halves (kci_vec_half_floats) if they are there; the attached index then answers
+ * kci_vec_search / _search_r / _search_rerank (with kci_vec_searcher_set_qg) as the index it was saved from. An
+ * image written by this version is read by an earlier one as an image without a graph. The file is for the machine
+ * that wrote it (byte order, alignment). */
 int     kci_vec_image_save(const KciVec *v, const char *path);
 KciVec *kci_vec_attach(const char *path);
 KciVec *kci_vec_attach_mem(const void *image, size_t len);
@@ -245,11 +353,15 @@ int64_t kci_vec_squeeze(KciVec *v);
  * out of core dumps, 2 = locked in RAM (0 = neither, e.g. on Windows without a raised working set), -1 error. */
 int     kci_vec_protect(KciVec *v);
 
+/* One way: the floats are wiped and freed. Returns 0, or -1 (not built, no resident floats, floats mapped from a
+ * file, halves made already). */
+int     kci_vec_half_floats(KciVec *v);
+
 /* How much of the index is plaintext in RAM, in bytes, by kind: out[0] vector codes (int8 rows, 4-bit / low-rank
- * list codes) out[1] floats kept in RAM (0 if mmap'd or absent) out[2] derived from the vectors (centroids,
- * projection, codebooks, per-list bases) out[3] graph (neighbour lists, levels, tombstones) out[4] caller ids (and
- * the id lookup table) out[5] total Allocated sizes (capacity, not only live rows): what is in memory. Searchers'
- * scratch (the last query) is not counted. 0 / -1. */
+ * list codes) out[1] floats kept in RAM (0 if mmap'd or absent; or the halves) out[2] derived from the vectors
+ * (centroids, projection, codebooks, per-list bases) out[3] graph (neighbour lists, levels, tombstones) out[4]
+ * caller ids (and the id lookup table) out[5] total Allocated sizes (capacity, not only live rows): what is in
+ * memory. Searchers' scratch (the last query) is not counted. 0 / -1. */
 int     kci_vec_plain_bytes(const KciVec *v, uint64_t out[6]);
 
 /* Introspection. */

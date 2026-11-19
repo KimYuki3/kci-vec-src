@@ -1,11 +1,11 @@
 # KCI-Vec — source
 
-**Fast, compact vector search you embed in your application.** One C file (`kci_vec.c` + `kci_vec.h`), no
+**Fast, compact vector search you embed in your application.** One C file (`kci_vec.c`) and two headers (`kci_vec.h`, `kci_crypt.h`), no
 dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec. The evaluation wheel (a pip-installable binary, which also supports L2 distance) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.3: cosine, Euclidean (L2) distance and inner product). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -51,8 +51,8 @@ or over data that should not leave the machine.
 - A Python client (`clients/python`, ctypes + NumPy) with a small BM25 index for hybrid keyword + vector ranking.
 - An ANN-Benchmarks component (`integrations/ann-benchmarks`).
 
-**Not in this release:** the L2 (Euclidean) index — it is in the evaluation wheel, and its source will follow later;
-this source is cosine only.
+**New in the source with 0.2.3:** the Euclidean (L2) index (`kci_vec_new_l2`) and the inner-product index (`kci_vec_new_ip`).
+The quantized graph now goes into both the read-only image and the encrypted save, so an opened index uses it as it is.
 
 ---
 
@@ -87,7 +87,7 @@ All figures are the author's own measurements and have not been independently ve
 
 **Where it is weaker**
 - The graph index (compact layout) is large: 3.3–4.3× glass's memory on VIBE yahoo (best-point indexes).
-- On 1024-dimensional L2 data (VIBE agnews), it does not reach glass from recall 0.95 up (L2 is in the evaluation wheel only, not in this source).
+- On 1024-dimensional L2 data (VIBE agnews), versions up to 0.2.2 did not reach glass from recall 0.95 up. 0.2.3 does (see Speed below), but its index takes about twice glass's memory.
 - On ARM (Apple M2) it builds and the tests pass, but the partitioned index and the quantized graph have no ARM SIMD path and run slower than on x86.
 
 ---
@@ -142,8 +142,10 @@ KCI-Vec is wheel 0.2.1.
 - One run each, the author's own measurements. The others ran with VIBE's own grids, on the same machines a day or two
   before KCI-Vec.
 - **KCI-Vec's grid was widened after looking at results on this dataset** (two dims per code, int8 re-scoring, ef 220 / 250).
-- On 1024-dimensional L2 data (agnews-mxbai-1024-euclidean, 9950X, same day) glass is faster from recall 0.95 up:
-  KCI-Vec graph 9,653 / 6,328 / 3,470, glass 9,875 / 7,425 / 4,693.
+- On 1024-dimensional L2 data (agnews-mxbai-1024-euclidean, 9950X) glass was faster than 0.2.1 from recall 0.95 up
+  (KCI-Vec graph 9,653 / 6,328 / 3,470, glass 9,875 / 7,425 / 4,693). Measured again with the 0.2.3 source on one night:
+  KCI-Vec 12,464 / 9,631 / 5,912, glass 9,877 / 7,378 / 4,961 (2026-11-19, one run; the KCI-Vec settings were chosen by us).
+  Index memory: KCI-Vec 5.0-7.4 GB, glass 2.5-3.6 GB.
 - Not yet submitted to VIBE. Not compared with the figures on vector-index-bench.github.io (another time, other machines).
 
 ---
@@ -157,7 +159,7 @@ ScaNN's anisotropic loss, NGT's ε search).
 ### Where it is not ahead
 
 - Memory: the fastest graph settings take 3.3–4.3× glass's memory (VIBE yahoo, Xeon).
-- 1024-dimensional L2 data (VIBE agnews): glass is faster from recall 0.95 up.
+- 1024-dimensional L2 data (VIBE agnews): the index takes about twice glass's memory (5.0-7.4 GB against 2.5-3.6 GB).
 
 ---
 

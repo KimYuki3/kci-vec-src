@@ -151,11 +151,115 @@ int main(void){
             CHECK(kci_vec_attach_mem(alt, len) == NULL, "wrong magic attached");
             memcpy(alt, buf, len); uint32_t *hdr = (uint32_t*)(alt + 8); hdr[3] += 1;   /* count + 1: lengths no longer match */
             CHECK(kci_vec_attach_mem(alt, len) == NULL, "wrong count attached");
+            {
+                uint64_t o0, big; memcpy(&o0, buf + 96, 8);
+                CHECK(o0 == 320, "header layout changed: off[0] = %llu", (unsigned long long)o0);
+                if(o0 == 320){
+                    memcpy(alt, buf, len); big = UINT64_MAX - 63; memcpy(alt + 96 + 8, &big, 8);          /* off of the rows */
+                    CHECK(kci_vec_attach_mem(alt, len) == NULL, "row offset near 2^64 attached");
+                    memcpy(alt, buf, len); big = UINT64_MAX - 127; memcpy(alt + 96, &big, 8);            /* off of the ids */
+                    CHECK(kci_vec_attach_mem(alt, len) == NULL, "id offset near 2^64 attached");
+                    memcpy(alt, buf, len); big = UINT64_MAX - 255; memcpy(alt + 200 + 8 * 10, &big, 8);   /* a length */
+                    CHECK(kci_vec_attach_mem(alt, len) == NULL, "length near 2^64 attached");
+                    memcpy(alt, buf, len); big = UINT64_MAX; memcpy(alt + 304, &big, 8);                 /* total */
+                    CHECK(kci_vec_attach_mem(alt, len) == NULL, "total 2^64 - 1 attached");
+                    memcpy(alt, buf, len); big = UINT64_MAX - 63; memcpy(alt + 96 + 8 * 12, &big, 8);    /* the last offset */
+                    CHECK(kci_vec_attach_mem(alt, len) == NULL, "last offset near 2^64 attached");
+                } }
             CHECK(kci_vec_attach_mem(buf, 100) == NULL, "short buffer attached");
             CHECK(kci_vec_attach("no_such_file.kvimg") == NULL, "missing file attached");
             free(alt); free(buf); remove("test_image_bad.kvimg");
         }
         if(a) kci_vec_free(a);
+        kci_vec_free(v);
+        remove(path);
+    }
+    for(int hv = 0; hv < 2; hv++){                 /* 0: floats, 1: halves */
+        KciVec *v = kci_vec_new(D, 16, 100); kci_vec_keep_float(v, 1);
+        for(int i = 0; i < N; i++) kci_vec_add(v, 1000 + (uint64_t)i, X + (size_t)i * D);
+        kci_vec_build(v, 0, NULL);
+        for(int i = 0; i < 30; i++) CHECK(kci_vec_delete(v, 1000 + 11 * i) == 0, "delete before the graph image");
+        CHECK(kci_vec_build_qg_ex(v, 2, 16, 0) == 0, "build_qg_ex");
+        if(hv) CHECK(kci_vec_half_floats(v) == 0, "half_floats");
+        const char *path = "test_image_g.kvimg";
+        CHECK(kci_vec_image_save(v, path) == 0, "image_save with a graph");
+        KciVec *a = kci_vec_attach(path);
+        CHECK(a != NULL, "attach with a graph");
+        if(a){
+            KciVecSearcher *sv = kci_vec_searcher_new(v), *sa = kci_vec_searcher_new(a);
+            uint64_t iv[64], ia[64]; float fv[64], fa[64], q[64]; int bad = 0;
+            for(int mode = 0; mode < 3; mode++){   /* 0 plain graph, 1 quantized graph + rerank, 2 + short rows */
+                CHECK(kci_vec_searcher_set_qg(sv, mode > 0) == 0 && kci_vec_searcher_set_qg(sa, mode > 0) == 0, "set_qg %d", mode);
+                kci_vec_searcher_set_qg_exact(sv, mode == 2 ? 2 : 0); kci_vec_searcher_set_qg_exact(sa, mode == 2 ? 2 : 0);
+                for(int t = 0; t < 30; t++){
+                    for(int d = 0; d < D; d++) q[d] = frand();
+                    int nv = mode ? kci_vec_search_rerank(sv, q, K, 80, 40, iv, fv) : kci_vec_search_r(sv, q, K, 80, iv, fv);
+                    int na = mode ? kci_vec_search_rerank(sa, q, K, 80, 40, ia, fa) : kci_vec_search_r(sa, q, K, 80, ia, fa);
+                    if(nv != K || na != K){ bad++; continue; }
+                    for(int i = 0; i < K; i++) if(iv[i] != ia[i] || fv[i] != fa[i]) bad++;
+                    for(int i = 0; i < K; i++) for(int j = 0; j < 30; j++) if(ia[i] == 1000 + 11 * (uint64_t)j) bad++;   /* a deleted id */
+                }
+            }
+            CHECK(bad == 0, "attached graph (halves %d): %d differences", hv, bad);
+            for(int d = 0; d < D; d++) q[d] = frand();
+            CHECK(kci_vec_search(a, q, K, 50, ia, fa) == K, "graph search on an attached index with a graph");
+            CHECK(kci_vec_insert(a, 1, q) < 0 && kci_vec_delete(a, 1001) < 0 && kci_vec_build(a, 1, NULL) < 0, "writes on attached");
+            CHECK(kci_vec_image_save(a, "test_image_g2.kvimg") == 0, "image_save from an attached index");
+            KciVec *b = kci_vec_attach("test_image_g2.kvimg");
+            CHECK(b != NULL, "attach the second generation");
+            if(b){ KciVecSearcher *sb = kci_vec_searcher_new(b); int bad2 = 0;
+                kci_vec_searcher_set_qg(sb, 1); kci_vec_searcher_set_qg_exact(sb, 2);
+                for(int t = 0; t < 10; t++){ for(int d = 0; d < D; d++) q[d] = frand();
+                    int na = kci_vec_search_rerank(sa, q, K, 80, 40, ia, fa), nb = kci_vec_search_rerank(sb, q, K, 80, 40, iv, fv);
+                    if(na != K || nb != K){ bad2++; continue; }
+                    for(int i = 0; i < K; i++) if(iv[i] != ia[i] || fv[i] != fa[i]) bad2++; }
+                CHECK(bad2 == 0, "second generation: %d differences", bad2);
+                kci_vec_searcher_free(sb); kci_vec_free(b); }
+            remove("test_image_g2.kvimg");
+            kci_vec_searcher_free(sv); kci_vec_searcher_free(sa);
+            kci_vec_free(a);
+        }
+        {   /* damaged graph parts */
+            FILE *f = fopen(path, "rb"); fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+            uint8_t *buf = malloc(len), *alt = malloc(len); CHECK(fread(buf, 1, len, f) == (size_t)len, "read the graph image back"); fclose(f);
+            long g = -1; for(long o = 0; o + 8 <= len; o += 64) if(memcmp(buf + o, "KCIVIGR1", 8) == 0){ g = o; break; }
+            CHECK(g > 0, "graph part not found");
+            if(g > 0){
+                KciVec *t;
+                CHECK((t = kci_vec_attach_mem(buf, len)) != NULL, "attach_mem of the whole image"); if(t) kci_vec_free(t);
+                CHECK(kci_vec_attach_mem(buf, len - 64) == NULL, "graph part cut short attached");
+                memcpy(alt, buf, len); alt[g + 2] ^= 0xFF;
+                CHECK(kci_vec_attach_mem(alt, len) == NULL, "wrong graph magic attached");
+                memcpy(alt, buf, len); { uint32_t n; memcpy(&n, alt + g + 8, 4); memcpy(alt + g + 20, &n, 4); }      /* ep = n */
+                CHECK(kci_vec_attach_mem(alt, len) == NULL, "entry point past the count attached");
+                memcpy(alt, buf, len); { uint64_t l0; memcpy(&l0, alt + g + 96 + 8, 8); uint32_t cnt, big = 0xFFFFFFF0u;
+                    memcpy(&cnt, alt + l0, 4); CHECK(cnt > 0, "row 0 has no neighbours"); memcpy(alt + l0 + 4, &big, 4); }   /* a link past the count */
+                CHECK(kci_vec_attach_mem(alt, len) == NULL, "link past the count attached");
+                memcpy(alt, buf, len); { uint64_t l0; memcpy(&l0, alt + g + 96 + 8, 8); uint32_t big = 1000; memcpy(alt + l0, &big, 4); }   /* more links than slots */
+                CHECK(kci_vec_attach_mem(alt, len) == NULL, "too many links attached");
+                {
+                    uint64_t o0, big, tot; memcpy(&o0, buf + g + 96, 8); memcpy(&tot, buf + g + 256, 8);
+                    const uint64_t first = ((uint64_t)g + 264 + 63) / 64 * 64;
+                    CHECK(o0 == first && tot == (uint64_t)len, "graph header layout changed: off[0] = %llu, total = %llu", (unsigned long long)o0, (unsigned long long)tot);
+                    if(o0 == first && tot == (uint64_t)len){
+                        memcpy(alt, buf, len); big = UINT64_MAX - 63; memcpy(alt + g + 96 + 8 * 2, &big, 8);     /* off of the upper links */
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "graph offset near 2^64 attached");
+                        memcpy(alt, buf, len); big = UINT64_MAX - 63; memcpy(alt + g + 96 + 8 * 9, &big, 8);     /* the last offset (halves) */
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "last graph offset near 2^64 attached");
+                        memcpy(alt, buf, len); big = UINT64_MAX - 255; memcpy(alt + g + 176 + 8 * 2, &big, 8);   /* len of the upper links (a multiple of 4) */
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "graph length near 2^64 attached");
+                        memcpy(alt, buf, len); big = UINT64_MAX - 255; memcpy(alt + g + 176 + 8 * 5, &big, 8);   /* a length that is 0 in this image */
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "unused graph length near 2^64 attached");
+                        memcpy(alt, buf, len); big = UINT64_MAX; memcpy(alt + g + 256, &big, 8);                 /* total */
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "graph total 2^64 - 1 attached");
+                        memcpy(alt, buf, len); big = 0; memcpy(alt + g + 96 + 8 * 5, &big, 8);
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "graph offset before the graph part attached");
+                        memcpy(alt, buf, len); big = (uint64_t)g + 64; memcpy(alt + g + 96 + 8 * 5, &big, 8);    /* an offset inside the header */
+                        CHECK(kci_vec_attach_mem(alt, len) == NULL, "graph offset inside its header attached");
+                    } }
+            }
+            free(alt); free(buf);
+        }
         kci_vec_free(v);
         remove(path);
     }

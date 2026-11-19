@@ -24,8 +24,8 @@ Contents: [1. The two indexes](#1-the-two-indexes) · [2. Python step by step](#
 | Insert / delete | Yes | Yes |
 | Saved with `save()` | Yes (the quantized graph is **not**; see [Rules](#5-rules)) | Yes |
 
-Both use cosine similarity by default; the vectors are normalized when they are added. The wheel also has Euclidean
-(L2) distance (`metric="l2"`).
+Both use cosine similarity by default; the vectors are normalized when they are added. Euclidean (L2) distance (`metric="l2"`) and inner product
+(`metric="ip"`) are there too.
 
 Which to choose: try both on your data. The partitioned index needs no graph build and its build is simpler to
 tune; the quantized graph gave the highest speeds in the benchmarks but takes more memory.
@@ -110,7 +110,7 @@ Product codes, names and numbers that embeddings miss are found by the word side
 split into two-character pieces, so no dictionary is needed. The word index is plain JSON: if the text is
 sensitive, keep that file encrypted yourself.
 
-### Euclidean (L2) distance (wheel only)
+### Euclidean (L2) distance
 
 ```python
 v = KciVec(dim=128, rerank=200, metric="l2")
@@ -118,7 +118,7 @@ v = KciVec(dim=128, rerank=200, metric="l2")
 
 Scores are then squared distances, smallest first. Everything else works as for cosine. `max_norm` (default 0) is
 the largest vector length the index will accept; 0 takes it from the vectors added before the first build, and a
-later `insert` of a much longer vector fails. The L2 source is not in this repository yet.
+later `insert` of a much longer vector fails. The L2 source is in this repository from version 0.2.3.
 
 ---
 
@@ -131,7 +131,7 @@ later `insert` of a much longer vector fails. The L2 source is not in this repos
 | `dim` | vector length (any length) |
 | `M`, `efc` | graph build settings: neighbours per node and the build-time search width. 16 / 200 are good defaults; 8 suits 384-dim text embeddings with the quantized graph |
 | `rerank` | > 0 keeps the float vectors and is the default shortlist re-scored exactly. Needed for `build_lists`, `insert`, `compact` |
-| `metric` | `"cosine"` or `"l2"` (wheel only) |
+| `metric` | `"cosine"`, `"l2"` or `"ip"` (inner product) |
 
 ### Adding
 

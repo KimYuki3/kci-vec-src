@@ -14,6 +14,9 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
 #ifdef _WIN32
 #include "kci_win_compat.h"
 #else
@@ -43,14 +46,18 @@ static void l2norm(int dim, const float *src, float *dst) {
 /* ── binary heap of (float key, id) ─────────────────────────────────────── */
 typedef struct { float d; uint32_t id; } He;
 typedef struct { He *a; int n, cap, ismax; } Heap;
-static void hp_init(Heap *h, int cap, int ismax){ h->a=malloc(sizeof(He)*cap); h->n=0; h->cap=cap; h->ismax=ismax; }
+static void hp_init(Heap *h, int cap, int ismax){ h->a=malloc(sizeof(He)*(size_t)(cap>0?cap:1)); h->n=0; h->cap=h->a?(cap>0?cap:1):0; h->ismax=ismax; }
 static inline int hp_less(Heap *h, He x, He y){ return h->ismax ? x.d>y.d : x.d<y.d; }
 static void hp_push(Heap *h, float d, uint32_t id){
-    if(h->n>=h->cap){ h->cap*=2; h->a=realloc(h->a,sizeof(He)*h->cap); }
+    if(h->n>=h->cap){ int nc = h->cap>0 ? h->cap*2 : 16; He *na = nc>h->cap ? realloc(h->a,sizeof(He)*(size_t)nc) : NULL;
+        if(!na) return;
+        h->a=na; h->cap=nc; }
     int i=h->n++; h->a[i].d=d; h->a[i].id=id;
     while(i){ int p=(i-1)/2; if(hp_less(h,h->a[i],h->a[p])){He t=h->a[i];h->a[i]=h->a[p];h->a[p]=t;i=p;}else break; }
 }
 static inline He hp_top(Heap *h){ return h->a[0]; }
+static inline void hp_replace_top(Heap *h, float d, uint32_t id){ h->a[0].d=d; h->a[0].id=id; int i=0;
+    for(;;){ int l=2*i+1,r=2*i+2,m=i; if(l<h->n&&hp_less(h,h->a[l],h->a[m]))m=l; if(r<h->n&&hp_less(h,h->a[r],h->a[m]))m=r; if(m==i)break; He t=h->a[i];h->a[i]=h->a[m];h->a[m]=t;i=m; } }
 static void hp_pop(Heap *h){ h->a[0]=h->a[--h->n]; int i=0;
     for(;;){ int l=2*i+1,r=2*i+2,m=i; if(l<h->n&&hp_less(h,h->a[l],h->a[m]))m=l; if(r<h->n&&hp_less(h,h->a[r],h->a[m]))m=r; if(m==i)break; He t=h->a[i];h->a[i]=h->a[m];h->a[m]=t;i=m; } }
 
@@ -60,6 +67,8 @@ struct KciVec {
     int8_t   *vq;       /* [cap*dim] signed int8 codes (x*gs), row-major */
     float     gs;       /* global quantization scale: code = round(x*gs), x unit-norm */
     float    *vf;       /* [cap*dim] retained unit floats (re-rank); malloc'd or mmap'd */
+    uint16_t *vh;
+    uint32_t  vhn;
     int       keepf;    /* user asked to retain floats (rerank); else freed at build */
     int       protect;
     int       vf_mmap;  /* 1 = vf is a read-only mmap of a disk file (RAM stays int8) */
@@ -76,7 +85,7 @@ struct KciVec {
     uint32_t  gcap;     /* allocated graph capacity (>= gN); grows on incremental insert */
     int built;
     uint8_t  *lock;
-    uint32_t  bnext;
+    uint32_t  bnext, bstep;      /* build: the next turn, and the stride that turns a turn into a row (kv_build_step) */
     pthread_mutex_t epmtx;
     /* incremental update (tombstone delete + live insert) */
     uint8_t  *dead;     /* [gcap] 1 = tombstoned (excluded from results, kept as a graph hop) */
@@ -87,6 +96,10 @@ struct KciVec {
     struct KvIvf *ivf;
     struct KvQg  *qg;
     KciVecFloatFn ffn; void *fctx; void (*ffree)(void *);
+    struct KvQl *ql; uint32_t rowgen;
+    struct KvVt *vt;
+    float *ipm; float ipmax; int ipc;   /* ipc: subtract the mean (kci_vec_set_ip_centre); off = ipm stays 0 */
+    int l2, udim, l2fin; float l2s, l2lam, l2ab, l2M2, l2me;
     int ivf_dp; float ivf_avqt;
     int ivf_km_iters; uint32_t ivf_km_sample;
     const uint8_t *img; size_t imglen; int img_mmap;
@@ -98,6 +111,8 @@ static int kv_ivf_add(KciVec *v, uint32_t i);
 static int kv_ensure_dead(KciVec *v);
 struct KvQg;
 static void kv_qg_free(struct KvQg *g);
+struct KvQl; static void kv_ql_free(struct KvQl *g);
+struct KvVt; static void kv_vt_free(struct KvVt *g);
 struct KvBq;
 static void kv_bq_free(struct KvBq *q);
 #define KV_HEMPTY 0xFFFFFFFFu
@@ -151,6 +166,10 @@ static void *kv_valloc(const KciVec *v, size_t n){
 #ifndef _WIN32
     if(v->protect){ size_t ps = kv_pagesz(); void *p = NULL; n = (n + ps - 1) / ps * ps;
         return posix_memalign(&p, ps, n ? n : ps) == 0 ? p : NULL; }
+#endif
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(KV_VALLOC_NOHUGE)
+    if(!v->protect){ const size_t al=(size_t)2<<20;
+        if(n>=4*al){ void *p=NULL; size_t sz=(n+al-1)/al*al; if(posix_memalign(&p,al,sz)==0){ madvise(p,sz,MADV_HUGEPAGE); return p; } } }
 #endif
     (void)v; return malloc(n ? n : 1);
 }
@@ -220,8 +239,8 @@ static int ensure_graph_cap(KciVec *v, uint32_t need){
     return 0;
 }
 
-static inline int32_t sdot(const KciVec *v, const int8_t *a, const int8_t *b){
-    int dim=v->dim; int i=0; int32_t s=0;
+static inline int32_t sdot_n(int dim, const int8_t *a, const int8_t *b){
+    int i=0; int32_t s=0;
 #if defined(__ARM_NEON)
   #if defined(__ARM_FEATURE_DOTPROD)
     int32x4_t acc=vdupq_n_s32(0);
@@ -267,6 +286,7 @@ static inline void sq_encode(const KciVec *v, const float *x, int8_t *code){
     }
 }
 /* navigation distance: smaller = closer. gs² is constant so ranking == cosine. */
+static inline int32_t sdot(const KciVec *v, const int8_t *a, const int8_t *b){ return sdot_n(v->dim, a, b); }
 static inline float vdist(const KciVec *v, const int8_t *a, const int8_t *b){ return -(float)sdot(v, a, b); }
 static inline uint32_t* g_l0(KciVec *v, uint32_t i){ return v->l0 + (size_t)i*(v->M0+1); }
 static inline uint32_t* g_lu(KciVec *v, uint32_t i, int l){ return v->lu[i] + (size_t)(l-1)*(v->M+1); }
@@ -276,19 +296,30 @@ static inline void nlock(KciVec *v, uint32_t i){ while(__atomic_test_and_set(&v-
 static inline void nunlock(KciVec *v, uint32_t i){ __atomic_clear(&v->lock[i], __ATOMIC_RELEASE); }
 
 /* per-thread search scratch */
-typedef struct { Heap C, W; uint16_t *vis; uint32_t visn; uint16_t epoch; He *tmp; int tmpcap; float eps;   /* eps: see kci_vec_searcher_set_eps */
-                 const float *qf; int use_qg; uint8_t *lut; float *lutf; int lutM; struct KvBq *bq; } Scr;   /* bq: the quantized graph's candidate buckets */
-static void scr_init(Scr *s, uint32_t N, int wcap){ hp_init(&s->C,4096,0); hp_init(&s->W,wcap,1); s->vis=calloc(N,sizeof(uint16_t)); s->visn=N; s->epoch=0; s->tmpcap=wcap+16; s->tmp=malloc(sizeof(He)*s->tmpcap); s->eps=0;
-                                                    s->qf=NULL; s->use_qg=0; s->lut=NULL; s->lutf=NULL; s->lutM=0; s->bq=NULL; }
-static void scr_free(Scr *s){ free(s->C.a); free(s->W.a); free(s->vis); free(s->tmp);
+typedef struct { Heap C, W; uint64_t *bm; uint32_t *bl; uint32_t bn, visn; uint16_t *vis; uint32_t vis16n; uint16_t epoch; He *tmp; int tmpcap; float eps;   /* eps: see kci_vec_searcher_set_eps */
+                 const float *qf; int use_qg; int qgx; uint8_t *lut; float *lutf; int lutM; struct KvBq *bq;
+                 const uint32_t *seeds; int nseeds;
+                 int (*filt)(uint64_t, void *); void *fctx; int fbudget, fvis; } Scr;   /* bq: the quantized graph's candidate buckets */
+static inline size_t kv_bm_words(uint32_t N){ return ((size_t)N+63)/64+1; }
+static inline int scr_ok(const Scr *s){ return s->bm && s->bl && s->C.a && s->W.a && s->tmp; }
+static void scr_init(Scr *s, uint32_t N, int wcap){ hp_init(&s->C,4096,0); hp_init(&s->W,wcap,1); s->bm=calloc(kv_bm_words(N),sizeof(uint64_t)); s->bl=malloc(kv_bm_words(N)*sizeof(uint32_t)); s->bn=0; s->visn=N;
+                                                    s->vis=NULL; s->vis16n=0; s->epoch=0; s->tmpcap=wcap+16; s->tmp=malloc(sizeof(He)*s->tmpcap); s->eps=0;
+                                                    s->qf=NULL; s->use_qg=0; s->qgx=0; s->filt=NULL; s->fctx=NULL; s->fbudget=0; s->fvis=0; s->lut=NULL; s->lutf=NULL; s->lutM=0; s->bq=NULL; s->seeds=NULL; s->nseeds=0; }
+static void scr_free(Scr *s){ free(s->C.a); free(s->W.a); free(s->bm); free(s->bl); free(s->vis); free(s->tmp);
                               if(s->lut) kv_wipe(s->lut, (size_t)(s->lutM+4)*16); if(s->lutf) kv_wipe(s->lutf, (size_t)s->lutM*16*sizeof(float)); free(s->lut); free(s->lutf); kv_bq_free(s->bq); }
-static inline void scr_next(Scr *s){ if(++s->epoch==0){ memset(s->vis,0,(size_t)s->visn*sizeof(uint16_t)); s->epoch=1; } }
-static inline int visited(Scr *s, uint32_t id){ if(s->vis[id]==s->epoch)return 1; s->vis[id]=s->epoch; return 0; }
+static inline void scr_next(Scr *s){ for(uint32_t i=0;i<s->bn;i++) s->bm[s->bl[i]]=0; s->bn=0; }
+static inline int visited(Scr *s, uint32_t id){ uint64_t *w=&s->bm[id>>6], m=1ULL<<(id&63);
+    if(*w&m) return 1;
+    if(!*w) s->bl[s->bn++]=id>>6;               /* first bit of this word since scr_next: at most one entry a word */
+    *w|=m; return 0; }
 static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore8);
 static int scr_fit(Scr *s, uint32_t N){
     if(s->visn>=N) return 0;
-    uint16_t *nv=realloc(s->vis,(size_t)N*sizeof(uint16_t)); if(!nv) return -1;
-    memset(nv,0,(size_t)N*sizeof(uint16_t)); s->vis=nv; s->visn=N; s->epoch=0; return 0;
+    size_t ow=kv_bm_words(s->visn), nw=kv_bm_words(N);
+    uint64_t *nb=realloc(s->bm,nw*sizeof(uint64_t)); if(!nb) return -1;
+    s->bm=nb; memset(nb+ow,0,(nw-ow)*sizeof(uint64_t));          /* the touched words keep their place */
+    uint32_t *nl=realloc(s->bl,nw*sizeof(uint32_t)); if(!nl) return -1;
+    s->bl=nl; s->visn=N; return 0;
 }
 
 static int default_threads(int t){
@@ -306,21 +337,26 @@ static inline float sl_bound(Heap *W, int ef, float k1, float gs2){
 static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int layer, Scr *s){
     Heap *C=&s->C, *W=&s->W; scr_next(s); C->n=0; W->n=0;
     const float gs2=v->gs*v->gs, k1=(layer==0 && s->eps>0) ? 1.0f+s->eps : 0.0f;
+    const size_t l0b=(size_t)(v->M0+1)*sizeof(uint32_t); const int dim=v->dim;
     float d0=vdist(v,q,vrow(v,ep)); visited(s,ep);
     hp_push(C,d0,ep); hp_push(W,d0,ep);
+    if(layer==0) for(int i=0;i<s->nseeds;i++){ uint32_t nb=s->seeds[i]; if(nb>=v->gN || visited(s,nb)) continue;
+        float d=vdist(v,q,vrow(v,nb)); hp_push(C,d,nb);
+        if(W->n<ef || d<hp_top(W).d){ if(W->n<ef) hp_push(W,d,nb); else hp_replace_top(W,d,nb); } }
     while(C->n){
         He c=hp_top(C); hp_pop(C);
         if(c.d>sl_bound(W,ef,k1,gs2)) break;
+        if(layer==0 && C->n){ const char *nx=(const char*)g_l0(v,hp_top(C).id); for(size_t o=0;o<l0b;o+=64) __builtin_prefetch(nx+o); }
         uint32_t *lk=g_links(v,c.id,layer);
         uint32_t cnt=__atomic_load_n(&lk[0], __ATOMIC_ACQUIRE);
-        for(uint32_t e=1;e<=cnt;e++){ uint32_t nb=lk[e]; if(nb<v->gN) __builtin_prefetch(&s->vis[nb]); }
         uint32_t cand[256]; int nc=0;
         for(uint32_t e=1;e<=cnt && nc<256;e++){
             uint32_t nb=lk[e];
             if(nb>=v->gN) continue;                  /* guard a torn read */
             if(visited(s,nb)) continue;
             const int8_t *r=vrow(v,nb);
-            __builtin_prefetch(r); __builtin_prefetch(r+v->dim-1);
+            for(int o=0;o<dim;o+=64) __builtin_prefetch(r+o);
+            __builtin_prefetch(r+dim-1);
             cand[nc++]=nb;
         }
         float bound=sl_bound(W,ef,k1,gs2);              /* recomputed only when W changes */
@@ -329,7 +365,7 @@ static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int la
             float d=vdist(v,q,vrow(v,nb));
             if(d<bound){                                 /* within the bound: explore from it ... */
                 hp_push(C,d,nb);
-                if(W->n<ef || d<hp_top(W).d){ hp_push(W,d,nb); if(W->n>ef) hp_pop(W); bound=sl_bound(W,ef,k1,gs2); }   /* ... and keep it if among the ef best */
+                if(W->n<ef || d<hp_top(W).d){ if(W->n<ef) hp_push(W,d,nb); else hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,gs2); }   /* ... and keep it if among the ef best */
             }
         }
     }
@@ -420,6 +456,11 @@ static void insert_node(KciVec *v, uint32_t i, Scr *s){
     }
 }
 
+static uint32_t kv_build_step(uint32_t N){
+    if(N<3) return 1;
+    uint32_t st=(uint32_t)((double)N*0.6180339887);
+    for(;;st++){ uint32_t x=N, y=st%N; while(y){ uint32_t r=x%y; x=y; y=r; } if(x==1) return st%N; }
+}
 typedef struct { KciVec *v; } BuildArg;
 static void* build_worker(void *arg){
     KciVec *v=((BuildArg*)arg)->v;
@@ -428,6 +469,7 @@ static void* build_worker(void *arg){
         uint32_t i=__atomic_fetch_add(&v->bnext,1,__ATOMIC_RELAXED);
         if(i>=v->gN) break;
         if(i==0) continue;            /* node 0 seeds the graph as initial ep */
+        i=(uint32_t)(((uint64_t)i*v->bstep)%v->gN);
         insert_node(v,i,&s);
     }
     scr_free(&s);
@@ -475,18 +517,27 @@ static uint32_t repair_reach(KciVec *v){
     return left;
 }
 
+static void kv_permute_rows(void *rows, size_t row, const uint32_t *order, uint32_t n, uint8_t *done, void *spare){
+    char *b=rows;
+    for(uint32_t s=0;s<n;s++){ if(done[s]) continue;
+        if(order[s]==s){ done[s]=1; continue; }
+        memcpy(spare, b+(size_t)s*row, row);
+        uint32_t i=s;
+        for(;;){ uint32_t o=order[i]; done[i]=1;
+            if(o==s){ memcpy(b+(size_t)i*row, spare, row); break; }
+            memcpy(b+(size_t)i*row, b+(size_t)o*row, row); i=o; } }
+}
 static int reorder_bfs(KciVec *v){
     uint32_t n=v->gN;
     if(n<2 || v->count!=n || !v->built || v->vf_mmap) return -1;
     uint32_t *order=malloc((size_t)n*4), *pos=malloc((size_t)n*4); uint8_t *seen=calloc(n,1);
-    int8_t *nq=malloc((size_t)v->cap*v->dim);
-    float *nf=v->vf ? malloc((size_t)v->cap*v->dim*sizeof(float)) : NULL;
+    void *spare=malloc((size_t)v->dim*sizeof(float));
     uint64_t *nid=malloc((size_t)v->cap*sizeof(uint64_t));
     uint8_t *nlv=malloc(v->gcap), *ndd=malloc(v->gcap);
     uint32_t *nl0=malloc((size_t)v->gcap*(v->M0+1)*sizeof(uint32_t));
     uint32_t **nlu=calloc(v->gcap,sizeof(uint32_t*));
-    if(!order||!pos||!seen||!nq||(v->vf&&!nf)||!nid||!nlv||!ndd||!nl0||!nlu){
-        free(order);free(pos);free(seen);free(nq);free(nf);free(nid);free(nlv);free(ndd);free(nl0);free(nlu); return -1; }
+    if(!order||!pos||!seen||!spare||!nid||!nlv||!ndd||!nl0||!nlu){
+        free(order);free(pos);free(seen);free(spare);free(nid);free(nlv);free(ndd);free(nl0);free(nlu); return -1; }
     uint32_t h=0,t=0; order[t++]=v->ep; seen[v->ep]=1;
     while(h<t){ uint32_t *lk=g_l0(v,order[h++]);
         for(uint32_t e=1;e<=lk[0];e++){ uint32_t nb=lk[e]; if(nb<n && !seen[nb]){ seen[nb]=1; order[t++]=nb; } } }
@@ -495,17 +546,16 @@ static int reorder_bfs(KciVec *v){
     memset(nl0+(size_t)n*(v->M0+1),0,(size_t)(v->gcap-n)*(v->M0+1)*sizeof(uint32_t));   /* room for inserts */
     memset(nlv+n,0,v->gcap-n); memset(ndd+n,0,v->gcap-n);
     size_t D=(size_t)v->dim;
+    memset(seen,0,n); kv_permute_rows(v->vq, D, order, n, seen, spare);
+    if(v->vf){ memset(seen,0,n); kv_permute_rows(v->vf, D*sizeof(float), order, n, seen, spare); }
+    kv_wipe(spare, D*sizeof(float)); free(spare);
     for(uint32_t i=0;i<n;i++){ uint32_t o=order[i];
-        memcpy(nq+i*D, v->vq+o*D, D);
-        if(nf) memcpy(nf+i*D, v->vf+o*D, D*sizeof(float));
         nid[i]=v->vid[o]; nlv[i]=v->level[o]; ndd[i]=v->dead[o]; nlu[i]=v->lu[o];
         const uint32_t *src=g_l0(v,o); uint32_t *dst=nl0+(size_t)i*(v->M0+1);
         dst[0]=src[0]; for(uint32_t e=1;e<=src[0];e++) dst[e]=pos[src[e]];
         for(int l=1;l<=nlv[i];l++){ uint32_t *u=nlu[i]+(size_t)(l-1)*(v->M+1);
             for(uint32_t e=1;e<=u[0];e++) u[e]=pos[u[e]]; }
     }
-    kv_vfree(v, v->vq, (size_t)v->cap*v->dim); v->vq=nq;
-    if(nf){ kv_vfree(v, v->vf, (size_t)v->cap*v->dim*sizeof(float)); v->vf=nf; }
     free(v->vid); v->vid=nid;
     kv_wipe(v->level, v->gcap); free(v->level); v->level=nlv; kv_wipe(v->dead, v->gcap); free(v->dead); v->dead=ndd;
     kv_wipe(v->l0, (size_t)v->gcap*(v->M0+1)*sizeof(uint32_t)); free(v->l0); v->l0=nl0;
@@ -516,8 +566,31 @@ static int reorder_bfs(KciVec *v){
     return 0;
 }
 
+static int kv_graph_ok(const KciVec *v, uint32_t n, uint32_t ep, uint32_t ml){
+    if(n==0 || ep>=n || ml>255 || !v->level || !v->l0 || !v->lu || v->level[ep]<ml) return 0;
+    const uint32_t M=(uint32_t)v->M, M0=(uint32_t)v->M0;
+    for(uint32_t i=0;i<n;i++){
+        const uint32_t *r=v->l0+(size_t)i*(M0+1);
+        if(r[0]>M0) return 0;
+        for(uint32_t j=0;j<r[0];j++) if(r[1+j]>=n) return 0;
+        const uint32_t lvl=v->level[i];
+        if(lvl && !v->lu[i]) return 0;
+        for(uint32_t l=0;l<lvl;l++){ const uint32_t *u=v->lu[i]+(size_t)l*(M+1);
+            if(u[0]>M) return 0;
+            for(uint32_t j=0;j<u[0];j++) if(u[1+j]>=n || v->level[u[1+j]]<l+1) return 0; }
+    }
+    return 1;
+}
 /* ── public: lifecycle / add ────────────────────────────────────────────── */
+static void kv_vh_free(KciVec *v){ if(v->vh){ kv_vfree(v, v->vh, (size_t)v->vhn*v->dim*sizeof(uint16_t)); v->vh=NULL; v->vhn=0; } }
+static inline double kv_level_u(uint32_t i){
+    uint64_t z=((uint64_t)i+42)*0x9E3779B97F4A7C15ULL; z=(z^(z>>30))*0xBF58476D1CE4E5B9ULL; z=(z^(z>>27))*0x94D049BB133111EBULL; z^=z>>31;
+    return ((double)(z>>11)+1.0)/9007199254740994.0;
+}
 static void graph_free(KciVec *v){
+    kv_vh_free(v);
+    v->rowgen++; kv_ql_free(v->ql); v->ql=NULL;
+    kv_vt_free(v->vt); v->vt=NULL;
     kv_qg_free(v->qg); v->qg=NULL;
     if(v->lu){ for(uint32_t i=0;i<v->gN;i++) if(v->lu[i]){
                    kv_wipe(v->lu[i], (size_t)(v->level? v->level[i] : 0)*(v->M+1)*sizeof(uint32_t)); free(v->lu[i]); }
@@ -543,6 +616,25 @@ KciVec *kci_vec_new(int dim, int M, int efc){
     pthread_mutex_init(&v->epmtx, NULL);
     return v;
 }
+#ifndef KCI_VEC_NO_L2
+KciVec *kci_vec_new_l2(int dim, int M, int efc, float max_norm){
+    if(dim<=0 || dim>(1<<24) || !(max_norm>=0) || isinf(max_norm)) return NULL;
+    KciVec *v=kci_vec_new(dim+2, M, efc);
+    if(!v) return NULL;
+    v->l2=1; v->udim=dim; v->l2s = max_norm>0 ? 1.0f/max_norm : 0.0f;
+    return v;
+}
+int kci_vec_is_l2(const KciVec *v){ return v && v->l2==1; }
+KciVec *kci_vec_new_ip(int dim, int M, int efc, float max_norm){
+    if(dim<=0 || dim>(1<<24) || !(max_norm>=0) || isinf(max_norm)) return NULL;
+    KciVec *v=kci_vec_new(dim+1, M, efc);
+    if(!v) return NULL;
+    v->l2=2; v->udim=dim; v->ipmax=max_norm; v->l2s=0.0f;   /* the scale comes from the centred rows (kv_l2_fin) */
+    return v;
+}
+#endif
+int kci_vec_set_ip_centre(KciVec *v, int on){ if(!v || v->l2!=2 || v->l2fin) return -1; v->ipc = on!=0; return 0; }
+int kci_vec_metric(const KciVec *v){ return v ? v->l2 : -1; }
 
 /* release the float store, whether malloc'd or mmap-backed */
 static void vf_free(KciVec *v){
@@ -564,7 +656,8 @@ static void vf_free(KciVec *v){
 void kci_vec_free(KciVec *v){
     if(!v) return;
     if(v->img){
-        kv_ivf_free(v->ivf); kv_qg_free(v->qg);
+        kv_ivf_free(v->ivf); kv_qg_free(v->qg); kv_ql_free(v->ql); kv_vt_free(v->vt); free(v->ipm);
+        free(v->lu); free(v->lock);
         if(v->img_mmap) munmap((void*)v->img, v->imglen);
         pthread_mutex_destroy(&v->epmtx);
         free(v); return; }
@@ -573,6 +666,7 @@ void kci_vec_free(KciVec *v){
     kv_vfree(v, v->vq, (size_t)v->cap * v->dim); v->vq = NULL;
     if(v->vf && !v->vf_mmap){ kv_wipe(v->vf, (size_t)v->cap * v->dim * sizeof(float)); if(v->protect) kv_unlock_region(v->vf, (size_t)v->cap * v->dim * sizeof(float)); }
     vf_free(v); free(v->vid);
+    if(v->ipm){ kv_wipe(v->ipm, (size_t)v->udim*sizeof(float)); free(v->ipm); }
     if(v->ffree) v->ffree(v->fctx);
     pthread_mutex_destroy(&v->epmtx);
     free(v);
@@ -607,6 +701,7 @@ int kci_vec_set_params(KciVec *v, int M, int efc){
 int kci_vec_reserve(KciVec *v, uint32_t need){
     if(!v || v->img) return -1;
     if(need <= v->cap) return 0;
+    if(need > (1u<<31)) return -1;
     uint32_t nc = v->cap ? v->cap : 1024;
     while(nc < need) nc *= 2;
     int wantf = (v->building || v->keepf) && !v->vf_mmap && !v->ffn;
@@ -638,15 +733,115 @@ int kci_vec_keep_float(KciVec *v, int on){
     return 0;
 }
 
+#ifndef KCI_VEC_NO_L2
+static __thread double kv_ip_qm;
+static int kv_l2_fits(const KciVec *v, const float *x){
+    if(!v->l2) return 1;
+    if(v->l2==2){ double n2=0;
+        if(!v->l2fin){ if(!(v->ipmax>0)) return 1;
+            for(int d=0;d<v->udim;d++) n2+=(double)x[d]*x[d];
+            return n2 <= (double)v->ipmax*v->ipmax*(1.0+1e-5); }
+        for(int d=0;d<v->udim;d++){ double t=((double)x[d]-v->ipm[d])*v->l2s; n2+=t*t; }
+        return n2 <= 1.0+1e-5; }
+    if(!v->l2fin && v->l2s<=0) return 1;
+    double s=v->l2s, n2=0; for(int d=0;d<v->udim;d++){ double t=x[d]*s; n2+=t*t; }
+    if(!(n2 <= 1.0+1e-5)) return 0;
+    if(!v->l2fin || v->l2==2) return 1;
+    double e=fabs(-n2/2 - v->l2ab);
+    return e <= v->l2me*(1.0+1e-4) + 1e-7;
+}
+static void kv_l2_row(const KciVec *v, const float *x, float *out){   /* out must not alias x */
+    int D=v->udim; double s=v->l2s, n2=0;
+    for(int d=0;d<D;d++){ double t=x[d]*s; n2+=t*t; }
+    if(v->l2==2){ double m2=0;
+        for(int d=0;d<D;d++){ double t=((double)x[d]-v->ipm[d])*s; out[d]=(float)t; m2+=t*t; }
+        out[D]=(float)sqrt(m2<1.0 ? 1.0-m2 : 0.0); return; }
+    double e=v->l2lam*(-n2/2 - v->l2ab), b2=v->l2M2-n2-e*e, inv=1.0/sqrt(v->l2M2);
+    for(int d=0;d<D;d++) out[d]=(float)(x[d]*s*inv);
+    out[D]=(float)(e*inv); out[D+1]=(float)(sqrt(b2>0?b2:0)*inv);
+}
+/* the query in the engine's space (out: udim+2 floats); returns |q|^2 for kv_l2_scores */
+static double kv_l2_query(const KciVec *v, const float *q, float *out){
+    int D=v->udim; double n2=0;
+    if(v->l2==2){ double qm=0;
+        for(int d=0;d<D;d++){ n2+=(double)q[d]*q[d]; qm+=(double)q[d]*v->ipm[d]; out[d]=q[d]; }
+        out[D]=0.0f; kv_ip_qm=qm; return n2; }
+    for(int d=0;d<D;d++){ n2+=(double)q[d]*q[d]; out[d]=q[d]*v->l2s; }
+    out[D]=(float)(1.0/v->l2lam); out[D+1]=0.0f;
+    return n2;
+}
+/* cosine scores of the transformed query → squared L2 distances (smallest first, the order is kept) */
+static void kv_l2_scores(const KciVec *v, int n, float *sc, double qn2){
+    if(!sc || n<=0) return;
+    if(v->l2==2){ double f=sqrt(qn2)/v->l2s, qm=kv_ip_qm; for(int i=0;i<n;i++) sc[i]=(float)(sc[i]*f + qm); return; }
+    double s=v->l2s, lam=v->l2lam, f=sqrt(qn2*s*s+1.0/(lam*lam))*sqrt(v->l2M2);
+    for(int i=0;i<n;i++){ double h=(sc[i]*f + v->l2ab)/(s*s); double d=qn2-2.0*h; sc[i]=(float)(d>0?d:0); }
+}
+/* fix the transform from the rows added so far and turn them into the engine's unit vectors (once) */
+static int kv_l2_fin(KciVec *v){
+    if(!v->l2 || v->l2fin) return 0;
+    if(!v->vf) return -1;
+    int D=v->udim; uint32_t N=v->count;
+    if(v->l2==2){
+        float *tp=malloc((size_t)D*sizeof(float)); double *acc=calloc((size_t)D,sizeof(double));
+        free(v->ipm); v->ipm=calloc((size_t)D,sizeof(float));
+        if(!tp || !acc || !v->ipm){ free(tp); free(acc); return -1; }
+        if(v->ipc) for(uint32_t i=0;i<N;i++){ const float *r=v->vf+(size_t)i*v->dim; for(int d=0;d<D;d++) acc[d]+=r[d]; }
+        double mn2=0, mx=0;
+        for(int d=0;d<D;d++){ v->ipm[d] = (N && v->ipc) ? (float)(acc[d]/N) : 0.0f; mn2+=(double)v->ipm[d]*v->ipm[d]; }
+        for(uint32_t i=0;i<N;i++){ const float *r=v->vf+(size_t)i*v->dim; double n2=0;
+            for(int d=0;d<D;d++){ double t=(double)r[d]-v->ipm[d]; n2+=t*t; }
+            if(n2>mx) mx=n2; }
+        if(v->ipmax>0){ double b=(double)v->ipmax+sqrt(mn2); if(b*b>mx) mx=b*b; }
+        v->l2s = mx>0 ? (float)(1.0/(sqrt(mx)*(1.0+1e-6))) : 1.0f;
+        v->l2lam=1.0f; v->l2ab=0.0f; v->l2M2=1.0f; v->l2me=1.0f;
+        for(uint32_t i=0;i<N;i++){ float *r=v->vf+(size_t)i*v->dim; memcpy(tp,r,(size_t)D*sizeof(float)); kv_l2_row(v,tp,r); }
+        kv_wipe(tp,(size_t)D*sizeof(float)); free(tp); free(acc);
+        v->l2fin=1;
+        return 0; }
+    if(v->l2s<=0){ double mx=0;
+        for(uint32_t i=0;i<N;i++){ const float *r=v->vf+(size_t)i*v->dim; double n2=0;
+            for(int d=0;d<D;d++) n2+=(double)r[d]*r[d];
+            if(n2>mx) mx=n2; }
+        v->l2s = mx>0 ? (float)(1.0/sqrt(mx)) : 1.0f; }
+    double s=v->l2s, t2min=1e300, t2max=0, qs=0;
+    for(uint32_t i=0;i<N;i++){ const float *r=v->vf+(size_t)i*v->dim; double n2=0;
+        for(int d=0;d<D;d++){ double t=r[d]*s; n2+=t*t; }
+        if(n2<t2min) t2min=n2;
+        if(n2>t2max) t2max=n2;
+        qs+=sqrt(n2); }
+    if(N==0){ t2min=t2max=0; }
+    double amin=-t2max/2, amax=-t2min/2, m=(amax-amin)/2, me=2*m+0.005, Q = N ? qs/N : 1.0;
+    if(me>0.25) me=0.25;
+    if(Q<1e-3) Q=1e-3;
+    double lam=1.0/sqrt(me*Q);
+    v->l2ab=(float)((amin+amax)/2); v->l2me=(float)me; v->l2lam=(float)lam; v->l2M2=(float)(1.0+lam*lam*me*me);
+    float *tmp=malloc((size_t)D*sizeof(float)); if(!tmp) return -1;
+    for(uint32_t i=0;i<N;i++){ float *r=v->vf+(size_t)i*v->dim; memcpy(tmp,r,(size_t)D*sizeof(float)); kv_l2_row(v,tmp,r); }
+    kv_wipe(tmp,(size_t)D*sizeof(float)); free(tmp);
+    v->l2fin=1;
+    return 0;
+}
+#else
+static int kv_l2_fits(const KciVec *v, const float *x){ (void)v; (void)x; return 1; }
+static void kv_l2_row(const KciVec *v, const float *x, float *out){ (void)v; (void)x; (void)out; }
+static double kv_l2_query(const KciVec *v, const float *q, float *out){ (void)v; (void)q; (void)out; return 0; }
+static void kv_l2_scores(const KciVec *v, int n, float *sc, double qn2){ (void)v; (void)n; (void)sc; (void)qn2; }
+static int kv_l2_fin(KciVec *v){ (void)v; return 0; }
+#endif
 
 /* store a unit-normalized copy of `src` at row `i` of v->vf (training buffer) */
 static void store_float_norm(KciVec *v, uint32_t i, const float *src){
     float *r = v->vf + (size_t)i*v->dim;
+    if(v->l2){
+        if(v->l2fin) kv_l2_row(v, src, r);
+        else { memcpy(r, src, (size_t)v->udim*sizeof(float)); for(int d=v->udim; d<v->dim; d++) r[d]=0; }
+        return; }
     l2norm(v->dim, src, r);
 }
 
 int64_t kci_vec_add_i8(KciVec *v, uint64_t id, const int8_t *vec){
-    if(!v) return -1;
+    if(!v || v->l2) return -1;
     if(kci_vec_reserve(v, v->count+1) != 0) return -1;
     /* legacy symmetric int8 input → reconstruct float into the training buffer */
     float *dst = v->vf + (size_t)v->count*v->dim;
@@ -657,7 +852,7 @@ int64_t kci_vec_add_i8(KciVec *v, uint64_t id, const int8_t *vec){
 }
 
 int64_t kci_vec_add(KciVec *v, uint64_t id, const float *vec){
-    if(!v) return -1;
+    if(!v || !kv_l2_fits(v, vec)) return -1;
     if(kci_vec_reserve(v, v->count+1) != 0) return -1;
     store_float_norm(v, v->count, vec);   /* unit-norm float → training buffer */
     v->vid[v->count] = id;
@@ -685,6 +880,7 @@ static int sq_train(KciVec *v){
 /* ── public: build ──────────────────────────────────────────────────────── */
 int kci_vec_build(KciVec *v, int threads, double *out_secs){
     if(!v || v->count==0 || !v->vf || v->img) return -1;
+    if(kv_l2_fin(v)!=0) return -1;
     graph_free(v);
     kv_ivf_free(v->ivf); v->ivf=NULL;
     uint32_t N = v->count;
@@ -699,13 +895,12 @@ int kci_vec_build(KciVec *v, int threads, double *out_secs){
     v->dead  = calloc(N, 1);
     if(!v->level || !v->l0 || !v->lu || !v->lock || !v->dead){ graph_free(v); return -1; }
     v->gcap=N; v->ndead=0;
-    srand(42);
     for(uint32_t i=0;i<N;i++){
-        double r=(double)(rand()+1)/((double)RAND_MAX+2.0);
+        double r=kv_level_u(i);
         int lvl=(int)(-log(r)*v->mL); if(lvl>255)lvl=255; v->level[i]=(uint8_t)lvl;
         if(lvl>0){ v->lu[i]=calloc((size_t)lvl*(v->M+1),sizeof(uint32_t)); if(!v->lu[i]){ graph_free(v); return -1; } }
     }
-    v->ep=0; v->maxlevel=v->level[0]; v->bnext=1;
+    v->ep=0; v->maxlevel=v->level[0]; v->bnext=1; v->bstep=kv_build_step(N);
     int T = default_threads(threads);
     struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
     pthread_t th[64]; BuildArg ba = { v };
@@ -734,7 +929,7 @@ static int search_collect(KciVec *v, const int8_t *q, int ef, Scr *s){
     for(int l=L;l>0;l--){ search_layer(v,q,ep,1,l,s); ep=hp_top(W).id; }
     search_layer(v,q,ep,ef,0,s);
     int m=W->n;
-    if(m>s->tmpcap){ s->tmpcap=m; s->tmp=realloc(s->tmp,sizeof(He)*s->tmpcap); }
+    if(m>s->tmpcap){ He *nt=realloc(s->tmp,sizeof(He)*(size_t)m); if(!nt) return 0; s->tmp=nt; s->tmpcap=m; }
     memcpy(s->tmp, W->a, sizeof(He)*(size_t)m);
     return m;
 }
@@ -804,6 +999,48 @@ static inline float fdot(int dim, const float *a, const float *b){
     for(; i<dim; i++) s+=a[i]*b[i];
     return s;
 }
+static inline uint16_t kv_f2h(float f){
+    uint32_t x; memcpy(&x,&f,4); uint32_t sg=(x>>16)&0x8000u, m=x&0x7FFFFFu; int e=(int)((x>>23)&0xFF)-127+15;
+    if(e>=31) return (uint16_t)(sg | 0x7C00u | (((x>>23)&0xFF)==0xFF && m ? 0x200u : 0));   /* too large / inf / NaN */
+    if(e<=0){ if(e<-10) return (uint16_t)sg;                                         /* below half the smallest subnormal */
+        m|=0x800000u; unsigned sh=(unsigned)(14-e); uint32_t h=m>>sh, rem=m&((1u<<sh)-1), hf=1u<<(sh-1);
+        if(rem>hf || (rem==hf && (h&1))) h++; return (uint16_t)(sg|h); }
+    uint32_t h=((uint32_t)e<<10)|(m>>13), rem=m&0x1FFFu;
+    if(rem>0x1000u || (rem==0x1000u && (h&1))) h++;                                  /* a carry into the exponent is right as it is */
+    return (uint16_t)(sg|h);
+}
+static inline float kv_h2f(uint16_t h){
+    uint32_t sg=(uint32_t)(h&0x8000u)<<16, m=h&0x3FFu, x; int e=(h>>10)&31;
+    if(e==0){ if(!m) x=sg; else { e=1; while(!(m&0x400u)){ m<<=1; e--; } x=sg|((uint32_t)(e+112)<<23)|((m&0x3FFu)<<13); } }
+    else if(e==31) x=sg|0x7F800000u|(m<<13);
+    else x=sg|((uint32_t)(e+112)<<23)|(m<<13);
+    float f; memcpy(&f,&x,4); return f;
+}
+static void kv_f2h_row(int dim, const float *a, uint16_t *o){
+    int i=0;
+#if defined(__AVX2__) && defined(__F16C__)
+    for(; i+8<=dim; i+=8) _mm_storeu_si128((__m128i*)(o+i), _mm256_cvtps_ph(_mm256_loadu_ps(a+i), _MM_FROUND_TO_NEAREST_INT|_MM_FROUND_NO_EXC));
+#endif
+    for(; i<dim; i++) o[i]=kv_f2h(a[i]);
+}
+/* float . half row */
+static inline float hdot(int dim, const float *a, const uint16_t *b){
+    int i=0; float s=0;
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    __m256 s0=_mm256_setzero_ps(), s1=_mm256_setzero_ps();
+    for(; i+16<=dim; i+=16){
+        s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),   _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))),   s0);
+        s1=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+8), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i+8))), s1);
+    }
+    if(i+8<=dim){ s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))), s0); i+=8; }
+    s0=_mm256_add_ps(s0,s1);
+    __m128 h=_mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0,1));
+    h=_mm_add_ps(h,_mm_movehl_ps(h,h)); h=_mm_add_ss(h,_mm_shuffle_ps(h,h,1));
+    s=_mm_cvtss_f32(h);
+#endif
+    for(; i<dim; i++) s+=a[i]*kv_h2f(b[i]);
+    return s;
+}
 /* encode a query: L2-normalize into tmp, then global SQ into signed int8 code. */
 static void enc_query(const KciVec *v, const float *query, float *tmp, int8_t *code){
     l2norm(v->dim, query, tmp);
@@ -824,11 +1061,23 @@ static int kv_search_(KciVec *v, const float *query, int k, int ef,
 }
 int kci_vec_search(KciVec *v, const float *query, int k, int ef,
                    uint64_t *out_ids, float *out_scores){
+    if(v && v->l2){
+        float *b=malloc((size_t)v->dim*sizeof(float)); if(!b) return -1;
+        double qn2=kv_l2_query(v, query, b);
+        int r=kv_search_(v, b, k, ef, out_ids, out_scores);
+        kv_l2_scores(v, r, out_scores, qn2);
+        kv_wipe(b, (size_t)v->dim*sizeof(float)); free(b);
+        return r; }
     return kv_search_(v, query, k, ef, out_ids, out_scores);
 }
 
 /* reusable per-thread searcher: amortizes the visited-set allocation */
-struct KciVecSearcher { KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; };
+struct KciVecSearcher { KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
+static int kv_l2_qs(KciVecSearcher *s, const float **q, double *qn2){
+    if(!s || !s->v->l2 || !s->l2q || *q==s->l2q) return 0;
+    *qn2 = kv_l2_query(s->v, *q, s->l2q); *q = s->l2q;
+    return 1;
+}
 int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
                                 KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
     if(!s) return -1;
@@ -839,7 +1088,8 @@ int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, in
 }
 int kci_vec_searcher_set_rerank_int8(KciVecSearcher *s, int on){ if(!s) return -1; s->rerank_i8 = on?1:0; return 0; }
 int kci_vec_searcher_set_eps(KciVecSearcher *s, float eps){ if(!s || !(eps==eps)) return -1; s->s.eps = eps>0 ? eps : 0; return 0; }
-int kci_vec_searcher_set_qg(KciVecSearcher *s, int on){ if(!s) return -1; if(on && !s->v->qg) return -2; s->s.use_qg = on?1:0; return 0; }
+int kci_vec_searcher_set_qg(KciVecSearcher *s, int on){ if(!s) return -1; if(on>0 && !s->v->qg) return -2; s->s.use_qg = on<0 ? -1 : (on?1:0); return 0; }
+int kci_vec_searcher_set_qg_exact(KciVecSearcher *s, int on){ if(!s) return -1; s->s.qgx = on<0 ? -1 : (on==2 ? 2 : (on?1:0)); return 0; }
 int kci_vec_searcher_set_probe_gap(KciVecSearcher *s, float gap, int min_probe){
     if(!s || !(gap==gap)) return -1;
     s->gap = gap>0 ? gap : 0; s->minp = min_probe>1 ? min_probe : 1; return 0; }
@@ -849,17 +1099,20 @@ KciVecSearcher *kci_vec_searcher_new(KciVec *v){
     if(!s) return NULL;
     s->v = v;
     scr_init(&s->s, v->gN ? v->gN : v->count, v->efc+16);
+    s->s.use_qg=-1; s->s.qgx=-1;
     s->dim = v->dim;
     s->q = malloc(v->dim);
     s->qf = malloc((size_t)v->dim*sizeof(float));
-    if(!s->s.vis || !s->q || !s->qf){ kci_vec_searcher_free(s); return NULL; }
+    if(v->l2) s->l2q = malloc((size_t)v->dim*sizeof(float));
+    if(!scr_ok(&s->s) || !s->q || !s->qf || (v->l2 && !s->l2q)){ kci_vec_searcher_free(s); return NULL; }
     s->s.qf = s->qf;
     return s;
 }
 void kci_vec_searcher_free(KciVecSearcher *s){
     if(!s) return;
     kv_wipe(s->q, (size_t)s->dim); kv_wipe(s->qf, (size_t)s->dim*sizeof(float));
-    scr_free(&s->s); free(s->q); free(s->qf);
+    if(s->l2q){ kv_wipe(s->l2q, (size_t)s->dim*sizeof(float)); free(s->l2q); }
+    scr_free(&s->s); free(s->q); free(s->qf); free(s->lseed); free(s->lq8);
     if(s->ivf) kv_ivf_scr_free(s->ivf);
     free(s);
 }
@@ -875,15 +1128,19 @@ static int kv_search_rerank_(KciVecSearcher *s, const float *query, int k, int e
                              int rerank_n, uint64_t *out_ids, float *out_scores){
     if(!s || !s->v->built) return -1;
     KciVec *v=s->v;
-    if(!v->keepf || !v->vf)                 /* no retained floats → plain SQ8 search */
+    if((!v->keepf || !v->vf) && !v->vh)     /* no retained floats → plain SQ8 search */
         return kci_vec_search_r(s, query, k, ef, out_ids, out_scores);
     if(k<1) k=1;
     if(rerank_n<k) rerank_n=k;
     if(ef<rerank_n) ef=rerank_n;
     enc_query(v, query, s->qf, s->q);       /* s->qf = unit query; s->q = code */
-    int m = (s->s.use_qg && v->qg) ? kv_qg_collect(v, &s->s, s->q, ef, 0) : search_collect(v, s->q, ef, &s->s);
+    int m = (s->s.use_qg && v->qg) ? kv_qg_collect(v, &s->s, s->q, ef, rerank_n<ef ? 2 : 0) : search_collect(v, s->q, ef, &s->s);
     He *t=s->s.tmp;
     if(m>rerank_n){ select_smallest(t, m, rerank_n); m=rerank_n; }
+    if(v->vh){ size_t rb=(size_t)v->dim*sizeof(uint16_t);
+        for(int i=0;i<m;i++){ const char *p=(const char*)(v->vh + (size_t)t[i].id*v->dim); for(size_t o=0;o<rb;o+=64) __builtin_prefetch(p+o); }
+        for(int i=0;i<m;i++) t[i].d = -hdot(v->dim, s->qf, v->vh + (size_t)t[i].id*v->dim);
+        return emit_topk(v, t, m, k, 1.0f, out_ids, out_scores); }
     { size_t rb=(size_t)v->dim*sizeof(float);
       for(int i=0;i<m;i++){ const char *p=(const char*)(v->vf + (size_t)t[i].id*v->dim); for(size_t o=0;o<rb;o+=64) __builtin_prefetch(p+o); } }
     for(int i=0;i<m;i++) t[i].d = -fdot(v->dim, s->qf, v->vf + (size_t)t[i].id*v->dim);
@@ -916,7 +1173,6 @@ static int search_collect_filtered(KciVec *v, const int8_t *q, int ef, Scr *s,
         if(vis>=budget) break;
         uint32_t *lk=g_links(v,c.id,0);
         uint32_t cnt=__atomic_load_n(&lk[0], __ATOMIC_ACQUIRE);
-        for(uint32_t e=1;e<=cnt;e++){ uint32_t nb=lk[e]; if(nb<v->gN) __builtin_prefetch(&s->vis[nb]); }
         float bound=sl_bound(W,ef,k1,gs2);
         for(uint32_t e=1;e<=cnt;e++){
             uint32_t nb=lk[e]; if(nb>=v->gN) continue;
@@ -924,13 +1180,13 @@ static int search_collect_filtered(KciVec *v, const int8_t *q, int ef, Scr *s,
             float d=vdist(v,q,vrow(v,nb)); vis++;
             if(d<bound){
                 hp_push(C,d,nb);
-                if((W->n<ef || d<hp_top(W).d) && node_ok(v,nb,filt,ctx)){ hp_push(W,d,nb); if(W->n>ef) hp_pop(W); bound=sl_bound(W,ef,k1,gs2); }
+                if((W->n<ef || d<hp_top(W).d) && node_ok(v,nb,filt,ctx)){ if(W->n<ef) hp_push(W,d,nb); else hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,gs2); }
             }
             if(vis>=budget) break;
         }
     }
     int m=W->n;
-    if(m>s->tmpcap){ s->tmpcap=m; s->tmp=realloc(s->tmp,sizeof(He)*s->tmpcap); }
+    if(m>s->tmpcap){ He *nt=realloc(s->tmp,sizeof(He)*(size_t)m); if(!nt) return 0; s->tmp=nt; s->tmpcap=m; }
     memcpy(s->tmp, W->a, sizeof(He)*(size_t)m);   /* unsorted: the caller selects top-k */
     return m;
 }
@@ -943,10 +1199,16 @@ static int kv_search_filtered_(KciVecSearcher *s, const float *query, int k, int
     KciVec *v=s->v; if(k<1)k=1; if(ef<k)ef=k;
     enc_query(v, query, s->qf, s->q);
     int budget = ef*64; if(budget<4096) budget=4096;
-    int m = search_collect_filtered(v, s->q, ef, &s->s, filt, ctx, budget);
+    int reranked = rerank_n>0 && ((v->keepf && v->vf) || v->vh);
+    int m;
+    if(s->s.use_qg && v->qg && scr_fit(&s->s, v->gN)==0){
+        s->s.filt=filt; s->s.fctx=ctx; s->s.fbudget=budget;
+        m = kv_qg_collect(v, &s->s, s->q, ef, reranked ? 0 : 1);
+        s->s.filt=NULL; s->s.fctx=NULL; }
+    else m = search_collect_filtered(v, s->q, ef, &s->s, filt, ctx, budget);
     He *t=s->s.tmp;
-    int reranked = (v->keepf && v->vf && rerank_n>0);
-    if(reranked) for(int i=0;i<m;i++) t[i].d = -fdot(v->dim, s->qf, v->vf + (size_t)t[i].id*v->dim);
+    if(reranked){ if(v->vh) for(int i=0;i<m;i++) t[i].d = -hdot(v->dim, s->qf, v->vh + (size_t)t[i].id*v->dim);
+                  else for(int i=0;i<m;i++) t[i].d = -fdot(v->dim, s->qf, v->vf + (size_t)t[i].id*v->dim); }
     float invgs2 = (v->gs>0) ? 1.0f/(v->gs*v->gs) : 1.0f;
     int no=0;
     for(int slot=0; slot<m && no<k; slot++){
@@ -1316,6 +1578,7 @@ static int kv_ensure_dead(KciVec *v){            /* tombstones for an index with
 
 int kci_vec_build_ivf_p(KciVec *v, const KciVecIvfParams *P){
     if(!v || !v->vf || v->count==0 || v->vf_mmap || v->img) return -1;
+    if(kv_l2_fin(v)!=0) return -1;
     int nlist = P ? P->nlist : 0, threads = P ? P->threads : 0, d1 = P ? P->code_dims : 0, lr = P ? P->lowrank : 0; float soar = P ? P->soar : 0;
     int D=v->dim; size_t n=v->count;
     if(nlist<=0){ nlist=(int)sqrt((double)n)*2; if(nlist<1) nlist=1; }
@@ -1851,9 +2114,10 @@ static int kv_search_ivf_(KciVecSearcher *ks, const float *query, int k, int npr
     He *sa=NULL; int sn=0;                          /* the shortlist handed to the re-rank (heap or table-scan buffer) */
     uint16_t *vis=NULL, ep=0;
     if(f->soar>0){
-        if(ks->s.visn<v->count){ uint16_t *nv=realloc(ks->s.vis,(size_t)v->count*sizeof(uint16_t)); if(!nv) return -1;
-            memset(nv,0,(size_t)v->count*sizeof(uint16_t)); ks->s.vis=nv; ks->s.visn=v->count; ks->s.epoch=0; }
-        scr_next(&ks->s); vis=ks->s.vis; ep=ks->s.epoch; }
+        if(ks->s.vis16n<v->count){ uint16_t *nv=realloc(ks->s.vis,(size_t)v->count*sizeof(uint16_t)); if(!nv) return -1;
+            memset(nv,0,(size_t)v->count*sizeof(uint16_t)); ks->s.vis=nv; ks->s.vis16n=v->count; ks->s.epoch=0; }
+        if(++ks->s.epoch==0){ memset(ks->s.vis,0,(size_t)ks->s.vis16n*sizeof(uint16_t)); ks->s.epoch=1; }
+        vis=ks->s.vis; ep=ks->s.epoch; }
     if(f->lr){
         int lr=f->lr, ld=f->ld; float qu[256] __attribute__((aligned(64))); uint8_t qu8[256]; uint8_t q8[f->LD4*4+4];   /* lr <= 256 */
         const float qtop = KV_LR_QOFF==128 ? 127.0f : 63.0f;
@@ -1927,12 +2191,21 @@ static int kv_search_ivf_(KciVecSearcher *ks, const float *query, int k, int npr
 #ifndef KV_QG_LUT_TOP
 #define KV_QG_LUT_TOP 255
 #endif
-struct KvQg { int M, dp, nblk, nfull, half; size_t stride, hdr; float *pq; double eta; uint8_t *blocks; uint32_t n; };
+struct KvQg { int M, dp, nblk, nfull, half; size_t stride, hdr; float *pq; double eta; uint8_t *blocks; uint32_t n;
+               int cd, D; float *R;
+               int8_t *R8; float *r8inv;
+               int8_t *P8; float ps;
+               int gd;
+               int ro; };
 static void kv_qg_free(struct KvQg *g){
     if(!g) return;
+    if(g->ro){ free(g); return; }
     if(g->blocks && g->n) kv_wipe(g->blocks, (size_t)g->n*g->stride);   /* the vectors' codes, and who is next to whom */
     if(g->pq) kv_wipe(g->pq, (size_t)(g->M+1)*32*sizeof(float));
-    free(g->blocks); free(g->pq); free(g);
+    if(g->R) kv_wipe(g->R, (size_t)g->D*g->cd*sizeof(float));
+    if(g->R8) kv_wipe(g->R8, (size_t)g->D*g->cd);
+    if(g->P8 && g->n) kv_wipe(g->P8, (size_t)g->n*g->cd);
+    free(g->P8); free(g->R8); free(g->r8inv); free(g->R); free(g->blocks); free(g->pq); free(g);
 }
 /* a node's unit vector: the retained float row, or the int8 row scaled back */
 static void kv_qg_row(const KciVec *v, uint32_t i, float *x){
@@ -1941,10 +2214,21 @@ static void kv_qg_row(const KciVec *v, uint32_t i, float *x){
     const int8_t *r=vrow(v,i); float inv = v->gs>0 ? 1.0f/v->gs : 1.0f;
     for(int d=0;d<D;d++) x[d]=(float)r[d]*inv;
 }
+static void kv_qg_proj(const struct KvQg *g, const float *x, float *y){
+    const int D=g->D, cd=g->cd;
+    for(int j=0;j<cd;j++) y[j]=0;
+    for(int p=0;p<D;p++){ const float xp=x[p]; const float *row=g->R+(size_t)p*cd; for(int j=0;j<cd;j++) y[j]+=xp*row[j]; }
+}
 typedef struct { const KciVec *v; const struct KvQg *g; uint8_t *cv; } KvQgEnc;
 static void kv_qg_enc_run(void *a, size_t lo, size_t hi){ KvQgEnc *e=a; int D=e->v->dim;
     float x[D], zero[D]; memset(zero,0,sizeof zero);
-    for(size_t i=lo;i<hi;i++){ kv_qg_row(e->v, (uint32_t)i, x); kv_encode_res(e->g->pq, e->g->M, e->g->dp, e->g->eta, x, zero, D, e->cv+i*(size_t)e->g->M); }
+    const int cd=e->g->cd; float y[cd ? cd : 1];
+    for(size_t i=lo;i<hi;i++){ kv_qg_row(e->v, (uint32_t)i, x);
+        if(cd){ kv_qg_proj(e->g, x, y); kv_encode_res(e->g->pq, e->g->M, e->g->dp, e->g->eta, y, zero, e->g->gd, e->cv+i*(size_t)e->g->M);
+            if(e->g->P8){ int8_t *r=e->g->P8+i*(size_t)cd; const float ps=e->g->ps;
+                for(int j=0;j<cd;j++){ int t=(int)lrintf(y[j]*ps); r[j]=(int8_t)(t < -127 ? -127 : (t > 127 ? 127 : t)); } } }
+        else kv_encode_res(e->g->pq, e->g->M, e->g->dp, e->g->eta, x, zero, D, e->cv+i*(size_t)e->g->M); }
+    kv_wipe(y, sizeof y);
     kv_wipe(x, sizeof x);
 }
 typedef struct { KciVec *v; struct KvQg *g; const uint8_t *cv; } KvQgFill;
@@ -1966,19 +2250,23 @@ static void kv_qg_fill_run(void *a, size_t lo, size_t hi){ KvQgFill *f=a; KciVec
         *(uint32_t*)b=w;
     }
 }
-int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads){
+static int kv_qg_build(KciVec *v, int dims_per_code, int cdims, int gdims, int threads){
     if(!v || !v->built || !v->l0 || v->gN==0 || v->gN!=v->count) return -1;
     if(dims_per_code!=0 && dims_per_code!=1 && dims_per_code!=2) return -1;
     int D=v->dim, dp = dims_per_code ? dims_per_code : 1;
+    if(cdims<0 || (cdims && (cdims<8 || (cdims&1) || cdims>=D))) return -1;
+    if(gdims<0 || (gdims && (!cdims || gdims<8 || (gdims&1) || gdims>cdims))) return -1;
+    if(!gdims) gdims=cdims;
+    const int Dc = cdims ? gdims : D;                  /* what the codes cover */
     struct KvQg *g=calloc(1,sizeof *g); if(!g) return -1;
-    g->dp=dp; g->M = dp==2 ? (D+1)/2 : D; g->nblk=(v->M0+31)/32;
+    g->gd=gdims; g->dp=dp; g->M = dp==2 ? (Dc+1)/2 : Dc; g->nblk=(v->M0+31)/32; g->cd=cdims; g->D=D;
     g->nfull=v->M0/32; g->half = v->M0%32>0 && v->M0%32<=16;
     if(!g->half) g->nfull=g->nblk;
     { const char *e=getenv("KCI_VEC_QG_NO_HALF"); if(e && *e=='1'){ g->half=0; g->nfull=g->nblk; } }
     g->hdr=((size_t)4+4*(size_t)v->M0+63)/64*64;
     g->stride=(g->hdr+(size_t)g->nfull*g->M*16+(g->half ? (size_t)((g->M+1)/2)*16 : 0)+63)/64*64;
     float t = v->ivf_avqt>0 ? v->ivf_avqt : (float)KV_IVF_T;
-    g->eta=(D-1)*(double)t*t/(1-(double)t*t);
+    g->eta=(Dc-1)*(double)t*t/(1-(double)t*t);
     size_t N=v->gN, ns = N<65536 ? N : 65536, step=N/ns, bytes=N*g->stride;
     float *S=malloc(ns*(size_t)D*sizeof(float)); uint8_t *cv=malloc(N*(size_t)g->M); g->pq=malloc((size_t)(g->M+1)*32*sizeof(float));
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
@@ -1989,8 +2277,32 @@ int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads){
     int ok = S && cv && g->pq && g->blocks;
     if(ok){
         for(size_t i=0;i<ns;i++) kv_qg_row(v, (uint32_t)(i*step), S+i*(size_t)D);          /* 1. codebooks from a sample */
-        size_t np = ns<KV_PQ_SAMPLE ? ns : KV_PQ_SAMPLE;
-        KvPqJob pj={S, np, ns/np, D, g->M, g->pq, 0, dp}; kv_par((size_t)g->M, threads, kv_pq_run, &pj); ok=!pj.fail;
+        if(cdims){
+            g->R=malloc((size_t)D*cdims*sizeof(float)); ok = g->R && kv_pca(S, ns, D, cdims, threads, g->R)==0;
+            if(ok){ float y[cdims]; for(size_t i=0;i<ns;i++){ kv_qg_proj(g, S+i*(size_t)D, y); memcpy(S+i*(size_t)cdims, y, (size_t)cdims*sizeof(float)); } }
+#ifndef KV_QG_NO_SHORT
+            if(ok){ size_t pb=(size_t)v->gN*cdims; float mx=0;
+                for(size_t i=0;i<ns*(size_t)cdims;i++){ float a=fabsf(S[i]); if(a>mx) mx=a; }
+                if(mx>0){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+                    { void *pp=NULL; size_t al=(size_t)2<<20, sz=(pb+al-1)/al*al;
+                      if(pb>=al && posix_memalign(&pp,al,sz)==0){ madvise(pp,sz,MADV_HUGEPAGE); g->P8=pp; } }
+#endif
+                    if(!g->P8) g->P8=malloc(pb);
+                    g->ps=127.0f/mx; } }
+#endif
+            if(ok && gdims<cdims) for(size_t i=1;i<ns;i++) memmove(S+i*(size_t)gdims, S+i*(size_t)cdims, (size_t)gdims*sizeof(float));
+#ifndef KV_QG_PROJ_FLOAT
+            if(ok){ g->R8=malloc((size_t)D*cdims); g->r8inv=malloc((size_t)cdims*sizeof(float)); ok = g->R8 && g->r8inv; }
+            if(ok) for(int j=0;j<cdims;j++){ float mx=0;
+                for(int pp=0;pp<D;pp++){ float a=fabsf(g->R[(size_t)pp*cdims+j]); if(a>mx) mx=a; }
+                float sc = mx>0 ? 127.0f/mx : 1.0f;
+                for(int pp=0;pp<D;pp++) g->R8[(size_t)j*D+pp]=(int8_t)lrintf(g->R[(size_t)pp*cdims+j]*sc);
+                g->r8inv[j] = v->gs>0 ? 1.0f/(sc*v->gs) : 1.0f/sc; }
+#endif
+        }
+        if(ok){ size_t np = ns<KV_PQ_SAMPLE ? ns : KV_PQ_SAMPLE;
+        KvPqJob pj={S, np, ns/np, Dc, g->M, g->pq, 0, dp}; kv_par((size_t)g->M, threads, kv_pq_run, &pj); ok=!pj.fail; }
     }
     if(ok){ KvQgEnc e={v,g,cv}; kv_par(N, threads, kv_qg_enc_run, &e); }                   /* 2. every node's codes */
     if(ok){ KvQgFill fj={v,g,cv}; kv_par(N, threads, kv_qg_fill_run, &fj); g->n=(uint32_t)N; } /* 3. the blocks */
@@ -2000,6 +2312,25 @@ int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads){
     kv_qg_free(v->qg); v->qg=g;
     return 0;
 }
+static int kv_qg_shape_ok(const struct KvQg *g, size_t D, size_t M0){
+    const int cd=g->cd, Dc = cd ? g->gd : (int)D;
+    return (g->dp==1 || g->dp==2) && (cd==0 ? g->gd==0 : (cd>=8 && !(cd&1) && cd<(int)D && g->gd>=8 && !(g->gd&1) && g->gd<=cd))
+        && g->M==(g->dp==2 ? (Dc+1)/2 : Dc) && g->nblk==(int)((M0+31)/32) && (g->half==0 || g->half==1)
+        && (g->half ? (g->nfull==(int)(M0/32) && M0%32>0 && M0%32<=16) : g->nfull==g->nblk)
+        && g->hdr==((size_t)4+4*M0+63)/64*64
+        && g->stride==(g->hdr+(size_t)g->nfull*g->M*16+(g->half ? (size_t)((g->M+1)/2)*16 : 0)+63)/64*64
+        && isfinite(g->eta);
+}
+static void *kv_big_alloc(size_t bytes){
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    { void *p=NULL; size_t al=(size_t)2<<20, sz=(bytes+al-1)/al*al;
+      if(bytes>=al && posix_memalign(&p,al,sz)==0){ madvise(p,sz,MADV_HUGEPAGE); return p; } }
+#endif
+    return malloc(bytes ? bytes : 1);
+}
+int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads){ return kv_qg_build(v, dims_per_code, 0, 0, threads); }
+int kci_vec_build_qg_ex(KciVec *v, int dims_per_code, int code_dims, int threads){ return kv_qg_build(v, dims_per_code, code_dims, 0, threads); }
+int kci_vec_build_qg_gate(KciVec *v, int dims_per_code, int code_dims, int gate_dims, int threads){ return kv_qg_build(v, dims_per_code, code_dims, gate_dims, threads); }
 int64_t kci_vec_qg_bytes(const KciVec *v){ return v && v->qg ? (int64_t)((size_t)v->qg->n*v->qg->stride + (size_t)(v->qg->M+1)*32*sizeof(float)) : 0; }
 
 static inline void kv_qg_sum32(const uint8_t *blk, const uint8_t *lut, int M, uint16_t *out){
@@ -2130,14 +2461,26 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
         if(s->lut) kv_wipe(s->lut,(size_t)(s->lutM+4)*16); if(s->lutf) kv_wipe(s->lutf,(size_t)s->lutM*16*sizeof(float));
         free(s->lut); free(s->lutf); s->lut=malloc((size_t)(M+4)*16); s->lutf=malloc((size_t)M*16*sizeof(float)); s->lutM=M;
         if(!s->lut||!s->lutf){ s->lutM=0; return 0; } }
-    float base, invs; kv_lut_build(g->pq, M, g->dp, s->qf, v->dim, s->lutf, s->lut, &base, &invs, KV_QG_LUT_TOP);
+    float base, invs, qp[g->cd ? g->cd : 1];
+    if(g->cd){
+        if(g->R8) for(int j=0;j<g->cd;j++) qp[j]=(float)sdot_n(g->D, q, g->R8+(size_t)j*g->D)*g->r8inv[j];
+        else kv_qg_proj(g, s->qf, qp); }
+    kv_lut_build(g->pq, M, g->dp, g->cd ? qp : s->qf, g->cd ? g->gd : v->dim, s->lutf, s->lut, &base, &invs, KV_QG_LUT_TOP);
     uint32_t ep=v->ep;
     for(int l=v->maxlevel;l>0;l--){ search_layer(v,q,ep,1,l,s); ep=hp_top(&s->W).id; }   /* upper layers: int8 rows */
     Heap *W=&s->W; scr_next(s); W->n=0;
     const float k1 = s->eps>0 ? 1.0f+s->eps : 0.0f;
     float d0 = -(float)sdot(v,q,vrow(v,ep)) / (v->gs*v->gs);          /* the entry point exactly, in cosine units */
     if(!s->bq && !(s->bq=kv_bq_new())) return 0; struct KvBq *BQ=s->bq; kv_bq_reset(BQ);
-    visited(s,ep); kv_bq_push(BQ,d0,ep); hp_push(W,d0,ep);
+#define KV_QG_KEEP(row) (!s->filt || ((!v->dead || !v->dead[row]) && s->filt(v->vid[row], s->fctx)))
+    s->fvis=1;
+    visited(s,ep); kv_bq_push(BQ,d0,ep); if(KV_QG_KEEP(ep)) hp_push(W,d0,ep);
+    const int qgx = s->qgx<0 ? (g->P8 ? 2 : 0) : s->qgx;
+    const int shortr = qgx==2 && g->P8; const int cdn = shortr ? g->cd : 1; int8_t qp8[cdn]; float pinv=0;
+    if(shortr){ float mx=0; for(int j=0;j<cdn;j++){ float a=fabsf(qp[j]); if(a>mx) mx=a; }
+        float qs = mx>0 ? 127.0f/mx : 1.0f;
+        for(int j=0;j<cdn;j++){ int t=(int)lrintf(qp[j]*qs); qp8[j]=(int8_t)(t < -127 ? -127 : (t > 127 ? 127 : t)); }
+        pinv=1.0f/(qs*g->ps); }
     uint16_t sums[g->nblk*32];
     const size_t pfn=kv_qg_pfn_bytes(g->stride);
     const int P=(M+1)/2; uint8_t lutE[g->half ? P*16 : 1], lutO[g->half ? P*16 : 1];
@@ -2146,6 +2489,7 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
     const uint32_t full32=(uint32_t)g->nfull*32;
     for(He c; kv_bq_pop(BQ,&c.d,&c.id); ){
         if(c.d>sl_bound(W,ef,k1,1.0f)) break;
+        if(s->filt && s->fvis>=s->fbudget) break;
         const uint8_t *b=g->blocks+(size_t)c.id*g->stride;
         for(size_t o=0;o<g->stride;o+=64) __builtin_prefetch(b+o);   /* every line of the block at once */
 #ifndef KV_QG_NO_PFNEXT
@@ -2163,6 +2507,22 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
                 __m256 dv=_mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(sums+k0+u)))),vi,vb);
                 mask |= (uint32_t)_mm256_movemask_ps(_mm256_cmp_ps(dv,vbound,_CMP_LT_OQ))<<u; }
             if(lim<32) mask &= (1u<<lim)-1;
+            if(qgx){ uint32_t cand[32]; int nc=0; const float gg=v->gs*v->gs;
+                while(mask){ uint32_t j=k0+(uint32_t)__builtin_ctz(mask); mask&=mask-1;
+                    if(!(-(base+(float)sums[j]*invs)<bound)) continue;
+                    uint32_t nb=ids[j];
+                    if(nb>=v->gN || visited(s,nb)) continue;
+                    cand[nc++]=nb;
+                    if(shortr){ const char *r=(const char*)(g->P8+(size_t)nb*cdn); for(int o=0;o<cdn;o+=64) __builtin_prefetch(r+o); }
+                    else { const char *r=(const char*)vrow(v,nb); for(int o=0;o<v->dim;o+=64) __builtin_prefetch(r+o); } }
+                for(int c2=0;c2<nc;c2++){ uint32_t nb=cand[c2];
+                    float d = shortr ? -(float)sdot_n(cdn,qp8,g->P8+(size_t)nb*cdn)*pinv : -(float)sdot(v,q,vrow(v,nb))/gg;   /* as the entry point */
+                    if(!(d<bound)) continue;
+                    if(kv_bq_idx(d)<=kv_bq_lowest(BQ)){ const uint8_t *nx=g->blocks+(size_t)nb*g->stride; for(size_t o=0;o<pfn;o+=64) __builtin_prefetch(nx+o); }
+                    if(kv_bq_push(BQ,d,nb)<0) return 0;
+                    s->fvis++; if(!KV_QG_KEEP(nb)) continue;
+                    if(W->n<ef){ hp_push(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); } else if(d<hp_top(W).d){ hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); } }
+                continue; }
             while(mask){ uint32_t j=k0+(uint32_t)__builtin_ctz(mask); mask&=mask-1;
                 float d=-(base+(float)sums[j]*invs);
                 if(!(d<bound)) continue;
@@ -2170,7 +2530,8 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
                 if(nb>=v->gN || visited(s,nb)) continue;
                 if(kv_bq_idx(d)<=kv_bq_lowest(BQ)){ const uint8_t *nx=g->blocks+(size_t)nb*g->stride; for(size_t o=0;o<pfn;o+=64) __builtin_prefetch(nx+o); }
                 if(kv_bq_push(BQ,d,nb)<0) return 0;
-                if(W->n<ef || d<hp_top(W).d){ hp_push(W,d,nb); if(W->n>ef) hp_pop(W); bound=sl_bound(W,ef,k1,1.0f); }
+                s->fvis++; if(!KV_QG_KEEP(nb)) continue;
+                if(W->n<ef){ hp_push(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); } else if(d<hp_top(W).d){ hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); }
             } } }
 #else
         for(uint32_t j=0;j<cnt;j++){
@@ -2178,22 +2539,37 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
             if(!(d<bound)) continue;
             uint32_t nb=ids[j];
             if(nb>=v->gN || visited(s,nb)) continue;
+            if(qgx){ d = shortr ? -(float)sdot_n(cdn,qp8,g->P8+(size_t)nb*cdn)*pinv : -(float)sdot(v,q,vrow(v,nb))/(v->gs*v->gs);
+                if(!(d<bound)) continue; }
             if(kv_bq_push(BQ,d,nb)<0) return 0;
-            if(W->n<ef || d<hp_top(W).d){ hp_push(W,d,nb); if(W->n>ef) hp_pop(W); bound=sl_bound(W,ef,k1,1.0f); }
+            s->fvis++; if(!KV_QG_KEEP(nb)) continue;
+            if(W->n<ef){ hp_push(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); } else if(d<hp_top(W).d){ hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); }
         }
 #endif
     }
     int m=W->n;
-    if(m>s->tmpcap){ s->tmpcap=m; s->tmp=realloc(s->tmp,sizeof(He)*s->tmpcap); }
+    if(m>s->tmpcap){ He *nt=realloc(s->tmp,sizeof(He)*(size_t)m); if(!nt) return 0; s->tmp=nt; s->tmpcap=m; }
     memcpy(s->tmp, W->a, sizeof(He)*(size_t)m);
-    if(rescore8){ He *t=s->tmp;
+    if(rescore8==1 && qgx && !shortr){ He *t=s->tmp; const float gg=v->gs*v->gs; for(int i=0;i<m;i++) t[i].d=(float)lrintf(t[i].d*gg); }
+    else if(rescore8==1 || (rescore8 && !qgx)){ He *t=s->tmp;
         for(int i=0;i<m;i++){ const int8_t *r=vrow(v,t[i].id); __builtin_prefetch(r); __builtin_prefetch(r+v->dim-1); }
         for(int i=0;i<m;i++) t[i].d=vdist(v,q,vrow(v,t[i].id)); }
     return m;
 }
 
+int kci_vec_half_floats(KciVec *v){
+    if(!v || !v->built || !v->keepf || !v->vf || v->vf_mmap || v->img || v->ffn || v->vh || v->gN!=v->count || v->count==0) return -1;
+    size_t n=v->count, hb=n*(size_t)v->dim*sizeof(uint16_t);
+    uint16_t *h=kv_valloc(v, hb); if(!h) return -1;
+    if(v->protect) kv_protect_region(h, hb);
+    for(size_t i=0;i<n;i++) kv_f2h_row(v->dim, v->vf+i*(size_t)v->dim, h+i*(size_t)v->dim);
+    kv_vfree(v, v->vf, (size_t)v->cap*v->dim*sizeof(float)); v->vf=NULL;       /* wiped; no float is left in RAM */
+    v->vh=h; v->vhn=(uint32_t)n; v->keepf=0; v->building=0;
+    return 0;
+}
+
 int kci_vec_set_float_source(KciVec *v, KciVecFloatFn fn, void *ctx, void (*ctx_free)(void *)){
-    if(!v || !fn || !v->ivf || v->built || v->vf_mmap || v->img) return -1;
+    if(!v || !fn || !v->ivf || v->built || v->vf_mmap || v->l2 || v->img) return -1;
     if(v->ffree) v->ffree(v->fctx);
     v->ffn=fn; v->fctx=ctx; v->ffree=ctx_free;
     if(v->vf){ kv_wipe(v->vf, (size_t)v->cap*v->dim*sizeof(float));
@@ -2263,6 +2639,7 @@ static int kv_search_exact_(KciVec *v, const float *query, int k, int threads,
  * serving, batch the updates, resume. Bulk loads should still use add()+build(). */
 int64_t kci_vec_insert(KciVec *v, uint64_t id, const float *vec){
     if(!v || (!v->built && !v->ivf) || v->img) return -1;
+    if(v->l2 && (v->ffn || !v->l2fin || !kv_l2_fits(v, vec))) return -1;
     if(v->ffn && !v->built){
         uint32_t i = v->count;
         if(kci_vec_reserve(v, i+1) != 0 || kv_ensure_dead(v) != 0) return -1;
@@ -2292,13 +2669,13 @@ int64_t kci_vec_insert(KciVec *v, uint64_t id, const float *vec){
     sq_encode(v, v->vf+(size_t)i*v->dim, v->vq+(size_t)i*v->dim);
     v->vid[i] = id;
     v->dead[i] = 0;
-    double r=(double)(rand()+1)/((double)RAND_MAX+2.0);
+    double r=kv_level_u(i);
     int lvl=(int)(-log(r)*v->mL); if(lvl>255)lvl=255; v->level[i]=(uint8_t)lvl;
     v->lu[i]=NULL;
     if(lvl>0){ v->lu[i]=calloc((size_t)lvl*(v->M+1),sizeof(uint32_t)); if(!v->lu[i]) return -1; }
     v->count = i+1; v->gN = v->count;             /* node is now addressable */
     Scr s; scr_init(&s, v->gN, v->efc+16);
-    if(!s.vis){ scr_free(&s); return -1; }
+    if(!scr_ok(&s)){ scr_free(&s); return -1; }
     insert_node(v, i, &s);                        /* greedy connect into the live graph */
     scr_free(&s);
     if(v->qg){ kv_qg_free(v->qg); v->qg=NULL; }
@@ -2396,6 +2773,7 @@ int kci_vec_forget(KciVec *v, uint64_t id){
 /* Rebuild the graph over only the live (non-tombstoned) vectors, reclaiming
  * tombstoned slots. Returns the new live count. Requires retained floats. */
 uint32_t kci_vec_compact(KciVec *v){
+    if(v){ v->rowgen++; kv_ql_free(v->ql); v->ql=NULL; kv_vt_free(v->vt); v->vt=NULL; }
     if(!v || (!v->built && !v->ivf)) return 0;
     if(v->img) return v->count;
     if(v->ndead==0) return v->count;
@@ -2419,7 +2797,8 @@ uint32_t kci_vec_compact(KciVec *v){
     v->count=0; v->cap=0; v->building=1;
     if(kci_vec_reserve(v, live)!=0){ free(nf); free(nid); return 0; }
     for(uint32_t i=0;i<live;i++){
-        store_float_norm(v,i,nf+(size_t)i*v->dim);
+        if(v->l2) memcpy(v->vf+(size_t)i*v->dim, nf+(size_t)i*v->dim, (size_t)v->dim*sizeof(float));
+        else store_float_norm(v,i,nf+(size_t)i*v->dim);
         v->vid[i]=nid[i]; }
     v->count=live;
     kv_wipe(nf, (size_t)live*v->dim*sizeof(float)); free(nf); free(nid);
@@ -2458,260 +2837,7 @@ static void cc20_crypt(uint8_t *buf, uint32_t len, const uint8_t key[32], uint32
         done+=c; }
 }
 /* derive a 32-byte key from an arbitrary caller key (PBKDF2-HMAC-SHA256, below). */
-/* ── SHA-256 (FIPS 180-4) → HMAC → PBKDF2: proper key derivation ──────────── */
-typedef struct { uint32_t h[8]; uint64_t bits; uint8_t buf[64]; size_t n; } SHA256;
-static const uint32_t SHA256_K[64]={
-0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
-#define SHR(x,n) ((x)>>(n))
-#define ROTR(x,n) (((x)>>(n))|((x)<<(32-(n))))
-static void sha256_blk(SHA256*c,const uint8_t*p){
-    uint32_t w[64],a,b,cc,d,e,f,g,h,t1,t2;
-    for(int i=0;i<16;i++) w[i]=(uint32_t)p[i*4]<<24|p[i*4+1]<<16|p[i*4+2]<<8|p[i*4+3];
-    for(int i=16;i<64;i++){ uint32_t s0=ROTR(w[i-15],7)^ROTR(w[i-15],18)^SHR(w[i-15],3);
-        uint32_t s1=ROTR(w[i-2],17)^ROTR(w[i-2],19)^SHR(w[i-2],10); w[i]=w[i-16]+s0+w[i-7]+s1; }
-    a=c->h[0];b=c->h[1];cc=c->h[2];d=c->h[3];e=c->h[4];f=c->h[5];g=c->h[6];h=c->h[7];
-    for(int i=0;i<64;i++){ uint32_t S1=ROTR(e,6)^ROTR(e,11)^ROTR(e,25), ch=(e&f)^(~e&g);
-        t1=h+S1+ch+SHA256_K[i]+w[i]; uint32_t S0=ROTR(a,2)^ROTR(a,13)^ROTR(a,22), maj=(a&b)^(a&cc)^(b&cc);
-        t2=S0+maj; h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2; }
-    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
-}
-static void sha256_init(SHA256*c){ static const uint32_t H0[8]={0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-    memcpy(c->h,H0,sizeof H0); c->bits=0; c->n=0; }
-static void sha256_upd(SHA256*c,const uint8_t*d,size_t n){ c->bits+=(uint64_t)n*8;
-    while(n){ size_t k=64-c->n; if(k>n)k=n; memcpy(c->buf+c->n,d,k); c->n+=k; d+=k; n-=k;
-        if(c->n==64){ sha256_blk(c,c->buf); c->n=0; } } }
-static void sha256_fin(SHA256*c,uint8_t out[32]){ uint64_t bits=c->bits; uint8_t pad=0x80;
-    sha256_upd(c,&pad,1); uint8_t z=0; while(c->n!=56) sha256_upd(c,&z,1);
-    uint8_t lb[8]; for(int i=0;i<8;i++) lb[i]=(uint8_t)(bits>>(56-i*8)); sha256_upd(c,lb,8);
-    for(int i=0;i<8;i++){ out[i*4]=c->h[i]>>24;out[i*4+1]=c->h[i]>>16;out[i*4+2]=c->h[i]>>8;out[i*4+3]=c->h[i]; } }
-static void hmac_sha256(const uint8_t*key,size_t kl,const uint8_t*msg,size_t ml,uint8_t out[32]){
-    uint8_t k[64]={0}, ip[64], op[64], ih[32]; SHA256 c;
-    if(kl>64){ sha256_init(&c); sha256_upd(&c,key,kl); sha256_fin(&c,k); } else memcpy(k,key,kl);
-    for(int i=0;i<64;i++){ ip[i]=k[i]^0x36; op[i]=k[i]^0x5c; }
-    sha256_init(&c); sha256_upd(&c,ip,64); sha256_upd(&c,msg,ml); sha256_fin(&c,ih);
-    sha256_init(&c); sha256_upd(&c,op,64); sha256_upd(&c,ih,32); sha256_fin(&c,out);
-}
-/* PBKDF2-HMAC-SHA256, dkLen=32 (one block) */
-static void pbkdf2(const uint8_t*pw,size_t pl,const uint8_t*salt,size_t sl,uint32_t iters,uint8_t out32[32]){
-    uint8_t s[64],u[32],t[32]; size_t n=sl<60?sl:60; memcpy(s,salt,n);
-    s[n]=0;s[n+1]=0;s[n+2]=0;s[n+3]=1;                      /* INT(1) big-endian */
-    hmac_sha256(pw,pl,s,n+4,u); memcpy(t,u,32);
-    for(uint32_t i=1;i<iters;i++){ hmac_sha256(pw,pl,u,32,u); for(int j=0;j<32;j++) t[j]^=u[j]; }
-    memcpy(out32,t,32);
-}
-#define KV_KDF_ITERS 100000u
-static void kdf_derive(const uint8_t *key, int keylen, const uint8_t *salt, int saltlen, uint8_t out32[32]){
-    pbkdf2(key,(size_t)keylen,salt,(size_t)saltlen,KV_KDF_ITERS,out32);
-}
-/* cryptographic salt: /dev/urandom, with a hashed-entropy fallback. */
-static void kv_randbytes(uint8_t *out, int n){
-    FILE *f=fopen("/dev/urandom","rb");
-    if(f){ size_t r=fread(out,1,n,f); fclose(f); if(r==(size_t)n) return; }
-    static uint64_t ctr=0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-    uint8_t seed[40]; uintptr_t a1=(uintptr_t)out, a2=(uintptr_t)&ts; ctr++;
-    memcpy(seed,&ts,sizeof ts); memcpy(seed+16,&a1,8); memcpy(seed+24,&a2,8); memcpy(seed+32,&ctr,8);
-    uint8_t h[32]; SHA256 c; sha256_init(&c); sha256_upd(&c,seed,sizeof seed); sha256_fin(&c,h);
-    memcpy(out,h,n<32?n:32);
-}
-
-static const uint8_t kv_sbox[256] = {
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16 };
-static inline uint8_t kv_xt(uint8_t x){ return (uint8_t)((x<<1)^((x>>7)*0x1b)); }
-
-/* FIPS-197 key expansion: 15 round keys in standard byte order */
-static void kv_aes_expand(const uint8_t key[32], uint8_t w[240]){
-    uint8_t rcon=1;
-    memcpy(w,key,32);
-    for(int i=8;i<60;i++){
-        uint8_t t[4]; memcpy(t,w+4*(i-1),4);
-        if(i%8==0){ uint8_t t0=t[0];
-            t[0]=kv_sbox[t[1]]^rcon; t[1]=kv_sbox[t[2]]; t[2]=kv_sbox[t[3]]; t[3]=kv_sbox[t0];
-            rcon=kv_xt(rcon); }
-        else if(i%8==4){ for(int k=0;k<4;k++) t[k]=kv_sbox[t[k]]; }
-        for(int k=0;k<4;k++) w[4*i+k]=w[4*(i-8)+k]^t[k];
-    }
-}
-/* portable AES-256 encryption of one block */
-static void kv_aes_block_soft(const uint8_t w[240], const uint8_t in[16], uint8_t out[16]){
-    uint8_t s[16], t[16];
-    for(int i=0;i<16;i++) s[i]=in[i]^w[i];
-    for(int r=1;r<=14;r++){
-        for(int i=0;i<16;i++) t[i]=kv_sbox[s[i]];                                   /* SubBytes  */
-        for(int c=0;c<4;c++) for(int q=0;q<4;q++) s[q+4*c]=t[q+4*((c+q)&3)];          /* ShiftRows */
-        if(r!=14) for(int c=0;c<4;c++){                                              /* MixColumns */
-            uint8_t *col=s+4*c, a0=col[0], a1=col[1], a2=col[2], a3=col[3], x=a0^a1^a2^a3;
-            col[0]=a0^x^kv_xt(a0^a1); col[1]=a1^x^kv_xt(a1^a2);
-            col[2]=a2^x^kv_xt(a2^a3); col[3]=a3^x^kv_xt(a3^a0); }
-        for(int i=0;i<16;i++) s[i]^=w[16*r+i];
-    }
-    memcpy(out,s,16);
-}
-
-#if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
-#define KV_AES_X86 1
-#include <wmmintrin.h>
-#include <emmintrin.h>
-#define KV_AESNI_FN __attribute__((target("aes,sse2")))
-KV_AESNI_FN static void kv_aes_block_ni(const uint8_t w[240], const uint8_t in[16], uint8_t out[16]){
-    const __m128i *k=(const __m128i*)w;
-    __m128i b=_mm_xor_si128(_mm_loadu_si128((const __m128i*)in), _mm_loadu_si128(k));
-    for(int r=1;r<14;r++) b=_mm_aesenc_si128(b,_mm_loadu_si128(k+r));
-    _mm_storeu_si128((__m128i*)out, _mm_aesenclast_si128(b,_mm_loadu_si128(k+14)));
-}
-/* CTR keystream XOR, 4 blocks in flight. Counter block = [nonce LE 8 | block LE 8]. */
-KV_AESNI_FN static void kv_ctr_ni(const uint8_t w[240], uint64_t nonce, uint8_t *buf, size_t len){
-    __m128i rk[15]; for(int i=0;i<15;i++) rk[i]=_mm_loadu_si128((const __m128i*)(w+16*i));
-    __m128i ctr=_mm_set_epi64x(0,(long long)nonce); const __m128i one=_mm_set_epi64x(1,0);
-    size_t pos=0;
-    for(; pos+64<=len; pos+=64){
-        __m128i c0=ctr, c1=_mm_add_epi64(c0,one), c2=_mm_add_epi64(c1,one), c3=_mm_add_epi64(c2,one);
-        ctr=_mm_add_epi64(c3,one);
-        c0=_mm_xor_si128(c0,rk[0]); c1=_mm_xor_si128(c1,rk[0]); c2=_mm_xor_si128(c2,rk[0]); c3=_mm_xor_si128(c3,rk[0]);
-        for(int r=1;r<14;r++){ c0=_mm_aesenc_si128(c0,rk[r]); c1=_mm_aesenc_si128(c1,rk[r]);
-                               c2=_mm_aesenc_si128(c2,rk[r]); c3=_mm_aesenc_si128(c3,rk[r]); }
-        c0=_mm_aesenclast_si128(c0,rk[14]); c1=_mm_aesenclast_si128(c1,rk[14]);
-        c2=_mm_aesenclast_si128(c2,rk[14]); c3=_mm_aesenclast_si128(c3,rk[14]);
-        __m128i *p=(__m128i*)(buf+pos);
-        _mm_storeu_si128(p+0,_mm_xor_si128(_mm_loadu_si128(p+0),c0));
-        _mm_storeu_si128(p+1,_mm_xor_si128(_mm_loadu_si128(p+1),c1));
-        _mm_storeu_si128(p+2,_mm_xor_si128(_mm_loadu_si128(p+2),c2));
-        _mm_storeu_si128(p+3,_mm_xor_si128(_mm_loadu_si128(p+3),c3));
-    }
-    for(; pos<len; pos+=16){
-        __m128i b=_mm_xor_si128(ctr,rk[0]); ctr=_mm_add_epi64(ctr,one);
-        for(int r=1;r<14;r++) b=_mm_aesenc_si128(b,rk[r]);
-        b=_mm_aesenclast_si128(b,rk[14]);
-        uint8_t ks[16]; _mm_storeu_si128((__m128i*)ks,b);
-        size_t c=len-pos<16?len-pos:16;
-        for(size_t i=0;i<c;i++) buf[pos+i]^=ks[i];
-    }
-}
-/* CBC-MAC chain over n whole blocks (CMAC body): x = E(x ^ block) */
-KV_AESNI_FN static void kv_cbcmac_ni(const uint8_t w[240], uint8_t x[16], const uint8_t *p, size_t n){
-    __m128i rk[15]; for(int i=0;i<15;i++) rk[i]=_mm_loadu_si128((const __m128i*)(w+16*i));
-    __m128i s=_mm_loadu_si128((const __m128i*)x);
-    for(size_t j=0;j<n;j++){
-        s=_mm_xor_si128(_mm_xor_si128(s,_mm_loadu_si128((const __m128i*)(p+16*j))),rk[0]);
-        for(int r=1;r<14;r++) s=_mm_aesenc_si128(s,rk[r]);
-        s=_mm_aesenclast_si128(s,rk[14]);
-    }
-    _mm_storeu_si128((__m128i*)x,s);
-}
-#elif defined(__aarch64__) && (defined(__ARM_FEATURE_AES) || defined(__ARM_FEATURE_CRYPTO))
-#define KV_AES_ARM 1
-/* AESE = AddRoundKey + SubBytes + ShiftRows; AESMC = MixColumns */
-static void kv_aes_block_arm(const uint8_t w[240], const uint8_t in[16], uint8_t out[16]){
-    uint8x16_t b=vld1q_u8(in);
-    for(int r=0;r<13;r++) b=vaesmcq_u8(vaeseq_u8(b,vld1q_u8(w+16*r)));
-    b=veorq_u8(vaeseq_u8(b,vld1q_u8(w+16*13)),vld1q_u8(w+16*14));
-    vst1q_u8(out,b);
-}
-#endif
-
-typedef struct { uint8_t rk[240]; int path; } KvAes;   /* path: 0 portable, 1 AES-NI, 2 ARMv8 */
-static void kv_aes_block(const KvAes *a, const uint8_t in[16], uint8_t out[16]){
-#if defined(KV_AES_X86)
-    if(a->path==1){ kv_aes_block_ni(a->rk,in,out); return; }
-#elif defined(KV_AES_ARM)
-    if(a->path==2){ kv_aes_block_arm(a->rk,in,out); return; }
-#endif
-    kv_aes_block_soft(a->rk,in,out);
-}
-/* expand the key and pick the fastest path that gives the FIPS-197 C.3 answer */
-static void kv_aes_init(KvAes *a, const uint8_t key[32]){
-    kv_aes_expand(key,a->rk); a->path=0;
-#if defined(KV_AES_X86) || defined(KV_AES_ARM)
-    static const uint8_t pt[16]={0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff};
-    static const uint8_t ct[16]={0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89};
-    uint8_t k[32], w[240], o[16];
-    for(int i=0;i<32;i++) k[i]=(uint8_t)i;
-    kv_aes_expand(k,w);
-#if defined(KV_AES_X86)
-    if(__builtin_cpu_supports("aes")){ kv_aes_block_ni(w,pt,o); if(memcmp(o,ct,16)==0) a->path=1; }
-#else
-    kv_aes_block_arm(w,pt,o); if(memcmp(o,ct,16)==0) a->path=2;
-#endif
-#endif
-}
-/* XOR the AES-256-CTR keystream for `nonce` over buf (block counter from 0) */
-static void kv_ctr(const KvAes *a, uint64_t nonce, uint8_t *buf, size_t len){
-#if defined(KV_AES_X86)
-    if(a->path==1){ kv_ctr_ni(a->rk,nonce,buf,len); return; }
-#endif
-    uint8_t cb[16], ks[16]; uint64_t blk=0;
-    for(size_t pos=0; pos<len; pos+=16, blk++){
-        for(int k=0;k<8;k++){ cb[k]=(uint8_t)(nonce>>(8*k)); cb[8+k]=(uint8_t)(blk>>(8*k)); }
-        kv_aes_block(a,cb,ks);
-        size_t c=len-pos<16?len-pos:16;
-        for(size_t i=0;i<c;i++) buf[pos+i]^=ks[i];
-    }
-}
-
-/* AES-256-CMAC (NIST SP 800-38B), streaming: the last full block is held back
- * until final, because it is padded with K1 instead of K2 */
-typedef struct { KvAes a; uint8_t k1[16], k2[16], x[16], buf[16]; uint32_t fill; } KvCmac;
-static void kv_cmac_dbl(const uint8_t in[16], uint8_t out[16]){
-    uint8_t carry=(uint8_t)(in[0]>>7);
-    for(int i=0;i<15;i++) out[i]=(uint8_t)((in[i]<<1)|(in[i+1]>>7));
-    out[15]=(uint8_t)((in[15]<<1)^(carry*0x87));
-}
-static void kv_cmac_init(KvCmac *m, const uint8_t key[32]){
-    memset(m,0,sizeof *m);
-    kv_aes_init(&m->a,key);
-    uint8_t l[16]={0}; kv_aes_block(&m->a,l,l);
-    kv_cmac_dbl(l,m->k1); kv_cmac_dbl(m->k1,m->k2);
-}
-static void kv_cmac_absorb(KvCmac *m, const uint8_t *p, size_t nblk){
-#if defined(KV_AES_X86)
-    if(m->a.path==1){ kv_cbcmac_ni(m->a.rk,m->x,p,nblk); return; }
-#endif
-    for(size_t j=0;j<nblk;j++){ for(int i=0;i<16;i++) m->x[i]^=p[16*j+i]; kv_aes_block(&m->a,m->x,m->x); }
-}
-static void kv_cmac_update(KvCmac *m, const void *data, size_t len){
-    const uint8_t *p=(const uint8_t*)data;
-    while(len){
-        if(m->fill==16){ kv_cmac_absorb(m,m->buf,1); m->fill=0; }   /* more data follows */
-        if(m->fill==0 && len>16){                   /* whole blocks straight from the input */
-            size_t n=(len-1)/16;                    /* keep at least 1 byte for the held block */
-            kv_cmac_absorb(m,p,n); p+=16*n; len-=16*n;
-            continue;
-        }
-        size_t take=16-m->fill; if(take>len) take=len;
-        memcpy(m->buf+m->fill,p,take); m->fill+=(uint32_t)take; p+=take; len-=take;
-    }
-}
-static void kv_cmac_final(KvCmac *m, uint8_t tag[16]){
-    const uint8_t *k=m->k1;
-    if(m->fill<16){ m->buf[m->fill]=0x80; memset(m->buf+m->fill+1,0,15-m->fill); k=m->k2; }
-    for(int i=0;i<16;i++) m->x[i]^=m->buf[i]^k[i];
-    kv_aes_block(&m->a,m->x,tag);
-}
-/* one key, one use: HMAC-SHA256(master, label) */
-static void kv_subkey(const uint8_t master[32], const char *label, uint8_t out[32]){
-    hmac_sha256(master,32,(const uint8_t*)label,strlen(label),out);
-}
+#include "kci_crypt.h"
 
 #define KV_ENC_CHUNK (256u*1024*1024)
 typedef struct { int kind; const uint8_t *cc; KvAes aes; KvCmac mac; uint32_t chunk; } KvIO;
@@ -2776,12 +2902,18 @@ static int kv_verify_file(FILE *f, KvCmac *m){
 
 #define KCIVEC_MAGIC  "KCIVEC04"   /* 04: signed int8 + global scale gs + tombstone bitmap */
 #define KCIVEC_MAGIC5 "KCIVEC05"   /* 05: same layout, AES-256-CTR + CMAC */
+#define KCIVEC_MAGIC6 "KCIVEC06"   /* 06: L2, plaintext */
+#define KCIVEC_MAGIC7 "KCIVEC07"   /* 07: L2, AES-256-CTR + CMAC */
+#define KCIVEC_MAGIC8 "KCIVEC08"   /* 08: inner product, plaintext */
+#define KCIVEC_MAGIC9 "KCIVEC09"   /* 09: inner product, AES-256-CTR + CMAC */
 #define KCIVEC_KEYCHK "KCIVEC-KEYCHECK!"   /* 16 bytes, encrypted as a key probe */
 #define KV_FLAG_ENC   1u
 #define KV_FLAG_GRAPH 2u
 #define KV_FLAG_FLOAT 4u
 #define KV_FLAG_IVF   8u
 #define KV_FLAG_FLOAT_EXT 16u
+#define KV_FLAG_QG 64u
+#define KV_QG_SEC 0x4751564Bu      /* 'KVQG' */
 #define KV_FLAG_RAWKEY 32u
 #define KV_KC_TWEAK   0xFFFFFFFEu           /* keycheck CTR nonce (≠ payload chunks) */
 #define KV_LABEL_ENC  "KCIVEC05 encryption key"
@@ -2791,7 +2923,7 @@ int kci_vec_save(KciVec *v, const char *path, const uint8_t *key, int keylen){
     return kci_vec_save_ex(v, path, key, keylen, 0);
 }
 int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen, int sflags){
-    if(!v) return -1;
+    if(!v || kv_l2_fin(v)!=0) return -1;
     int nofloat = (sflags & KCI_VEC_SAVE_NO_FLOAT) && v->vf && !v->vf_mmap;
     int rawkey = (sflags & KCI_VEC_SAVE_RAW_KEY) != 0;
     if(rawkey && (!key || keylen != 32)) return -1;
@@ -2799,7 +2931,7 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
     uint8_t salt[16];
     if(key && keylen>0){
         uint8_t mk[32], ek[32], ak[32];
-        kv_randbytes(salt,16);
+        if(kv_randbytes(salt,16)!=0) return -1;
         if(rawkey) hmac_sha256(key,32,salt,16,mk);
         else kdf_derive(key,keylen,salt,16,mk);
         kv_subkey(mk,KV_LABEL_ENC,ek); kv_subkey(mk,KV_LABEL_MAC,ak);
@@ -2812,18 +2944,23 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
     if(snprintf(tmp,sizeof(tmp),"%s.tmp",path) >= (int)sizeof(tmp)) return -1;
     FILE *f=fopen(tmp,"wb");
     if(!f) return -1;
+    const int wqg = v->built && v->qg && v->qg->n==v->count && v->count>0, wvh = v->built && v->vh && v->vhn==v->count && v->count>0;
     uint32_t flags = (io.kind?KV_FLAG_ENC:0) | (v->built?KV_FLAG_GRAPH:0) | (v->vf && !nofloat?KV_FLAG_FLOAT:0) | (v->ivf?KV_FLAG_IVF:0)
-                   | (nofloat?KV_FLAG_FLOAT_EXT:0) | (rawkey && io.kind?KV_FLAG_RAWKEY:0);
+                   | (nofloat?KV_FLAG_FLOAT_EXT:0) | (rawkey && io.kind?KV_FLAG_RAWKEY:0) | (wqg || wvh ? KV_FLAG_QG : 0);
     uint32_t hdr[8] = { flags, (uint32_t)v->dim, (uint32_t)v->M, (uint32_t)v->efc,
                         v->count, v->built?(uint32_t)v->maxlevel:0, v->ep, 0 };
     memcpy(&hdr[7], &v->gs, sizeof(float));            /* global SQ scale */
     int ok=1;
-    ok &= kv_wraw(f, io.kind?KCIVEC_MAGIC5:KCIVEC_MAGIC, 8, &io)==0;
+    ok &= kv_wraw(f, v->l2==2 ? (io.kind?KCIVEC_MAGIC9:KCIVEC_MAGIC8) : v->l2 ? (io.kind?KCIVEC_MAGIC7:KCIVEC_MAGIC6) : (io.kind?KCIVEC_MAGIC5:KCIVEC_MAGIC), 8, &io)==0;
     ok &= kv_wraw(f, hdr, sizeof(hdr), &io)==0;
+    if(v->l2){ uint32_t lh[6]={ (uint32_t)v->udim }; float p5[5]={ v->l2s, v->l2lam, v->l2ab, v->l2M2, v->l2me };
+        memcpy(&lh[1], p5, sizeof p5);
+        ok &= kv_wraw(f, lh, sizeof lh, &io)==0; }
     if(io.kind) ok &= kv_wraw(f, salt, 16, &io)==0;   /* PBKDF2 salt (plaintext, not secret) */
     { uint8_t kc[16]; memcpy(kc,KCIVEC_KEYCHK,16);    /* key-check probe */
       if(io.kind) kv_ctr(&io.aes,KV_KC_TWEAK,kc,16);
       ok &= kv_wraw(f, kc, 16, &io)==0; }
+    if(v->l2==2) ok &= enc_fwrite(f, v->ipm, (size_t)v->udim*sizeof(float), &io)==0;
     ok &= enc_fwrite(f, v->vid, (size_t)v->count*sizeof(uint64_t), &io)==0;
     ok &= enc_fwrite(f, v->vq,  (size_t)v->count*v->dim, &io)==0;
     if(v->vf && !nofloat) ok &= enc_fwrite(f, v->vf, (size_t)v->count*v->dim*sizeof(float), &io)==0;
@@ -2852,6 +2989,21 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
                 float sc2[2]={L->uscale,L->cscale}; ok &= enc_fwrite(f, sc2, sizeof sc2, &io)==0; } }
         if(!v->built) ok &= enc_fwrite(f, v->dead, v->count, &io)==0;   /* no graph: tombstones here */
     }
+    if(wqg || wvh){
+        const struct KvQg *g = wqg ? v->qg : NULL;
+        uint32_t qh[12]={ KV_QG_SEC, (g ? 1u : 0u) | (g && g->P8 ? 2u : 0u) | (g && g->R8 && g->r8inv ? 4u : 0u) | (wvh ? 8u : 0u),
+                          g ? (uint32_t)g->M : 0, g ? (uint32_t)g->dp : 0, g ? (uint32_t)g->nblk : 0, g ? (uint32_t)g->nfull : 0,
+                          g ? (uint32_t)g->half : 0, g ? (uint32_t)g->cd : 0, g ? (uint32_t)g->gd : 0, 0, 0, 0 };
+        uint64_t q8[2]={ g ? (uint64_t)g->stride : 0, g ? (uint64_t)g->hdr : 0 }; double qe = g ? g->eta : 0; float qp = g ? g->ps : 0;
+        ok &= enc_fwrite(f, qh, sizeof qh, &io)==0 && enc_fwrite(f, q8, sizeof q8, &io)==0 && enc_fwrite(f, &qe, sizeof qe, &io)==0 && enc_fwrite(f, &qp, sizeof qp, &io)==0;
+        if(g){ const size_t n=v->count, D=(size_t)v->dim;
+            ok &= enc_fwrite(f, g->blocks, n*g->stride, &io)==0;
+            ok &= enc_fwrite(f, g->pq, (size_t)(g->M+1)*32*sizeof(float), &io)==0;
+            if(g->cd){ if(g->R8 && g->r8inv){ ok &= enc_fwrite(f, g->R8, D*(size_t)g->cd, &io)==0; ok &= enc_fwrite(f, g->r8inv, (size_t)g->cd*sizeof(float), &io)==0; }
+                       else ok &= enc_fwrite(f, g->R, D*(size_t)g->cd*sizeof(float), &io)==0;
+                       if(g->P8) ok &= enc_fwrite(f, g->P8, n*(size_t)g->cd, &io)==0; } }
+        if(wvh) ok &= enc_fwrite(f, v->vh, (size_t)v->count*v->dim*sizeof(uint16_t), &io)==0;
+    }
     if(io.kind){ uint8_t tag[16]; kv_cmac_final(&io.mac,tag); ok &= fwrite(tag,16,1,f)==1; }
     memset(&io,0,sizeof io);
     if(fflush(f)!=0) ok=0;
@@ -2864,12 +3016,27 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
 static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lflags){
     char magic[8]; uint32_t hdr[8];
     if(fread(magic,8,1,f)!=1) return NULL;
-    int v5 = memcmp(magic,KCIVEC_MAGIC5,8)==0;
-    if(!v5 && memcmp(magic,KCIVEC_MAGIC,8)!=0) return NULL;
+    int l2 = memcmp(magic,KCIVEC_MAGIC6,8)==0 || memcmp(magic,KCIVEC_MAGIC7,8)==0;
+    if(memcmp(magic,KCIVEC_MAGIC8,8)==0 || memcmp(magic,KCIVEC_MAGIC9,8)==0) l2=2;
+#ifdef KCI_VEC_NO_L2
+    if(l2) return NULL;
+#endif
+    int v5 = memcmp(magic,KCIVEC_MAGIC5,8)==0 || memcmp(magic,KCIVEC_MAGIC7,8)==0 || memcmp(magic,KCIVEC_MAGIC9,8)==0;
+    if(!v5 && !l2 && memcmp(magic,KCIVEC_MAGIC,8)!=0) return NULL;
     if(fread(hdr,sizeof(hdr),1,f)!=1) return NULL;
+    if((lflags & KCI_VEC_LOAD_AUTH_ONLY) && !(v5 && (hdr[0] & KV_FLAG_ENC))) return NULL;
     uint32_t flags=hdr[0]; int dim=hdr[1], M=hdr[2], efc=hdr[3];
     uint32_t count=hdr[4], ml=hdr[5], ep=hdr[6];
     float gs; memcpy(&gs,&hdr[7],sizeof(float));
+    if(dim<=0 || dim>(1<<16) || M<2 || M>4096 || count>(1u<<30)) return NULL;
+    { struct stat st; if(fstat(fileno(f),&st)==0 && S_ISREG(st.st_mode) && (uint64_t)count*((uint64_t)dim+8) > (uint64_t)st.st_size) return NULL; }
+    int udim=0; float p5[5]={0};
+    if(l2){ uint32_t lh[6];
+        if(fread(lh,sizeof lh,1,f)!=1) return NULL;
+        udim=(int)lh[0]; memcpy(p5,&lh[1],sizeof p5);
+        for(int i=0;i<5;i++) if(!isfinite(p5[i])) return NULL;
+        if(udim<=0 || udim+(l2==2?1:2)!=dim || !(p5[0]>0) || !(p5[1]>0) || !(p5[3]>=1.0f) || !(p5[4]>0)) return NULL;
+        if(!v5 && (flags & KV_FLAG_ENC)) return NULL; }      /* 06 is plaintext, never ChaCha20 */
     uint8_t mk[32];
     if(flags & KV_FLAG_ENC){
         if(!key || keylen<=0){ fprintf(stderr,"kci_vec_load: snapshot is encrypted, key required\n"); return NULL; }
@@ -2894,18 +3061,24 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
         fprintf(stderr,"kci_vec_load: snapshot failed authentication (damaged or altered)\n"); return NULL; }
     KciVec *v=kci_vec_new(dim,M,efc);
     if(!v) return NULL;
+    if(l2){ v->l2=l2; v->udim=udim; v->l2s=p5[0]; v->l2lam=p5[1]; v->l2ab=p5[2]; v->l2M2=p5[3]; v->l2me=p5[4]; v->l2fin=1; }
     v->building=0;                                  /* loaded: no training vf */
     if(kci_vec_reserve(v,count)!=0){ kci_vec_free(v); return NULL; }
     int ok=1;
+    if(l2==2){ v->ipm=malloc((size_t)udim*sizeof(float));
+        ok &= v->ipm && enc_fread(f, v->ipm, (size_t)udim*sizeof(float), io)==0;
+        for(int d=0;ok && d<udim;d++) if(!isfinite(v->ipm[d])) ok=0; }
     ok &= enc_fread(f, v->vid, (size_t)count*sizeof(uint64_t), io)==0;
     ok &= enc_fread(f, v->vq,  (size_t)count*dim, io)==0;
     if(flags & KV_FLAG_FLOAT){
-        v->keepf=1; v->vf=malloc((size_t)v->cap*dim*sizeof(float));
+        v->keepf=1; v->vf=kv_valloc(v, (size_t)v->cap*dim*sizeof(float));
         if(!v->vf){ kci_vec_free(v); return NULL; }
+        if(v->cap>count) memset(v->vf+(size_t)count*dim, 0, (size_t)(v->cap-count)*dim*sizeof(float));
         ok &= enc_fread(f, v->vf, (size_t)count*dim*sizeof(float), io)==0;
     } else if(flags & KV_FLAG_FLOAT_EXT){                /* the caller fills the floats (kci_vec_set_float) */
-        v->keepf=1; v->vf=calloc((size_t)v->cap*dim, sizeof(float));
+        v->keepf=1; v->vf=kv_valloc(v, (size_t)v->cap*dim*sizeof(float));
         if(!v->vf){ kci_vec_free(v); return NULL; }
+        memset(v->vf, 0, (size_t)v->cap*dim*sizeof(float));
     }
     v->count=count; v->gs=gs;
     if(flags & KV_FLAG_GRAPH){
@@ -2921,8 +3094,9 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
         ok &= enc_fread(f, v->l0, (size_t)count*(v->M0+1)*sizeof(uint32_t), io)==0;
         for(uint32_t i=0;i<count && ok;i++){ int lvl=v->level[i];
             if(lvl>0){ v->lu[i]=calloc((size_t)lvl*(v->M+1),sizeof(uint32_t));
-                ok &= enc_fread(f, v->lu[i], (size_t)lvl*(v->M+1)*sizeof(uint32_t), io)==0; } }
+                ok &= v->lu[i] && enc_fread(f, v->lu[i], (size_t)lvl*(v->M+1)*sizeof(uint32_t), io)==0; } }
         ok &= enc_fread(f, v->dead, count, io)==0;       /* tombstone bitmap */
+        if(ok) ok = kv_graph_ok(v, count, ep, ml);
         if(ok){ for(uint32_t i=0;i<count;i++) if(v->dead[i]) v->ndead++;
             uint32_t bits=1; while((1u<<bits) < count*2u) bits++; h_rebuild(v, bits); }
         v->ep=ep; v->maxlevel=(int)ml; v->built=1;
@@ -2970,6 +3144,31 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
                 uint32_t bits=1; while((1u<<bits) < count*2u) bits++; ok = h_rebuild(v, bits)==0; } }
         if(ok) v->ivf=iv; else kv_ivf_free(iv);
     }
+    if(ok && (flags & KV_FLAG_QG)){
+        uint32_t qh[12]; uint64_t q8[2]; double qe; float qp;
+        ok = (flags & KV_FLAG_GRAPH) && count>0
+          && enc_fread(f, qh, sizeof qh, io)==0 && enc_fread(f, q8, sizeof q8, io)==0 && enc_fread(f, &qe, sizeof qe, io)==0 && enc_fread(f, &qp, sizeof qp, io)==0
+          && qh[0]==KV_QG_SEC && (qh[1]&~15u)==0 && (qh[1]&9u);
+        const size_t n=count, D=(size_t)dim;
+        if(ok && (qh[1]&1)){
+            struct KvQg *g=calloc(1,sizeof *g); ok = g!=NULL;
+            if(ok){ g->M=(int)qh[2]; g->dp=(int)qh[3]; g->nblk=(int)qh[4]; g->nfull=(int)qh[5]; g->half=(int)qh[6]; g->cd=(int)qh[7]; g->gd=(int)qh[8];
+                g->D=dim; g->stride=(size_t)q8[0]; g->hdr=(size_t)q8[1]; g->eta=qe; g->ps=qp; g->n=count;
+                ok = qh[2]<=(1u<<16) && qh[4]<=64 && q8[0]<=((uint64_t)1<<24) && kv_qg_shape_ok(g, D, (size_t)v->M0)
+                  && ((qh[1]&6)==0 || g->cd) && (!(qh[1]&2) || (isfinite(g->ps) && g->ps>0));
+                if(ok){ g->blocks=kv_big_alloc(n*g->stride); g->pq=malloc((size_t)(g->M+1)*32*sizeof(float));
+                    ok = g->blocks && g->pq && enc_fread(f, g->blocks, n*g->stride, io)==0 && enc_fread(f, g->pq, (size_t)(g->M+1)*32*sizeof(float), io)==0; }
+                if(ok && g->cd){
+                    if(qh[1]&4){ g->R8=malloc(D*(size_t)g->cd); g->r8inv=malloc((size_t)g->cd*sizeof(float));
+                        ok = g->R8 && g->r8inv && enc_fread(f, g->R8, D*(size_t)g->cd, io)==0 && enc_fread(f, g->r8inv, (size_t)g->cd*sizeof(float), io)==0; }
+                    else { g->R=malloc(D*(size_t)g->cd*sizeof(float)); ok = g->R && enc_fread(f, g->R, D*(size_t)g->cd*sizeof(float), io)==0; }
+                    if(ok && (qh[1]&2)){ g->P8=kv_big_alloc(n*(size_t)g->cd); ok = g->P8 && enc_fread(f, g->P8, n*(size_t)g->cd, io)==0; } }
+                if(ok) v->qg=g; else { g->n=0; kv_qg_free(g); } }
+        }
+        if(ok && (qh[1]&8)){ size_t hb=n*D*sizeof(uint16_t);
+            v->vh=kv_valloc(v, hb); v->vhn = v->vh ? count : 0;
+            ok = v->vh && !v->vf && enc_fread(f, v->vh, hb, io)==0; }
+    }
     memset(mk,0,32);
     if(!ok){ kci_vec_free(v); return NULL; }
     return v;
@@ -2984,21 +3183,33 @@ KciVec *kci_vec_load(const char *path, const uint8_t *key, int keylen){
 enum { KVI_VID, KVI_VQ, KVI_VF, KVI_DEAD, KVI_CENT, KVI_PQ, KVI_R, KVI_LN, KVI_CODES, KVI_IDS, KVI_U, KVI_USUM, KVI_SC, KVI_N };
 typedef struct {
     char magic[8];
-    uint32_t dim, M, efc, count, flags;           /* flags: 1 floats kept, 2 lists, 4 reserved */
+    uint32_t dim, M, efc, count, flags;           /* flags: 1 floats kept, 2 lists, 4 L2 */
     uint32_t nlist, ivfM, d1, lr, dp, tc, soar1000, nmax;
     float gs, avqt;
-    uint32_t rsv[6];                              /* reserved (flags & 4) */
+    uint32_t udim; float l2p[5];                  /* L2 (flags & 4): udim, l2s, l2lam, l2ab, l2M2, l2me */
     uint64_t off[KVI_N], len[KVI_N], total;
 } KvImg;
 static uint64_t kv_img_al(uint64_t x){ return (x + KV_IMG_AL - 1) / KV_IMG_AL * KV_IMG_AL; }
+#define KV_IMGG_MAGIC "KCIVIGR1"
+enum { KVG_LEVEL, KVG_L0, KVG_UP, KVG_BLOCKS, KVG_PQ, KVG_R, KVG_R8, KVG_R8INV, KVG_P8, KVG_VH, KVG_N };
+typedef struct {
+    char magic[8];
+    uint32_t n, M, M0, ep, maxlevel, flags;       /* flags: 1 quantized graph, 2 halves */
+    uint32_t qM, qdp, qnblk, qnfull, qhalf, qcd, qgd, pad;
+    uint64_t qstride, qhdr; double qeta; float qps, pad2;
+    uint64_t off[KVG_N], len[KVG_N], total;
+} KvImgG;
 
 int kci_vec_image_save(const KciVec *v, const char *path){
     if(!v || !path || v->vf_mmap) return -1;
+    if(v->l2 && !v->l2fin) return -1;
     const struct KvIvf *f = v->ivf;
     KvImg h; memset(&h, 0, sizeof h);
     memcpy(h.magic, KV_IMG_MAGIC, 8);
     h.dim=(uint32_t)v->dim; h.M=(uint32_t)v->M; h.efc=(uint32_t)v->efc; h.count=v->count; h.gs=v->gs;
-    h.flags = (v->vf ? 1u : 0u) | (f ? 2u : 0u);
+    const int wg = v->built && v->l0 && v->lu && v->level && v->count>0 && v->gN==v->count;
+    h.flags = (v->vf ? 1u : 0u) | (f ? 2u : 0u) | (v->l2 ? 4u : 0u) | (v->l2==2 ? 8u : 0u) | (wg ? 16u : 0u);
+    if(v->l2){ h.udim=(uint32_t)v->udim; h.l2p[0]=v->l2s; h.l2p[1]=v->l2lam; h.l2p[2]=v->l2ab; h.l2p[3]=v->l2M2; h.l2p[4]=v->l2me; }
     size_t D=(size_t)v->dim, n=v->count;
     h.len[KVI_VID]=n*sizeof(uint64_t); h.len[KVI_VQ]=n*D; h.len[KVI_VF]= v->vf ? n*D*sizeof(float) : 0; h.len[KVI_DEAD]=n;
     uint64_t nbsum=0;
@@ -3015,6 +3226,26 @@ int kci_vec_image_save(const KciVec *v, const char *path){
     uint64_t off=kv_img_al(sizeof h);
     for(int i=0;i<KVI_N;i++){ h.off[i]=off; off=kv_img_al(off+h.len[i]); }
     h.total=off;
+    const uint64_t tail0 = h.total+(v->l2==2 ? (uint64_t)v->udim*sizeof(float) : 0), gbase=kv_img_al(tail0);
+    KvImgG x; memset(&x, 0, sizeof x);
+    const struct KvQg *g = wg ? v->qg : NULL;
+    if(g && g->n!=v->count) g=NULL;
+    if(wg){
+        memcpy(x.magic, KV_IMGG_MAGIC, 8);
+        x.n=v->count; x.M=(uint32_t)v->M; x.M0=(uint32_t)v->M0; x.ep=v->ep; x.maxlevel=(uint32_t)v->maxlevel;
+        x.len[KVG_LEVEL]=n; x.len[KVG_L0]=n*(size_t)(v->M0+1)*sizeof(uint32_t);
+        for(size_t i=0;i<n;i++) x.len[KVG_UP] += (uint64_t)v->level[i]*(v->M+1)*sizeof(uint32_t);
+        if(g){ x.flags|=1u; x.qM=(uint32_t)g->M; x.qdp=(uint32_t)g->dp; x.qnblk=(uint32_t)g->nblk; x.qnfull=(uint32_t)g->nfull;
+            x.qhalf=(uint32_t)g->half; x.qcd=(uint32_t)g->cd; x.qgd=(uint32_t)g->gd; x.qstride=g->stride; x.qhdr=g->hdr; x.qeta=g->eta; x.qps=g->ps;
+            x.len[KVG_BLOCKS]=n*g->stride; x.len[KVG_PQ]=(size_t)(g->M+1)*32*sizeof(float);
+            if(g->cd){ if(g->R8 && g->r8inv){ x.len[KVG_R8]=D*(size_t)g->cd; x.len[KVG_R8INV]=(size_t)g->cd*sizeof(float); }
+                       else x.len[KVG_R]=D*(size_t)g->cd*sizeof(float);
+                       if(g->P8) x.len[KVG_P8]=n*(size_t)g->cd; } }
+        if(v->vh && v->vhn==v->count){ x.flags|=2u; x.len[KVG_VH]=n*D*sizeof(uint16_t); }
+        uint64_t o2=kv_img_al(gbase+sizeof x);
+        for(int i=0;i<KVG_N;i++){ x.off[i]=o2; o2=kv_img_al(o2+x.len[i]); }
+        x.total=o2;
+    }
     char tmp[1100]; if(snprintf(tmp,sizeof tmp,"%s.tmp",path) >= (int)sizeof tmp) return -1;
     FILE *fp=fopen(tmp,"wb"); if(!fp) return -1;
     int ok=1; uint64_t pos=0;
@@ -3040,29 +3271,101 @@ int kci_vec_image_save(const KciVec *v, const char *path){
             KVI_PAD(h.off[KVI_SC]); for(int c=0;c<f->nlist;c++){ float sc2[2]={f->lists[c].uscale,f->lists[c].cscale}; KVI_PUT(sc2, sizeof sc2); } }
     }
     KVI_PAD(h.total);
+    if(v->l2==2) KVI_PUT(v->ipm, (size_t)v->udim*sizeof(float));
+    if(wg){
+        KVI_PAD(gbase); KVI_PUT(&x, sizeof x);
+        KVI_PAD(x.off[KVG_LEVEL]); KVI_PUT(v->level, n);
+        KVI_PAD(x.off[KVG_L0]); KVI_PUT(v->l0, x.len[KVG_L0]);
+        KVI_PAD(x.off[KVG_UP]); for(size_t i=0;i<n;i++) if(v->level[i]) KVI_PUT(v->lu[i], (size_t)v->level[i]*(v->M+1)*sizeof(uint32_t));
+        if(g){
+            KVI_PAD(x.off[KVG_BLOCKS]); KVI_PUT(g->blocks, x.len[KVG_BLOCKS]);
+            KVI_PAD(x.off[KVG_PQ]); KVI_PUT(g->pq, x.len[KVG_PQ]);
+            if(x.len[KVG_R]){ KVI_PAD(x.off[KVG_R]); KVI_PUT(g->R, x.len[KVG_R]); }
+            if(x.len[KVG_R8]){ KVI_PAD(x.off[KVG_R8]); KVI_PUT(g->R8, x.len[KVG_R8]); KVI_PAD(x.off[KVG_R8INV]); KVI_PUT(g->r8inv, x.len[KVG_R8INV]); }
+            if(x.len[KVG_P8]){ KVI_PAD(x.off[KVG_P8]); KVI_PUT(g->P8, x.len[KVG_P8]); } }
+        if(x.len[KVG_VH]){ KVI_PAD(x.off[KVG_VH]); KVI_PUT(v->vh, x.len[KVG_VH]); }
+        KVI_PAD(x.total);
+    }
 #undef KVI_PUT
 #undef KVI_PAD
     if(fflush(fp)!=0) ok=0;
     fclose(fp);
-    if(ok && pos==h.total && kv_replace_file(tmp, path)==0) return 0;
+    if(ok && pos==(wg ? x.total : tail0) && kv_replace_file(tmp, path)==0) return 0;
     remove(tmp); return -1;
+}
+
+static int kv_img_graph(KciVec *v, const uint8_t *p, size_t len, uint64_t base){
+    KvImgG x; if(base%KV_IMG_AL || base>len || len-base<sizeof x) return -1;
+    memcpy(&x, p+base, sizeof x);
+    const size_t n=v->count, D=(size_t)v->dim, M=(size_t)v->M, M0=(size_t)v->M0;
+    if(memcmp(x.magic, KV_IMGG_MAGIC, 8)!=0 || x.total>len || n==0 || x.n!=n || x.M!=M || x.M0!=M0 || x.ep>=n || x.maxlevel>255) return -1;
+    for(int i=0;i<KVG_N;i++) if(x.off[i]%KV_IMG_AL || x.off[i]<base || x.off[i]-base<sizeof x || x.off[i]>x.total || x.len[i]>x.total-x.off[i]) return -1;   /* no sums (review) */
+    if(x.len[KVG_LEVEL]!=n || x.len[KVG_L0]!=n*(M0+1)*sizeof(uint32_t) || x.len[KVG_UP]%sizeof(uint32_t)) return -1;
+    const uint8_t *lev=p+x.off[KVG_LEVEL]; const uint32_t *l0=(const uint32_t*)(p+x.off[KVG_L0]), *up=(const uint32_t*)(p+x.off[KVG_UP]);
+    if(lev[x.ep]<x.maxlevel) return -1;
+    uint32_t **lu=calloc(n, sizeof *lu); uint8_t *lock=calloc(n, 1);
+    if(!lu || !lock){ free(lu); free(lock); return -1; }
+    size_t upw=0; const size_t upn=(size_t)(x.len[KVG_UP]/sizeof(uint32_t)); int ok=1;
+    for(size_t i=0;i<n && ok;i++){
+        const uint32_t *r=l0+i*(M0+1);
+        if(r[0]>M0){ ok=0; break; }
+        for(uint32_t j=0;j<r[0];j++) if(r[1+j]>=n){ ok=0; break; }
+        const size_t lvl=lev[i];
+        if(lvl){ const size_t w=lvl*(M+1);
+            if(w>upn-upw){ ok=0; break; }
+            for(size_t l=0;l<lvl && ok;l++){ const uint32_t *u=up+upw+l*(M+1);
+                if(u[0]>M){ ok=0; break; }
+                for(uint32_t j=0;j<u[0];j++) if(u[1+j]>=n || lev[u[1+j]]<l+1){ ok=0; break; } }   /* a link at layer l+1 leads to a node that has that layer */
+            lu[i]=(uint32_t*)(up+upw); upw+=w; }
+    }
+    if(ok && upw!=upn) ok=0;
+    struct KvQg *g=NULL;
+    if(ok && (x.flags&1)){
+        g=calloc(1, sizeof *g); ok = g!=NULL;
+        if(ok){ g->ro=1; g->M=(int)x.qM; g->dp=(int)x.qdp; g->nblk=(int)x.qnblk; g->nfull=(int)x.qnfull; g->half=(int)x.qhalf; g->cd=(int)x.qcd; g->gd=(int)x.qgd;
+            g->D=(int)D; g->stride=(size_t)x.qstride; g->hdr=(size_t)x.qhdr; g->eta=x.qeta; g->ps=x.qps; g->n=(uint32_t)n;
+            const int cd=g->cd;
+            ok = kv_qg_shape_ok(g, D, M0) && x.len[KVG_BLOCKS]==n*g->stride && x.len[KVG_PQ]==(size_t)(g->M+1)*32*sizeof(float);
+            if(ok && cd){
+                if(x.len[KVG_R8]){ ok = x.len[KVG_R8]==D*(size_t)cd && x.len[KVG_R8INV]==(size_t)cd*sizeof(float);
+                    g->R8=(int8_t*)(p+x.off[KVG_R8]); g->r8inv=(float*)(p+x.off[KVG_R8INV]); }
+                else { ok = x.len[KVG_R]==D*(size_t)cd*sizeof(float); g->R=(float*)(p+x.off[KVG_R]); }
+                if(ok && x.len[KVG_P8]){ ok = x.len[KVG_P8]==n*(size_t)cd && isfinite(g->ps) && g->ps>0; g->P8=(int8_t*)(p+x.off[KVG_P8]); } }
+            else if(ok) ok = !x.len[KVG_R] && !x.len[KVG_R8] && !x.len[KVG_P8];
+            g->blocks=(uint8_t*)(p+x.off[KVG_BLOCKS]); g->pq=(float*)(p+x.off[KVG_PQ]); }
+    }
+    if(ok && (x.flags&2)) ok = x.len[KVG_VH]==n*D*sizeof(uint16_t);
+    if(!ok){ free(lu); free(lock); free(g); return -1; }
+    v->level=(uint8_t*)lev; v->l0=(uint32_t*)l0; v->lu=lu; v->lock=lock;
+    v->gN=(uint32_t)n; v->gcap=(uint32_t)n; v->ep=x.ep; v->maxlevel=(int)x.maxlevel; v->built=1;
+    v->qg=g;
+    if(x.flags&2){ v->vh=(uint16_t*)(p+x.off[KVG_VH]); v->vhn=(uint32_t)n; }
+    return 0;
 }
 
 KciVec *kci_vec_attach_mem(const void *image, size_t len){
     if(!image || len < sizeof(KvImg)) return NULL;
     const uint8_t *p=image; KvImg h; memcpy(&h, p, sizeof h);
     if(memcmp(h.magic, KV_IMG_MAGIC, 8)!=0 || h.total>len || h.dim==0 || h.dim>(1u<<16)) return NULL;
-    for(int i=0;i<KVI_N;i++) if(h.off[i]%KV_IMG_AL || h.off[i]+h.len[i]>h.total) return NULL;
+    for(int i=0;i<KVI_N;i++) if(h.off[i]%KV_IMG_AL || h.off[i]>h.total || h.len[i]>h.total-h.off[i]) return NULL;
     size_t D=h.dim, n=h.count;
     if(h.len[KVI_VID]!=n*sizeof(uint64_t) || h.len[KVI_VQ]!=n*D || h.len[KVI_DEAD]!=n
        || ((h.flags&1) && h.len[KVI_VF]!=n*D*sizeof(float))) return NULL;
-    if(h.flags&4) return NULL;                   /* an index kind this release does not have */
+#ifdef KCI_VEC_NO_L2
+    if(h.flags&4) return NULL;
+#endif
     KciVec *v=kci_vec_new((int)h.dim, (int)h.M, (int)h.efc); if(!v) return NULL;
     v->img=p; v->imglen=len; v->building=0;
     v->vid=(uint64_t*)(p+h.off[KVI_VID]); v->vq=(int8_t*)(p+h.off[KVI_VQ]);
     if(h.flags&1){ v->vf=(float*)(p+h.off[KVI_VF]); v->keepf=1; }
     v->dead=(uint8_t*)(p+h.off[KVI_DEAD]); for(size_t i=0;i<n;i++) v->ndead += v->dead[i]!=0;
     v->count=(uint32_t)n; v->cap=(uint32_t)n; v->gcap=(uint32_t)n; v->gs=h.gs;
+    if(h.flags&4){ v->l2 = (h.flags&8) ? 2 : 1; v->udim=(int)h.udim; v->l2s=h.l2p[0]; v->l2lam=h.l2p[1]; v->l2ab=h.l2p[2]; v->l2M2=h.l2p[3]; v->l2me=h.l2p[4]; v->l2fin=1;
+        if(v->udim<=0 || v->udim+(v->l2==2?1:2)!=(int)D || !(v->l2s>0) || !(v->l2lam>0) || !(v->l2M2>=1.0f) || !(v->l2me>0)){ kci_vec_free(v); return NULL; }
+        if(v->l2==2){ size_t mb=(size_t)v->udim*sizeof(float);
+            if(mb>len-h.total || !(v->ipm=malloc(mb))){ kci_vec_free(v); return NULL; }
+            memcpy(v->ipm, p+h.total, mb);
+            for(int d=0;d<v->udim;d++) if(!isfinite(v->ipm[d])){ kci_vec_free(v); return NULL; } } }
     if(h.flags&2){
         struct KvIvf *f=calloc(1,sizeof *f); if(!f){ kci_vec_free(v); return NULL; }
         f->ro=1; f->D=(int)D; f->nlist=(int)h.nlist; f->M=(int)h.ivfM; f->d1=(int)h.d1; f->lr=(int)h.lr; f->dp = h.dp==1 ? 1 : 2;
@@ -3101,6 +3404,11 @@ KciVec *kci_vec_attach_mem(const void *image, size_t len){
         if(!ok){ kv_ivf_free(f); kci_vec_free(v); return NULL; }
         v->ivf=f;
     }
+    if(h.flags&16){
+        const uint64_t tail=(v->l2==2 ? (uint64_t)v->udim*sizeof(float) : 0);
+        if(tail>len-h.total || len-h.total-tail<KV_IMG_AL){ kci_vec_free(v); return NULL; }   /* room for the next 64-byte offset, no sum that can wrap */
+        uint64_t gbase=kv_img_al(h.total+tail);
+        if(kv_img_graph(v, p, len, gbase)!=0){ kci_vec_free(v); return NULL; } }
     return v;
 }
 
@@ -3134,7 +3442,9 @@ KciVec *kci_vec_thaw(const KciVec *a){
     size_t D=(size_t)a->dim, n=a->count;
     KciVec *v=kci_vec_new(a->dim, a->M, a->efc); if(!v) return NULL;
     v->building=0; v->keepf = a->vf ? 1 : 0;
+    if(a->l2){ v->l2=a->l2; v->udim=a->udim; v->l2s=a->l2s; v->l2lam=a->l2lam; v->l2ab=a->l2ab; v->l2M2=a->l2M2; v->l2me=a->l2me; v->l2fin=1; }
     int ok = kci_vec_reserve(v, n ? (uint32_t)n : 1)==0;
+    if(ok && a->ipm){ v->ipm=malloc((size_t)a->udim*sizeof(float)); ok = v->ipm!=NULL; if(ok) memcpy(v->ipm, a->ipm, (size_t)a->udim*sizeof(float)); }
     if(ok){
         memcpy(v->vid, a->vid, n*sizeof(uint64_t)); memcpy(v->vq, a->vq, n*D);
         if(a->vf) memcpy(v->vf, a->vf, n*D*sizeof(float));
@@ -3228,6 +3538,7 @@ int kci_vec_plain_bytes(const KciVec *v, uint64_t out[6]){
     size_t D=(size_t)v->dim;
     if(v->vq) out[0] += (uint64_t)v->cap*D;
     if(v->vf && !v->vf_mmap) out[1] += (uint64_t)v->cap*D*sizeof(float);
+    if(v->vh) out[1] += (uint64_t)v->vhn*D*sizeof(uint16_t);
     const struct KvIvf *f=v->ivf;
     if(f){
         if(f->lists) for(int c=0;c<f->nlist;c++){ const KvList *L=&f->lists[c];
@@ -3262,6 +3573,11 @@ int kci_vec_protect(KciVec *v){
 #else
     (void)ps;
 #endif
+#ifndef _WIN32
+    if(v->vh && ((uintptr_t)v->vh % ps)){ size_t hb=(size_t)v->vhn*v->dim*sizeof(uint16_t); uint16_t *n = kv_valloc(v, hb); if(!n) return -1;
+        memcpy(n, v->vh, hb); kv_wipe(v->vh, hb); free(v->vh); v->vh = n; }
+#endif
+    if(v->vh) r &= kv_protect_region(v->vh, (size_t)v->vhn*v->dim*sizeof(uint16_t));
     if(v->vq) r &= kv_protect_region(v->vq, q_b);
     if(v->vf && !v->vf_mmap) r &= kv_protect_region(v->vf, q_b * sizeof(float));
     if(v->ivf && v->ivf->arena){ struct KvIvf *f = v->ivf; size_t ab = 0;   /* the arena: all lists side by side */
@@ -3282,7 +3598,7 @@ int kci_vec_protect(KciVec *v){
 }
 
 int kci_vec_set_float(KciVec *v, uint64_t id, const float *vec){
-    if(!v || !vec || !v->keepf || !v->vf || v->vf_mmap || v->img) return -1;
+    if(!v || !vec || !v->keepf || !v->vf || v->vf_mmap || v->img || !kv_l2_fits(v, vec)) return -1;
     uint32_t i = h_get(v, id);
     if(i==KV_HEMPTY || i>=v->count) return -1;
     store_float_norm(v, i, vec);
@@ -3291,31 +3607,380 @@ int kci_vec_set_float(KciVec *v, uint64_t id, const float *vec){
 
 int kci_vec_get_float(const KciVec *v, uint32_t i, float *out){
     if(!v || i>=v->count) return -1;
+    if(v->l2){
+        const float *r = v->keepf && v->vf ? v->vf+(size_t)i*v->dim : NULL;
+        if(r && !v->l2fin){ memcpy(out, r, (size_t)v->udim*sizeof(float)); return 0; }
+        double f = sqrt(v->l2M2)/v->l2s;
+        if(r){ for(int d=0;d<v->udim;d++) out[d]=(float)(r[d]*f + (v->ipm ? v->ipm[d] : 0.0f)); return 0; }
+        if(v->built && v->gs>0){ const int8_t *c=vrow(v,i); for(int d=0;d<v->udim;d++) out[d]=(float)(c[d]/v->gs*f + (v->ipm ? v->ipm[d] : 0.0f)); return 0; }
+        return -1; }
     if(v->keepf && v->vf){ memcpy(out, v->vf+(size_t)i*v->dim, (size_t)v->dim*sizeof(float)); return 0; }
     if(v->built && v->gs>0){ const int8_t *c=vrow(v,i); float inv=1.0f/v->gs; for(int d=0;d<v->dim;d++) out[d]=c[d]*inv; return 0; }
     return -1;
 }
 
-/* the public searches (the bodies above) */
 int kci_vec_search_r(KciVecSearcher *s, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
-    return kv_search_r_(s, query, k, ef, out_ids, out_scores);
+    double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
+    int r=kv_search_r_(s, query, k, ef, out_ids, out_scores);
+    if(t) kv_l2_scores(s->v, r, out_scores, qn2);
+    return r;
 }
 int kci_vec_search_rerank(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
                           uint64_t *out_ids, float *out_scores){
-    return kv_search_rerank_(s, query, k, ef, rerank_n, out_ids, out_scores);
+    double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
+    int r=kv_search_rerank_(s, query, k, ef, rerank_n, out_ids, out_scores);
+    if(t) kv_l2_scores(s->v, r, out_scores, qn2);
+    return r;
 }
 int kci_vec_search_filtered(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
                             KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
-    return kv_search_filtered_(s, query, k, ef, rerank_n, filt, ctx, out_ids, out_scores);
+    double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
+    int r=kv_search_filtered_(s, query, k, ef, rerank_n, filt, ctx, out_ids, out_scores);
+    if(t) kv_l2_scores(s->v, r, out_scores, qn2);
+    return r;
 }
 int kci_vec_search_ivf(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
                        uint64_t *out_ids, float *out_scores){
-    return kv_search_ivf_(s, query, k, nprobe, rerank_n, out_ids, out_scores);
+    double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
+    int r=kv_search_ivf_(s, query, k, nprobe, rerank_n, out_ids, out_scores);
+    if(t) kv_l2_scores(s->v, r, out_scores, qn2);
+    return r;
 }
 int kci_vec_search_exact(KciVec *v, const float *query, int k, int threads, uint64_t *out_ids, float *out_scores){
+    if(v && v->l2){
+        if(kv_l2_fin(v)!=0) return -1;
+        float *b=malloc((size_t)v->dim*sizeof(float)); if(!b) return -1;
+        double qn2=kv_l2_query(v, query, b);
+        int r=kv_search_exact_(v, b, k, threads, out_ids, out_scores);
+        kv_l2_scores(v, r, out_scores, qn2);
+        kv_wipe(b, (size_t)v->dim*sizeof(float)); free(b);
+        return r; }
     return kv_search_exact_(v, query, k, threads, out_ids, out_scores);
 }
 
+
+/* si / mean / sis (kci_vec_learn_pack): the lists' vectors themselves, in list order, as int8 rows of (row - mean) * sis */
+struct KvQl { int C, D; float *cen; uint32_t *off, *rows; uint32_t gen; int8_t *si; float *mean; float sis; int sdim;
+              int S; float *pcen; uint32_t *poff, *pmem;
+              uint32_t hot; };
+static void kv_ql_free(struct KvQl *g){ if(!g) return;
+    if(g->si && g->off) kv_wipe(g->si, ((size_t)g->off[g->C]+g->hot)*g->sdim);      /* vectors: wiped like the rows */
+    free(g->cen); free(g->off); free(g->rows); free(g->si); free(g->mean); free(g->pcen); free(g->poff); free(g->pmem); free(g); }
+typedef struct { uint32_t c, r; } KvQlP;
+static int kv_qlp_cmp(const void *a, const void *b){ const KvQlP *x=a, *y=b;
+    return x->c<y->c ? -1 : x->c>y->c ? 1 : (x->r<y->r ? -1 : x->r>y->r); }
+static int kv_qlf_cmp(const void *a, const void *b){ const KvQlP *x=a, *y=b;   /* c = count here: most frequent first, then by row */
+    return x->c>y->c ? -1 : x->c<y->c ? 1 : (x->r<y->r ? -1 : x->r>y->r); }
+
+int kci_vec_learn(KciVec *v, const float *queries, uint32_t nq, const uint64_t *answers, int per_query,
+                  int nclusters, int list_cap, int threads, float *out_top5){
+    if(!v || !queries || !answers || nq==0 || per_query<=0 || v->img || (!v->built && !v->ivf) || !v->hval) return -1;
+    int D=kci_vec_dim(v), T=default_threads(threads);
+    if(nclusters<=0) nclusters=1024;
+    if((uint32_t)nclusters>nq) nclusters=(int)nq;
+    if(list_cap<=0) list_cap=4000;
+    int C=nclusters, ok=0;
+    struct KvQl *g=calloc(1,sizeof *g);
+    int big = (size_t)nq > (size_t)64*nclusters;
+    float *U = big ? NULL : malloc((size_t)nq*D*sizeof(float)), *samp=NULL; int *as=malloc((size_t)nq*sizeof(int));
+    KvQlP *pr=malloc((size_t)nq*per_query*sizeof(KvQlP)), *fr=NULL; uint32_t *cnt=NULL;
+    if(!g || (!big && !U) || !as || !pr) goto done;
+    g->C=C; g->D=D; g->cen=malloc((size_t)C*D*sizeof(float)); g->off=calloc((size_t)C+1,sizeof(uint32_t));
+    if(!g->cen || !g->off) goto done;
+    if(U) for(uint32_t i=0;i<nq;i++) l2norm(D, queries+(size_t)i*D, U+(size_t)i*D);
+    { size_t ns=nq; const float *TR=U;                    /* centroids from at most 64 queries per cluster, evenly taken */
+      if(big){ ns=(size_t)64*C; samp=malloc(ns*D*sizeof(float)); if(!samp) goto done;
+          for(size_t i=0;i<ns;i++) l2norm(D, queries+(size_t)((double)i*nq/ns)*D, samp+i*D); TR=samp; }
+      if(kv_kmeans_sph(TR, ns, D, C, 15, T, g->cen)!=0) goto done; }
+    { KvKm km={U ? U : queries,nq,D,C,g->cen,as,NULL,0}; kv_par(nq,T,kv_km_assign,&km); }
+    if(C>=64){ int S=(int)lrint(sqrt((double)C)); int *pa=malloc((size_t)C*sizeof(int));
+        g->pcen=malloc((size_t)S*D*sizeof(float)); g->poff=calloc((size_t)S+1,sizeof(uint32_t)); g->pmem=malloc((size_t)C*sizeof(uint32_t));
+        if(pa && g->pcen && g->poff && g->pmem && kv_kmeans_sph(g->cen,(size_t)C,D,S,15,1,g->pcen)==0){
+            KvKm km={g->cen,(size_t)C,D,S,g->pcen,pa,NULL,0}; kv_km_assign(&km,0,(size_t)C);
+            for(int c=0;c<C;c++) g->poff[pa[c]+1]++;
+            for(int p=0;p<S;p++) g->poff[p+1]+=g->poff[p];
+            uint32_t *fill=calloc((size_t)S,sizeof(uint32_t));
+            if(fill){ for(int c=0;c<C;c++) g->pmem[g->poff[pa[c]]+fill[pa[c]]++]=(uint32_t)c; g->S=S; free(fill); } }
+        free(pa); }
+    size_t np=0;
+    for(uint32_t i=0;i<nq;i++) for(int k=0;k<per_query;k++){ uint32_t r=h_get(v, answers[(size_t)i*per_query+k]);
+        if(r==KV_HEMPTY || r>=v->count) continue;        /* an answer that is not (or no longer) in the index */
+        pr[np].c=(uint32_t)as[i]; pr[np].r=r; np++; }
+    if(np==0) goto done;
+    qsort(pr, np, sizeof(KvQlP), kv_qlp_cmp);
+    size_t mxc=0; for(size_t i=0,j;i<np;i=j){ for(j=i;j<np && pr[j].c==pr[i].c;) j++; if(j-i>mxc) mxc=j-i; }
+    g->rows=malloc((np+(size_t)v->count/4+1)*sizeof(uint32_t)); fr=malloc(mxc*sizeof(KvQlP)); cnt=calloc(v->count,sizeof(uint32_t));
+    if(!g->rows || !fr || !cnt) goto done;
+    uint32_t tot=0; size_t a=0;
+    for(int c=0;c<C;c++){ size_t nf=0;
+        while(a<np && pr[a].c==(uint32_t)c){ size_t b=a; while(b<np && pr[b].c==(uint32_t)c && pr[b].r==pr[a].r) b++;
+            fr[nf].c=(uint32_t)(b-a); fr[nf].r=pr[a].r; nf++; cnt[pr[a].r]+=(uint32_t)(b-a); a=b; }
+        qsort(fr, nf, sizeof(KvQlP), kv_qlf_cmp);
+        if(nf>(size_t)list_cap) nf=(size_t)list_cap;
+        for(size_t i=0;i<nf;i++) g->rows[tot++]=fr[i].r;
+        g->off[c+1]=tot; }
+    if(out_top5){
+        uint32_t n=v->count, m=n/20 ? n/20 : 1; double all=0, top=0;
+        for(uint32_t i=0;i<n;i++) all+=cnt[i];
+        /* the m largest counts: counting sort over the count values is overkill; partial selection by threshold search */
+        uint32_t lo=0, hi=0; for(uint32_t i=0;i<n;i++) if(cnt[i]>hi) hi=cnt[i];
+        while(lo<hi){ uint32_t mid=lo+(hi-lo+1)/2, c2=0; for(uint32_t i=0;i<n;i++) if(cnt[i]>=mid) c2++; if(c2>=m) lo=mid; else hi=mid-1; }
+        uint32_t taken=0; for(uint32_t i=0;i<n;i++) if(cnt[i]>lo){ top+=cnt[i]; taken++; }
+        top += (double)(m>taken ? m-taken : 0)*lo;
+        *out_top5 = all>0 ? (float)(top/all) : 0.0f; }
+    { uint32_t n=v->count, hc=n/4 ? n/4 : 1, nh=0; KvQlP *hp=malloc((size_t)n*sizeof(KvQlP));
+      if(hp){ for(uint32_t i=0;i<n;i++) if(cnt[i]){ hp[nh].c=cnt[i]; hp[nh].r=i; nh++; }
+          qsort(hp, nh, sizeof(KvQlP), kv_qlf_cmp); if(nh>hc) nh=hc;
+          for(uint32_t i=0;i<nh;i++) g->rows[tot+i]=hp[i].r;
+          g->hot=nh; free(hp); } }
+    { uint32_t *sh=realloc(g->rows,((size_t)tot+g->hot+1)*sizeof(uint32_t)); if(sh) g->rows=sh; }
+    g->gen=v->rowgen;
+    kv_ql_free(v->ql); v->ql=g; g=NULL; ok=1;
+done:
+    kv_ql_free(g); free(U); free(samp); free(as); free(pr); free(fr); free(cnt);
+    return ok ? 0 : -1;
+}
+int kci_vec_has_learned(const KciVec *v){ return v && v->ql && v->ql->gen==v->rowgen; }
+int kci_vec_searcher_set_learned_seeds(KciVecSearcher *s, int best){ if(!s || best<0) return -1; s->lseedR=best; return 0; }
+int kci_vec_searcher_set_learned_pages(KciVecSearcher *s, int pages){ if(!s || pages<0) return -1; s->lpages=pages; return 0; }
+int kci_vec_searcher_set_learned_hot(KciVecSearcher *s, int rows){ if(!s || rows<0) return -1; s->lhot=rows; return 0; }
+
+int kci_vec_learn_pack(KciVec *v){
+    if(!v || !v->ql || v->ql->gen!=v->rowgen || !v->vf || v->img) return -1;
+    struct KvQl *g=v->ql; int D=v->dim; uint32_t N=v->count, tot=g->off[g->C]+g->hot;
+    if(tot==0 || N==0) return -1;
+    double *acc=calloc((size_t)D,sizeof(double)); float *mean=malloc((size_t)D*sizeof(float)), *smp=NULL;
+    int8_t *si=NULL;
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(KV_QL_NOHUGE)
+    { size_t al=(size_t)2<<20, sz=(((size_t)tot*D)+al-1)/al*al; void *pp=NULL;
+      if(posix_memalign(&pp,al,sz)==0){ madvise(pp,sz,MADV_HUGEPAGE); si=pp; } }
+#endif
+    if(!si) si=malloc((size_t)tot*D);
+    if(!acc || !mean || !si){ free(acc); free(mean); free(si); return -1; }
+    for(uint32_t i=0;i<N;i++){ const float *r=v->vf+(size_t)i*D; for(int d=0;d<D;d++) acc[d]+=r[d]; }
+    for(int d=0;d<D;d++) mean[d]=(float)(acc[d]/N);
+    /* scale: the 99.9th percentile of |row - mean| over a sample of the listed rows' components; the rest saturates */
+    size_t ns = (size_t)tot*D < 400000 ? (size_t)tot*D : 400000; smp=malloc(ns*sizeof(float));
+    if(!smp){ free(acc); free(mean); free(si); return -1; }
+    { uint64_t rs=0x9E3779B97F4A7C15ULL; for(size_t i=0;i<ns;i++){ uint32_t e=(uint32_t)(kv_rng(&rs)%tot); int d=(int)(kv_rng(&rs)%(uint64_t)D);
+          smp[i]=fabsf(v->vf[(size_t)g->rows[e]*D+d]-mean[d]); } }
+    qsort(smp, ns, sizeof(float), cmpf);
+    float p=smp[(size_t)(0.999*(double)(ns-1))], sis = p>1e-20f ? 127.0f/p : 1.0f;
+    for(uint32_t e=0;e<tot;e++){ const float *r=v->vf+(size_t)g->rows[e]*D; int8_t *o=si+(size_t)e*D;
+        for(int d=0;d<D;d++){ float x=(r[d]-mean[d])*sis; o[d]=(int8_t)(x>127.0f ? 127 : x<-127.0f ? -127 : lrintf(x)); } }
+    free(acc); free(smp);
+    if(g->si) kv_wipe(g->si, (size_t)tot*g->sdim);
+    free(g->si); free(g->mean); g->si=si; g->mean=mean; g->sis=sis; g->sdim=D;
+    return 0;
+}
+
+static int kv_search_learned_(KciVecSearcher *s, const float *uq, const float *query, int k, int ncl, int per_list, int ef,
+                              uint64_t *out_ids, float *out_scores){
+    KciVec *v=s->v; struct KvQl *g=v->ql;
+    if(!v->keepf || !v->vf) return -1;
+    if(k<1) k=1;
+    if(ncl<1) ncl=1;
+    if(ncl>64) ncl=64;
+    if(ncl>g->C) ncl=g->C;
+    if(per_list<1) per_list=1;
+    int top[64]; float ts[64]; int nt=0, D=g->D;
+#define KV_QL_TOP(c_, sc_) do{ float sc=(sc_); if(nt<ncl || sc>ts[nt-1]){ int j = nt<ncl ? nt++ : nt-1; \
+        while(j>0 && ts[j-1]<sc){ ts[j]=ts[j-1]; top[j]=top[j-1]; j--; } ts[j]=sc; top[j]=(int)(c_); } }while(0)
+    if(s->lpages>0 && g->S>0 && s->lpages<g->S){
+        int pg[64]; float ps[64]; int np=0, P=s->lpages>64 ? 64 : s->lpages;
+        for(int p=0;p<g->S;p++){ float sc=fdot(D,uq,g->pcen+(size_t)p*D);
+            if(np<P || sc>ps[np-1]){ int j = np<P ? np++ : np-1; while(j>0 && ps[j-1]<sc){ ps[j]=ps[j-1]; pg[j]=pg[j-1]; j--; } ps[j]=sc; pg[j]=p; } }
+        for(int i=0;i<np;i++) for(uint32_t m=g->poff[pg[i]]; m<g->poff[pg[i]+1]; m++){ uint32_t c=g->pmem[m]; KV_QL_TOP(c, fdot(D,uq,g->cen+(size_t)c*D)); }
+    } else
+    for(int c=0;c<g->C;c++) KV_QL_TOP(c, fdot(D,uq,g->cen+(size_t)c*D));     /* the query's length does not change the order */
+#undef KV_QL_TOP
+    uint32_t lo[65], ln[65]; int nl=0;                   /* the stretches of g->rows to read: list prefixes, then the hot rows */
+    for(int t=0;t<nt;t++){ uint32_t o=g->off[top[t]], len=g->off[top[t]+1]-o; lo[nl]=o; ln[nl++] = len>(uint32_t)per_list ? (uint32_t)per_list : len; }
+    if(s->lhot>0 && g->hot){ lo[nl]=g->off[g->C]; ln[nl++] = (uint32_t)s->lhot<g->hot ? (uint32_t)s->lhot : g->hot; }
+    size_t need=0; for(int t=0;t<nl;t++) need+=ln[t];
+    if((size_t)s->lseedcap<need){ uint32_t *nb=realloc(s->lseed,(need+64)*sizeof(uint32_t)); if(!nb) return -1; s->lseed=nb; s->lseedcap=(int)(need+64); }
+    if(scr_fit(&s->s, v->gN>v->count ? v->gN : v->count)!=0) return -1;
+    scr_next(&s->s);
+    int ns=0;
+    int packed_seeds = ef>0 && s->lseedR>0 && g->si && g->sdim==v->dim;
+    if(ef>=0 && !packed_seeds) for(int t=0;t<nl;t++){ const uint32_t *l=g->rows+lo[t]; uint32_t len=ln[t];
+        for(uint32_t i=0;i<len;i++){ uint32_t r=l[i]; if(r<v->count && !visited(&s->s,r)) s->lseed[ns++]=r; } }
+    int pscan = ef<0 ? -ef : (ef>0 && s->lseedR>0 && g->si && g->sdim==v->dim) ? s->lseedR : 0;
+    if(ef<0 && (!g->si || g->sdim!=v->dim)) return -2;
+    if(pscan){
+        int R=pscan, dim=v->dim; if(R<k) R=k; if(R>4096) R=4096;
+        if(R>s->s.tmpcap){ He *nt2=realloc(s->s.tmp,sizeof(He)*(size_t)R); if(!nt2) return -1; s->s.tmp=nt2; s->s.tmpcap=R; }
+        if(!s->lq8){ s->lq8=malloc((size_t)dim+64); if(!s->lq8) return -1; }
+        enc_query(v, query, s->qf, s->q);
+        { float qm=0; for(int d=0;d<dim;d++){ float a=fabsf(s->qf[d]); if(a>qm) qm=a; }
+          float qs = qm>0 ? 127.0f/qm : 1.0f; for(int d=0;d<dim;d++) s->lq8[d]=(int8_t)lrintf(s->qf[d]*qs); }
+        He *h=s->s.tmp; int hn=0;                         /* min-heap on the integer score (kept in d), the R largest */
+        for(int t=0;t<nl;t++){ uint32_t o=lo[t], len=ln[t];
+            const uint32_t *l=g->rows+o; const int8_t *rows=g->si+(size_t)o*dim;
+            for(uint32_t i=0;i<len;i++){ uint32_t r=l[i]; if(r>=v->count || visited(&s->s,r)) continue;
+                float sc=(float)sdot(v, s->lq8, rows+(size_t)i*dim);
+                if(hn<R){ int j=hn++; while(j>0){ int pp=(j-1)/2; if(h[pp].d<=sc) break; h[j]=h[pp]; j=pp; } h[j].d=sc; h[j].id=r; }
+                else if(sc>h[0].d){ int j=0; for(;;){ int c=2*j+1; if(c>=R) break; if(c+1<R && h[c+1].d<h[c].d) c++; if(h[c].d>=sc) break; h[j]=h[c]; j=c; }
+                    h[j].d=sc; h[j].id=r; } } }
+        if(ef<0){                                        /* ... and scored exactly */
+            for(int i=0;i<hn;i++) __builtin_prefetch(v->vf+(size_t)h[i].id*dim);
+            for(int i=0;i<hn;i++) h[i].d=-fdot(dim, s->qf, v->vf+(size_t)h[i].id*dim);
+            return emit_topk(v, h, hn, k, 1.0f, out_ids, out_scores); }
+        if((size_t)s->lseedcap<(size_t)hn){ uint32_t *nb=realloc(s->lseed,((size_t)hn+64)*sizeof(uint32_t)); if(!nb) return -1; s->lseed=nb; s->lseedcap=hn+64; }
+        for(int i=0;i<hn;i++) s->lseed[i]=h[i].id;
+        ns=hn; }
+    if(ef==0){                                           /* the lists alone, scored exactly */
+        if(ns>s->s.tmpcap){ He *nt2=realloc(s->s.tmp,sizeof(He)*(size_t)ns); if(!nt2) return -1; s->s.tmp=nt2; s->s.tmpcap=ns; }
+        enc_query(v, query, s->qf, s->q);
+        He *t=s->s.tmp; const int dim=v->dim;
+        for(int i=0;i<ns;i++){ uint32_t r=s->lseed[i];
+            if(i+4<ns) __builtin_prefetch(v->vf+(size_t)s->lseed[i+4]*dim);
+            t[i].id=r; t[i].d=-fdot(dim, s->qf, v->vf+(size_t)r*dim); }
+        return emit_topk(v, t, ns, k, 1.0f, out_ids, out_scores); }
+    if(!v->built) return -1;                             /* seeds for the graph */
+    int uqg=s->s.use_qg; s->s.use_qg=0; s->s.seeds=s->lseed; s->s.nseeds=ns;
+    int r=kv_search_rerank_(s, query, k, ef, ef, out_ids, out_scores);
+    s->s.seeds=NULL; s->s.nseeds=0; s->s.use_qg=uqg;
+    return r;
+}
+int kci_vec_search_learned(KciVecSearcher *s, const float *query, int k, int nclusters, int per_list, int ef,
+                           uint64_t *out_ids, float *out_scores){
+    if(!s || !query || !out_ids) return -1;
+    if(!s->v->ql || s->v->ql->gen!=s->v->rowgen) return -2;
+    const float *uq=query; double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
+    int r=kv_search_learned_(s, uq, query, k, nclusters, per_list, ef, out_ids, out_scores);
+    if(t) kv_l2_scores(s->v, r, out_scores, qn2);
+    return r;
+}
+
+struct KvVt { uint32_t nq; int per, dim; uint32_t *rows; int8_t *si; float sis; uint32_t gen; size_t n;
+    int sd; int8_t *ss; };                           /* the short codes (kci_vec_vote_short): sd bytes per row */
+static void kv_vt_free(struct KvVt *g){ if(!g) return;
+    if(g->si) kv_wipe(g->si, g->n*(size_t)g->dim);
+    if(g->ss) kv_wipe(g->ss, g->n*(size_t)g->sd);
+    free(g->rows); free(g->si); free(g->ss); free(g); }
+int kci_vec_vote_set(KciVec *v, const uint64_t *answers, uint32_t nq, int per_query){
+    if(!v || !answers || nq==0 || per_query<=0 || v->img || (!v->built && !v->ivf) || !v->hval || !v->vf || !v->keepf) return -1;
+    int D=v->dim; uint32_t N=v->count; if(N==0) return -1;
+    struct KvVt *g=calloc(1,sizeof *g); double *acc=calloc((size_t)D,sizeof(double)); float *mean=malloc((size_t)D*sizeof(float)), *smp=NULL;
+    if(!g || !acc || !mean){ free(g); free(acc); free(mean); return -1; }
+    g->nq=nq; g->per=per_query; g->dim=D; g->n=N; g->rows=malloc((size_t)nq*per_query*sizeof(uint32_t));
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(KV_QL_NOHUGE)
+    { size_t al=(size_t)2<<20, sz=(((size_t)N*D)+al-1)/al*al; void *pp=NULL;
+      if(posix_memalign(&pp,al,sz)==0){ madvise(pp,sz,MADV_HUGEPAGE); g->si=pp; } }
+#endif
+    if(!g->si) g->si=malloc((size_t)N*D);
+    size_t ns = (size_t)N*D < 400000 ? (size_t)N*D : 400000; smp=malloc(ns*sizeof(float));
+    if(!g->rows || !g->si || !smp){ kv_vt_free(g); free(acc); free(mean); free(smp); return -1; }
+    for(size_t i=0;i<(size_t)nq*per_query;i++){ uint32_t r=h_get(v, answers[i]); g->rows[i] = (r==KV_HEMPTY || r>=N) ? 0xFFFFFFFFu : r; }
+    for(uint32_t i=0;i<N;i++){ const float *r=v->vf+(size_t)i*D; for(int d=0;d<D;d++) acc[d]+=r[d]; }
+    for(int d=0;d<D;d++) mean[d]=(float)(acc[d]/N);
+    { uint64_t rs=0x9E3779B97F4A7C15ULL; for(size_t i=0;i<ns;i++){ uint32_t e=(uint32_t)(kv_rng(&rs)%N); int d=(int)(kv_rng(&rs)%(uint64_t)D);
+          smp[i]=fabsf(v->vf[(size_t)e*D+d]-mean[d]); } }
+    qsort(smp, ns, sizeof(float), cmpf);
+    float p=smp[(size_t)(0.999*(double)(ns-1))]; g->sis = p>1e-20f ? 127.0f/p : 1.0f;
+    for(uint32_t e=0;e<N;e++){ const float *r=v->vf+(size_t)e*D; int8_t *o=g->si+(size_t)e*D;
+        for(int d=0;d<D;d++){ float x=(r[d]-mean[d])*g->sis; o[d]=(int8_t)(x>127.0f ? 127 : x<-127.0f ? -127 : lrintf(x)); } }
+    free(acc); free(mean); free(smp);
+    g->gen=v->rowgen; kv_vt_free(v->vt); v->vt=g;
+    return 0;
+}
+int kci_vec_vote_short(KciVec *v, const uint64_t *ids, const float *rows, uint32_t n, int sdim){
+    if(!v || !ids || !rows || sdim<1 || sdim>4096 || !v->vt || v->vt->gen!=v->rowgen || n!=v->count || (size_t)n!=v->vt->n) return -1;
+    struct KvVt *g=v->vt; uint32_t N=n; int D=sdim;
+    double *acc=calloc((size_t)D,sizeof(double)); float *mean=malloc((size_t)D*sizeof(float)), *smp=NULL; int8_t *ss=NULL;
+    uint8_t *got=calloc(N,1);
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(KV_QL_NOHUGE)
+    { size_t al=(size_t)2<<20, sz=(((size_t)N*D)+al-1)/al*al; void *pp=NULL;
+      if(posix_memalign(&pp,al,sz)==0){ madvise(pp,sz,MADV_HUGEPAGE); ss=pp; } }
+#endif
+    if(!ss) ss=malloc((size_t)N*D);
+    size_t ns = (size_t)N*D < 400000 ? (size_t)N*D : 400000; smp=malloc(ns*sizeof(float));
+    int ok = acc && mean && ss && smp && got;
+    for(uint32_t i=0;ok && i<N;i++){ uint32_t r=h_get(v, ids[i]); if(r==KV_HEMPTY || r>=N || got[r]) ok=0; else got[r]=1; }   /* every row once */
+    if(!ok){ free(acc); free(mean); free(ss); free(smp); free(got); return -1; }
+    for(uint32_t i=0;i<N;i++){ const float *r=rows+(size_t)i*D; for(int d=0;d<D;d++) acc[d]+=r[d]; }
+    for(int d=0;d<D;d++) mean[d]=(float)(acc[d]/N);
+    { uint64_t rs=0x9E3779B97F4A7C15ULL; for(size_t i=0;i<ns;i++){ uint32_t e=(uint32_t)(kv_rng(&rs)%N); int d=(int)(kv_rng(&rs)%(uint64_t)D);
+          smp[i]=fabsf(rows[(size_t)e*D+d]-mean[d]); } }
+    qsort(smp, ns, sizeof(float), cmpf);
+    float p=smp[(size_t)(0.999*(double)(ns-1))], sc = p>1e-20f ? 127.0f/p : 1.0f;
+    for(uint32_t i=0;i<N;i++){ const float *r=rows+(size_t)i*D; int8_t *o=ss+(size_t)h_get(v, ids[i])*D;
+        for(int d=0;d<D;d++){ float x=(r[d]-mean[d])*sc; o[d]=(int8_t)(x>127.0f ? 127 : x<-127.0f ? -127 : lrintf(x)); } }
+    free(acc); free(mean); free(smp); free(got);
+    if(g->ss){ kv_wipe(g->ss, g->n*(size_t)g->sd); free(g->ss); }
+    g->ss=ss; g->sd=D;
+    return 0;
+}
+static int kv_search_voted_(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
+                            int k, int rerank, uint64_t *out_ids, float *out_scores);
+int kci_vec_search_voted(KciVecSearcher *s, const float *query, const uint32_t *voters, int nvoters, int k, int rerank,
+                         uint64_t *out_ids, float *out_scores){
+    return kv_search_voted_(s, query, NULL, 0, voters, nvoters, k, rerank, out_ids, out_scores);
+}
+int kci_vec_search_voted_short(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
+                               int k, int rerank, uint64_t *out_ids, float *out_scores){
+    if(!qshort || keep<1) return -1;
+    return kv_search_voted_(s, query, qshort, keep, voters, nvoters, k, rerank, out_ids, out_scores);
+}
+static int kv_search_voted_(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
+                            int k, int rerank, uint64_t *out_ids, float *out_scores){
+    if(!s || !query || !voters || nvoters<=0 || !out_ids) return -1;
+    KciVec *v=s->v; struct KvVt *g=v->vt;
+    if(!g || g->gen!=v->rowgen) return -2;
+    if(qshort && !g->ss) return -2;
+    if(!v->keepf || !v->vf || g->dim!=v->dim) return -1;
+    double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
+    if(k<1) k=1;
+    int R=rerank, dim=v->dim; if(R<k) R=k; if(R>4096) R=4096;
+    if(scr_fit(&s->s, v->gN>v->count ? v->gN : v->count)!=0) return -1;
+    scr_next(&s->s);
+    if(R>s->s.tmpcap){ He *nt2=realloc(s->s.tmp,sizeof(He)*(size_t)R); if(!nt2) return -1; s->s.tmp=nt2; s->s.tmpcap=R; }
+    if(!s->lq8){ s->lq8=malloc((size_t)dim+64); if(!s->lq8) return -1; }
+    enc_query(v, query, s->qf, s->q);
+    { float qm=0; for(int d=0;d<dim;d++){ float a=fabsf(s->qf[d]); if(a>qm) qm=a; }
+      float qs = qm>0 ? 127.0f/qm : 1.0f; for(int d=0;d<dim;d++) s->lq8[d]=(int8_t)lrintf(s->qf[d]*qs); }
+    He *h=s->s.tmp; int hn=0; const int per=g->per;
+    if(qshort){                                          /* the union ranked by the short codes; the best `keep` go on */
+        int sd=g->sd, K2=keep; if(K2<R) K2=R; if(K2>65536) K2=65536;
+        if((size_t)s->lseedcap<(size_t)2*K2+(size_t)sd+64){ uint32_t *nb=realloc(s->lseed,((size_t)2*K2+(size_t)sd+64)*sizeof(uint32_t)); if(!nb) return -1; s->lseed=nb; s->lseedcap=2*K2+sd+64; }
+        uint32_t *hid=s->lseed; int32_t *hsc=(int32_t*)(s->lseed+K2); int8_t *q8=(int8_t*)(s->lseed+2*K2); int n2=0;
+        { float qm=0; for(int d=0;d<sd;d++){ float a=fabsf(qshort[d]); if(a>qm) qm=a; }
+          float qs = qm>0 ? 127.0f/qm : 1.0f; for(int d=0;d<sd;d++) q8[d]=(int8_t)lrintf(qshort[d]*qs); }
+        for(int a=0;a<nvoters;a++){ if(voters[a]>=g->nq) continue;
+            const uint32_t *l=g->rows+(size_t)voters[a]*per;
+            if(a+1<nvoters && voters[a+1]<g->nq) __builtin_prefetch(g->rows+(size_t)voters[a+1]*per);
+            for(int i=0;i<per;i++){ uint32_t r=l[i];
+                if(i+6<per && l[i+6]<v->count) __builtin_prefetch(g->ss+(size_t)l[i+6]*sd);
+                if(r>=v->count || visited(&s->s,r)) continue;
+                int32_t sc=sdot_n(sd, q8, g->ss+(size_t)r*sd);
+                if(n2<K2){ int j=n2++; while(j>0){ int pp=(j-1)/2; if(hsc[pp]<=sc) break; hsc[j]=hsc[pp]; hid[j]=hid[pp]; j=pp; } hsc[j]=sc; hid[j]=r; }
+                else if(sc>hsc[0]){ int j=0; for(;;){ int c=2*j+1; if(c>=K2) break; if(c+1<K2 && hsc[c+1]<hsc[c]) c++; if(hsc[c]>=sc) break; hsc[j]=hsc[c]; hid[j]=hid[c]; j=c; }
+                    hsc[j]=sc; hid[j]=r; } } }
+        for(int i=0;i<n2;i++){ uint32_t r=hid[i];
+            if(i+4<n2){ const int8_t *pf=g->si+(size_t)hid[i+4]*dim; __builtin_prefetch(pf); __builtin_prefetch(pf+64); }
+            float sc=(float)sdot(v, s->lq8, g->si+(size_t)r*dim);
+            if(hn<R){ int j=hn++; while(j>0){ int pp=(j-1)/2; if(h[pp].d<=sc) break; h[j]=h[pp]; j=pp; } h[j].d=sc; h[j].id=r; }
+            else if(sc>h[0].d){ int j=0; for(;;){ int c=2*j+1; if(c>=R) break; if(c+1<R && h[c+1].d<h[c].d) c++; if(h[c].d>=sc) break; h[j]=h[c]; j=c; }
+                h[j].d=sc; h[j].id=r; } }
+    } else
+    for(int a=0;a<nvoters;a++){ if(voters[a]>=g->nq) continue;
+        const uint32_t *l=g->rows+(size_t)voters[a]*per;
+        if(a+1<nvoters && voters[a+1]<g->nq) __builtin_prefetch(g->rows+(size_t)voters[a+1]*per);
+        for(int i=0;i<per;i++){ uint32_t r=l[i];
+            if(i+6<per && l[i+6]<v->count){ const int8_t *pf=g->si+(size_t)l[i+6]*dim; __builtin_prefetch(pf); __builtin_prefetch(pf+64); }
+            if(r>=v->count || visited(&s->s,r)) continue;
+            float sc=(float)sdot(v, s->lq8, g->si+(size_t)r*dim);
+            if(hn<R){ int j=hn++; while(j>0){ int pp=(j-1)/2; if(h[pp].d<=sc) break; h[j]=h[pp]; j=pp; } h[j].d=sc; h[j].id=r; }
+            else if(sc>h[0].d){ int j=0; for(;;){ int c=2*j+1; if(c>=R) break; if(c+1<R && h[c+1].d<h[c].d) c++; if(h[c].d>=sc) break; h[j]=h[c]; j=c; }
+                h[j].d=sc; h[j].id=r; } } }
+    for(int i=0;i<hn;i++) __builtin_prefetch(v->vf+(size_t)h[i].id*dim);
+    for(int i=0;i<hn;i++) h[i].d=-fdot(dim, s->qf, v->vf+(size_t)h[i].id*dim);
+    int r=emit_topk(v, h, hn, k, 1.0f, out_ids, out_scores);
+    if(t) kv_l2_scores(v, r, out_scores, qn2);
+    return r;
+}
+
 uint32_t kci_vec_count(const KciVec *v){ return v?v->count:0; }
-int kci_vec_dim(const KciVec *v){ return v ? v->dim : 0; }
+int kci_vec_dim(const KciVec *v){ return v ? (v->l2 ? v->udim : v->dim) : 0; }
 int kci_vec_is_built(const KciVec *v){ return v?v->built:0; }
