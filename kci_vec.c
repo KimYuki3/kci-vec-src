@@ -371,17 +371,18 @@ static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int la
     }
 }
 
-/* HNSW neighbour-selection heuristic: keep a candidate only if no already-
- * chosen node is closer to it than the query is (diversity pruning). */
 static int select_neighbors(KciVec *v, const int8_t *q, Heap *W, int M, uint32_t *out){
     int m=W->n; He *cand=malloc(sizeof(He)*m);
     for(int i=0;i<m;i++) cand[i]=W->a[i];
     for(int i=0;i<m;i++){ int mi=i; for(int j=i+1;j<m;j++) if(cand[j].d<cand[mi].d) mi=j; He t=cand[i];cand[i]=cand[mi];cand[mi]=t; }
-    int no=0;
-    for(int i=0;i<m&&no<M;i++){ uint32_t e=cand[i].id; int good=1;
-        for(int j=0;j<no;j++){ if(vdist(v,vrow(v,e),vrow(v,out[j]))<cand[i].d){ good=0; break; } }
+    int no=0, same=0, cap=M/2; size_t rb=(size_t)v->dim;
+    for(int i=0;i<m&&no<M;i++){ uint32_t e=cand[i].id; int good=1; const int8_t *re=vrow(v,e);
+        for(int j=0;j<no;j++){ const int8_t *ro=vrow(v,out[j]); if(memcmp(re,ro,rb)==0 || vdist(v,re,ro)<cand[i].d){ good=0; break; } }
         if(good) out[no++]=e; }
-    for(int i=0;i<m&&no<M;i++){ uint32_t e=cand[i].id; int dup=0; for(int j=0;j<no;j++) if(out[j]==e){dup=1;break;} if(!dup) out[no++]=e; }
+    for(int i=0;i<m&&no<M;i++){ uint32_t e=cand[i].id; int dup=0, idn=0; const int8_t *re=vrow(v,e);
+        for(int j=0;j<no;j++){ if(out[j]==e){dup=1;break;} if(!idn && memcmp(re,vrow(v,out[j]),rb)==0) idn=1; }
+        if(dup || (idn && same>=cap)) continue;
+        same+=idn; out[no++]=e; }
     free(cand); return no;
 }
 

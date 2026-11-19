@@ -4,7 +4,7 @@
 
 *[English](README.md)* · **紹介ページ:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A#ja>
 
-このリポジトリは KCI-Vec の **ソース** です (版 0.2.3。cosine・ユークリッド (L2) 距離・内積)。評価用の wheel (pip で入る実行ファイル) は
+このリポジトリは KCI-Vec の **ソース** です (版 0.2.4。cosine・ユークリッド (L2) 距離・内積)。評価用の wheel (pip で入る実行ファイル) は
 **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)** にあります。
 
 ---
