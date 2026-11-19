@@ -49,12 +49,12 @@ int     kci_vec_is_l2(const KciVec *v);   /* 1 = made by kci_vec_new_l2 (or load
  * index of dim+1 dims: each vector is scaled to length <= 1 and gets one more coordinate that brings its length to
  * 1, the query gets a 0 there (the published reduction of Bachrach et al. 2014). It changes no ranking (every
  * score moves by the same q.mean, which is added back) and lets the int8 rows and the codes describe what differs
- * between the vectors instead of what they share. 0 / -1 (not an inner-product index, or already built). max_norm:
- * the largest |x| that will ever be added. Afterwards a longer vector (centred: one farther from the mean than the
- * farthest at that build; with max_norm: any vector longer than max_norm) returns -1 from add / insert. Not for
- * inner product: kci_vec_add_i8 and kci_vec_set_float_source (both return -1). kci_vec_dim returns dim,
- * kci_vec_get_float the vector as given. Not in a KCI_VEC_NO_L2 build. Returns NULL on bad args (dim <= 0,
- * max_norm < 0 or not finite) / OOM. */
+ * between the vectors instead of what they share. Measure both with your own queries. 0 / -1 (not an inner-product
+ * index, or already built). max_norm: the largest |x| that will ever be added. Afterwards a longer vector
+ * (centred: one farther from the mean than the farthest at that build; with max_norm: any vector longer than
+ * max_norm) returns -1 from add / insert. Not for inner product: kci_vec_add_i8 and kci_vec_set_float_source (both
+ * return -1). kci_vec_dim returns dim, kci_vec_get_float the vector as given. Not in a KCI_VEC_NO_L2 build.
+ * Returns NULL on bad args (dim <= 0, max_norm < 0 or not finite) / OOM. */
 KciVec *kci_vec_new_ip(int dim, int M, int efc, float max_norm);
 int     kci_vec_set_ip_centre(KciVec *v, int on);
 int     kci_vec_metric(const KciVec *v);  /* 0 = cosine, 1 = L2, 2 = inner product; -1 = NULL */
@@ -88,6 +88,9 @@ int kci_vec_set_params(KciVec *v, int M, int efc);
  * threads <= 0 selects a sensible default (cpu cores). Returns 0 on success,
  * and writes the wall-clock build seconds to *out_secs if non-NULL. */
 int kci_vec_build(KciVec *v, int threads, double *out_secs);
+/* The graph is of the same kind (same file format, same searches, rows can be added and deleted after); efc is
+ * used for the upper layers only. Below 20,000 rows it is the same as kci_vec_build. Returns as kci_vec_build. */
+int kci_vec_build_fast(KciVec *v, int threads, double *out_secs);
 
 /* Approximate top-k search via HNSW. Fills out_ids[0..ret) and (if non-NULL) out_scores[] with cosine similarity,
  * best first. Returns the number of results (<= k), or -1 if no graph is built. */

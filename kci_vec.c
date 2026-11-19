@@ -878,8 +878,189 @@ static int sq_train(KciVec *v){
     return 0;
 }
 
+/* ── fast build (kci_vec_build_fast) ────────────────────────────────────── */
+#define KV_FAST_MIN 20000u      /* fewer rows: the ordinary build (it takes a second or two there) */
+#define KV_FAST_C   512
+#define KV_FAST_F0  4
+#define KV_FAST_F1  3
+#define KV_FAST_K   64
+#define KV_FAST_LK  16          /* a leaf gives each of its rows at most this many */
+typedef struct { float s; uint32_t id; } KfNb;                 /* larger s = closer */
+typedef struct KvFast KvFast;
+typedef void (*KfFn)(KvFast *f, uint32_t lo, uint32_t hi);
+struct KvFast { KciVec *v; uint32_t N; int dim, T, F0, oom;
+    KfNb *L; uint8_t *Ln; char *lk; int32_t *thr;                /* the candidate lists: N x KV_FAST_K, their lengths, a lock and the K-th best a row */
+    int l0n; int8_t *l0LD; uint16_t *l0as; uint32_t *l0out; size_t *l0cnt;
+    uint32_t *fw, *rv; uint16_t *fn; size_t *ro;               /* the picks (N x M0), their counts, the reverse lists */
+    KfFn run; uint32_t n, chunk, next; };
+static void *kf_m(KvFast *f, size_t n){ void *p=malloc(n?n:1); if(!p) __atomic_store_n(&f->oom,1,__ATOMIC_RELAXED); return p; }
+static void *kf_z(KvFast *f, size_t n, size_t sz){ void *p=calloc(n?n:1,sz); if(!p) __atomic_store_n(&f->oom,1,__ATOMIC_RELAXED); return p; }
+static void *kf_work(void *p){ KvFast *f=p;
+    for(;;){ uint32_t a=__atomic_fetch_add(&f->next,f->chunk,__ATOMIC_RELAXED); if(a>=f->n) break;
+        uint32_t e=f->n-a<f->chunk?f->n:a+f->chunk; f->run(f,a,e); }
+    return NULL; }
+/* run(lo, hi) over [0, n) in chunks handed out from one counter; a thread that does not start: the others take its share */
+static void kf_par(KvFast *f, uint32_t n, uint32_t chunk, KfFn fn){
+    f->run=fn; f->n=n; f->chunk=chunk?chunk:1; f->next=0; pthread_t th[64]; int ok[64];
+    for(int t=1;t<f->T;t++) ok[t]=pthread_create(&th[t],NULL,kf_work,f)==0;
+    kf_work(f); for(int t=1;t<f->T;t++) if(ok[t]) pthread_join(th[t],NULL); }
+static inline uint64_t kf_rnd(uint64_t *s){ uint64_t x=*s; x^=x<<13; x^=x>>7; x^=x<<17; return *s=x; }
+/* put (id, s) into p's list if it is among the K best */
+static inline void kf_upd(KvFast *f, uint32_t p, uint32_t id, float s){
+    if(s<=(float)__atomic_load_n(&f->thr[p],__ATOMIC_RELAXED)) return;
+    while(__atomic_test_and_set(&f->lk[p],__ATOMIC_ACQUIRE)){}
+    KfNb *l=f->L+(size_t)p*KV_FAST_K; int n=f->Ln[p], mi=0;
+    for(int i=0;i<n;i++){ if(l[i].id==id){ __atomic_clear(&f->lk[p],__ATOMIC_RELEASE); return; } if(l[i].s<l[mi].s) mi=i; }
+    if(n<KV_FAST_K){ l[n].id=id; l[n].s=s; f->Ln[p]=(uint8_t)(n+1);
+        if(n+1==KV_FAST_K){ float m=l[0].s; for(int i=1;i<KV_FAST_K;i++) if(l[i].s<m) m=l[i].s; __atomic_store_n(&f->thr[p],(int32_t)m,__ATOMIC_RELAXED); } }
+    else if(s>l[mi].s){ l[mi].id=id; l[mi].s=s; float m=l[0].s; for(int i=1;i<KV_FAST_K;i++) if(l[i].s<m) m=l[i].s; __atomic_store_n(&f->thr[p],(int32_t)m,__ATOMIC_RELAXED); }
+    __atomic_clear(&f->lk[p],__ATOMIC_RELEASE);
+}
+/* a thread's scratch for the leaves: short lists of KV_FAST_LK a row, and the leaf's rows side by side */
+typedef struct { float *bs, *mn; int *mp, *cn, *bj; int8_t *B; } KfScr;
+static int kf_scr_init(KvFast *f, KfScr *S){ size_t C=KV_FAST_C;
+    S->bs=kf_m(f,sizeof(float)*C*KV_FAST_LK); S->mn=kf_m(f,sizeof(float)*C); S->mp=kf_m(f,sizeof(int)*C); S->cn=kf_m(f,sizeof(int)*C);
+    S->bj=kf_m(f,sizeof(int)*C*KV_FAST_LK); S->B=kf_m(f,C*(size_t)f->dim);
+    return S->bs && S->mn && S->mp && S->cn && S->bj && S->B ? 0 : -1; }
+static void kf_scr_free(KfScr *S){ free(S->bs); free(S->mn); free(S->mp); free(S->cn); free(S->bj); free(S->B); }
+/* all pairs inside a leaf. The rows are copied side by side first and the pairs taken 64 rows at a time, so that the
+ * inner loop stays in the cache; every pair goes straight to the two rows' short lists, and those to the lists of K. */
+static void kf_leaf(KvFast *f, const uint32_t *ids, int m, KfScr *S){
+    if(m<2) return;
+    const KciVec *v=f->v; int dim=f->dim, kk=KV_FAST_LK<m-1?KV_FAST_LK:m-1; float *bs=S->bs, *mn=S->mn; int *mp=S->mp, *cn=S->cn, *bj=S->bj; int8_t *B=S->B;
+    for(int i=0;i<m;i++){ mn[i]=(float)__atomic_load_n(&f->thr[ids[i]],__ATOMIC_RELAXED); cn[i]=0;      /* a pair below the row's K-th best so far cannot enter its list */
+        if(i+6<m){ const char *r=(const char*)vrow(v,ids[i+6]); for(int o=0;o<dim;o+=64) __builtin_prefetch(r+o); }
+        memcpy(B+(size_t)i*dim,vrow(v,ids[i]),(size_t)dim); }
+#define KF_PUT(I,J,SC) do{ float *b_=bs+(size_t)(I)*KV_FAST_LK; int *j_=bj+(size_t)(I)*KV_FAST_LK; int n_=cn[I]; \
+        if(n_<kk){ b_[n_]=(SC); j_[n_]=(J); cn[I]=++n_; if(n_==kk){ int p_=0; for(int x_=1;x_<kk;x_++) if(b_[x_]<b_[p_]) p_=x_; mp[I]=p_; mn[I]=b_[p_]; } } \
+        else { int p_=mp[I]; b_[p_]=(SC); j_[p_]=(J); p_=0; for(int x_=1;x_<kk;x_++) if(b_[x_]<b_[p_]) p_=x_; mp[I]=p_; mn[I]=b_[p_]; } }while(0)
+    for(int jb=0;jb<m;jb+=64){ int je=jb+64<m?jb+64:m;
+        for(int i=0;i<je;i++){ const int8_t *a=B+(size_t)i*dim;
+            for(int j=i+1>jb?i+1:jb;j<je;j++){ float s=(float)sdot_n(dim,a,B+(size_t)j*dim); if(s>mn[i]) KF_PUT(i,j,s); if(s>mn[j]) KF_PUT(j,i,s); } } }
+#undef KF_PUT
+    for(int i=0;i<m;i++){ const float *b=bs+(size_t)i*KV_FAST_LK; const int *jj=bj+(size_t)i*KV_FAST_LK; for(int x=0;x<cn[i];x++) kf_upd(f,ids[i],ids[jj[x]],b[x]); }
+}
+/* The fz nearest of nl leaders for the rows ids[0..m) (ids == NULL: the rows lo, lo+1, ...). LD: the leaders' rows side by
+ * side. 16 rows against 64 leaders at a time, so that both stay in the cache. out[i*fz + x] = the x-th nearest leader of row i. */
+static void kf_assign(const KvFast *f, const uint32_t *ids, uint32_t lo, int m, const int8_t *LD, int nl, int fz, uint16_t *out){
+    enum { PB=16, LB=64 }; const KciVec *v=f->v; int dim=f->dim;
+    for(int i0=0;i0<m;i0+=PB){ int pe=i0+PB<m?i0+PB:m; int32_t bs[PB][8]; int bl[PB][8], nn[PB]; const int8_t *row[PB];
+        for(int i=i0;i<pe;i++){ row[i-i0]=vrow(v,ids?ids[i]:lo+(uint32_t)i); nn[i-i0]=0; }
+        if(ids) for(int i=pe;i<pe+PB && i<m;i++){ const char *r=(const char*)vrow(v,ids[i]); for(int o=0;o<dim;o+=64) __builtin_prefetch(r+o); }
+        for(int l0=0;l0<nl;l0+=LB){ int le=l0+LB<nl?l0+LB:nl;
+            for(int i=0;i<pe-i0;i++){ const int8_t *a=row[i]; int32_t *b=bs[i]; int *bb=bl[i]; int n=nn[i];
+                for(int l=l0;l<le;l++){ int32_t sc=sdot_n(dim,a,LD+(size_t)l*dim); int p=n; if(n<fz) n++; else if(sc<=b[fz-1]) continue; else p=fz-1;
+                    while(p>0 && b[p-1]<sc){ b[p]=b[p-1]; bb[p]=bb[p-1]; p--; } b[p]=sc; bb[p]=l; }
+                nn[i]=n; } }
+        for(int i=i0;i<pe;i++) for(int x=0;x<fz;x++) out[(size_t)i*fz+x]=(uint16_t)bl[i-i0][x]; }
+}
+/* split ids[0..m) by nearest leaders (each row goes to its fz nearest), recurse until a piece has at most KV_FAST_C rows */
+static void kf_split(KvFast *f, uint32_t *ids, int m, int fz, uint64_t *rs, KfScr *S){
+    if(m<=KV_FAST_C){ kf_leaf(f,ids,m,S); return; }
+    const KciVec *v=f->v; int dim=f->dim, nl=m/(KV_FAST_C/2); if(nl<2) nl=2; if(nl>1024) nl=1024; if(fz>nl) fz=nl;
+    int8_t *ld=kf_m(f,(size_t)nl*dim); uint32_t *out=kf_m(f,sizeof(uint32_t)*(size_t)m*fz); uint16_t *as=kf_m(f,sizeof(uint16_t)*(size_t)m*fz);
+    size_t *cnt=kf_z(f,(size_t)nl+1,sizeof(size_t)), *pos=kf_m(f,sizeof(size_t)*nl);
+    if(!ld||!out||!as||!cnt||!pos){ free(ld); free(out); free(as); free(cnt); free(pos); return; }
+    for(int i=0;i<nl;i++) memcpy(ld+(size_t)i*dim,vrow(v,ids[kf_rnd(rs)%(uint32_t)m]),(size_t)dim);
+    kf_assign(f,ids,0,m,ld,nl,fz,as);
+    for(size_t i=0;i<(size_t)m*fz;i++) cnt[as[i]+1]++;
+    for(int l=0;l<nl;l++) cnt[l+1]+=cnt[l];
+    memcpy(pos,cnt,sizeof(size_t)*nl);
+    for(int i=0;i<m;i++) for(int x=0;x<fz;x++) out[pos[as[(size_t)i*fz+x]]++]=ids[i];
+    free(as); free(ld); free(pos);
+    for(int l=0;l<nl;l++){ size_t a=cnt[l], g=cnt[l+1]-a; if(g==0) continue;
+        if(g>=(size_t)m){ for(size_t o=0;o<g;o+=KV_FAST_C) kf_leaf(f,out+a+o,(int)(g-o<KV_FAST_C?g-o:KV_FAST_C),S); }     /* no progress (the same row many times): cut it into leaves */
+        else kf_split(f,out+a,(int)g,1,rs,S); }
+    free(out); free(cnt);
+}
+static void kf_l0_assign(KvFast *f, uint32_t lo, uint32_t hi){ kf_assign(f,NULL,lo,(int)(hi-lo),f->l0LD,f->l0n,f->F0,f->l0as+(size_t)lo*f->F0); }
+static void kf_l0_groups(KvFast *f, uint32_t lo, uint32_t hi){ KfScr S; if(kf_scr_init(f,&S)!=0){ kf_scr_free(&S); return; }
+    for(uint32_t l=lo;l<hi;l++){ size_t a=f->l0cnt[l], g=f->l0cnt[l+1]-a; uint64_t rs=0x9E3779B97F4A7C15ULL*(uint64_t)(l+1);
+        if(g>0) kf_split(f,f->l0out+a,(int)g,KV_FAST_F1,&rs,&S); }
+    kf_scr_free(&S); }
+/* step 1: the candidate lists. 0 / -1 (out of memory) */
+static int kf_candidates(KvFast *f){
+    const KciVec *v=f->v; uint32_t N=f->N; int dim=f->dim;
+    f->L=kf_m(f,sizeof(KfNb)*(size_t)N*KV_FAST_K); f->Ln=kf_z(f,N,1); f->lk=kf_z(f,N,1); f->thr=kf_m(f,sizeof(int32_t)*N);
+    if(f->oom) return -1;
+    for(uint32_t i=0;i<N;i++) f->thr[i]=INT32_MIN;
+    uint32_t g0 = N>=1000000u ? 16384u : 2048u;                 /* rows a top group, about */
+    f->l0n=(int)(N/g0); if(f->l0n<4) f->l0n=4; if(f->l0n>60000) f->l0n=60000; f->F0=KV_FAST_F0<f->l0n?KV_FAST_F0:f->l0n;
+    f->l0LD=kf_m(f,(size_t)f->l0n*dim); f->l0as=kf_m(f,sizeof(uint16_t)*(size_t)N*f->F0); f->l0cnt=kf_z(f,(size_t)f->l0n+1,sizeof(size_t));
+    f->l0out=kf_m(f,sizeof(uint32_t)*(size_t)N*f->F0); size_t *pos=kf_m(f,sizeof(size_t)*f->l0n);
+    if(f->oom){ free(pos); return -1; }
+    { uint64_t rs=1234567; for(int l=0;l<f->l0n;l++) memcpy(f->l0LD+(size_t)l*dim,vrow(v,(uint32_t)(kf_rnd(&rs)%N)),(size_t)dim); }
+    kf_par(f,N,2048,kf_l0_assign);
+    for(size_t i=0;i<(size_t)N*f->F0;i++) f->l0cnt[f->l0as[i]+1]++;
+    for(int l=0;l<f->l0n;l++) f->l0cnt[l+1]+=f->l0cnt[l];
+    memcpy(pos,f->l0cnt,sizeof(size_t)*f->l0n);
+    for(uint32_t i=0;i<N;i++) for(int x=0;x<f->F0;x++) f->l0out[pos[f->l0as[(size_t)i*f->F0+x]]++]=i;
+    free(pos); free(f->l0as); f->l0as=NULL; free(f->l0LD); f->l0LD=NULL;
+    kf_par(f,(uint32_t)f->l0n,1,kf_l0_groups);
+    free(f->l0out); f->l0out=NULL; free(f->l0cnt); f->l0cnt=NULL; free(f->lk); f->lk=NULL; free(f->thr); f->thr=NULL;
+    return f->oom?-1:0;
+}
+/* step 2, pass 1: the row's candidates best first, and its picks: a candidate is taken unless one already taken is closer to
+ * it than the row is (the rule of select_neighbors, without the fill) */
+static void kf_pick(KvFast *f, uint32_t lo, uint32_t hi){ KciVec *v=f->v; int M0=v->M0;
+    for(uint32_t i=lo;i<hi;i++){ KfNb *l=f->L+(size_t)i*KV_FAST_K; int n=f->Ln[i];
+        for(int a=1;a<n;a++){ KfNb x=l[a]; int j=a; while(j>0 && l[j-1].s<x.s){ l[j]=l[j-1]; j--; } l[j]=x; }
+        uint32_t *out=f->fw+(size_t)i*M0; int no=0;
+        for(int x=0;x<n && no<M0;x++){ int good=1; const int8_t *r=vrow(v,l[x].id);
+            for(int j=0;j<no;j++) if((float)sdot(v,r,vrow(v,out[j]))>l[x].s){ good=0; break; }
+            if(good) out[no++]=l[x].id; }
+        f->fn[i]=(uint16_t)no; } }
+/* step 2, pass 2: every row selects once among its candidates and the rows that picked it, and writes its own layer-0 list */
+static void kf_link(KvFast *f, uint32_t lo, uint32_t hi){ KciVec *v=f->v; Heap W; hp_init(&W,KV_FAST_K+452,1); if(!W.a){ __atomic_store_n(&f->oom,1,__ATOMIC_RELAXED); return; }
+    for(uint32_t i=lo;i<hi;i++){ const int8_t *q=vrow(v,i); const KfNb *l=f->L+(size_t)i*KV_FAST_K; int n=f->Ln[i]; W.n=0;
+        for(int k=0;k<n;k++) hp_push(&W,-l[k].s,l[k].id);
+        size_t r0=f->ro[i], r1=f->ro[i+1]; if(r1-r0>448) r1=r0+448;
+        for(size_t r=r0;r<r1;r++){ uint32_t j=f->rv[r]; int dup=0; for(int k=0;k<n;k++) if(l[k].id==j){ dup=1; break; }
+            if(!dup) hp_push(&W,vdist(v,q,vrow(v,j)),j); }
+        if(!W.n) continue;
+        uint32_t sel[512]; int ns=select_neighbors(v,q,&W,v->M0,sel); publish(g_l0(v,i),sel,ns); }
+    free(W.a); }
+/* step 3: a row with a level >= 1, on the layers above 0 only (insert_node without layer 0) */
+static void kf_upper_one(KciVec *v, uint32_t i, Scr *s){
+    const int8_t *q=vrow(v,i);
+    pthread_mutex_lock(&v->epmtx); uint32_t ep=v->ep; int L=v->maxlevel; pthread_mutex_unlock(&v->epmtx);
+    int lvl=v->level[i];
+    for(int l=L;l>lvl;l--){ search_layer(v,q,ep,1,l,s); ep=hp_top(&s->W).id; }
+    int top=lvl<L?lvl:L;
+    for(int l=top;l>=1;l--){ search_layer(v,q,ep,v->efc,l,s); uint32_t one[512]; int ns=select_neighbors(v,q,&s->W,v->M,one);
+        { const He *wa=s->W.a; int bi=0; for(int z=1;z<s->W.n;z++) if(wa[z].d<wa[bi].d) bi=z; if(s->W.n>0) ep=wa[bi].id; }
+        connect(v,i,one,ns,l); }
+    if(lvl>L){ pthread_mutex_lock(&v->epmtx); if(lvl>v->maxlevel){ v->maxlevel=lvl; v->ep=i; } pthread_mutex_unlock(&v->epmtx); }
+}
+static void kf_upper(KvFast *f, uint32_t lo, uint32_t hi){ KciVec *v=f->v; Scr s; scr_init(&s,v->gN,v->efc+16);
+    for(uint32_t t=lo;t<hi;t++){ if(t==0) continue;               /* row 0 seeds the graph, as in build_worker */
+        uint32_t i=(uint32_t)(((uint64_t)t*v->bstep)%v->gN); if(v->level[i]>=1) kf_upper_one(v,i,&s); }
+    scr_free(&s); }
+static void kf_free(KvFast *f){ free(f->L); free(f->Ln); free(f->lk); free(f->thr); free(f->l0LD); free(f->l0as); free(f->l0out); free(f->l0cnt);
+    free(f->fw); free(f->rv); free(f->fn); free(f->ro); }
+/* the graph of a fresh build (levels drawn, lists empty, ep = row 0). 0 / -1 (out of memory: the graph is to be thrown away) */
+static int kv_fast_graph(KciVec *v, int T){
+    KvFast F; memset(&F,0,sizeof F); KvFast *f=&F; uint32_t N=v->gN; int M0=v->M0;
+    f->v=v; f->N=N; f->dim=v->dim; f->T=T<1?1:T>64?64:T;
+    if(kf_candidates(f)!=0){ kf_free(f); return -1; }
+    f->fw=kf_m(f,sizeof(uint32_t)*(size_t)N*M0); f->fn=kf_m(f,sizeof(uint16_t)*N); f->ro=kf_z(f,(size_t)N+2,sizeof(size_t));
+    if(f->oom){ kf_free(f); return -1; }
+    kf_par(f,N,256,kf_pick);
+    size_t tot=0;
+    for(uint32_t i=0;i<N;i++){ const uint32_t *o=f->fw+(size_t)i*M0; for(int x=0;x<f->fn[i];x++) f->ro[(size_t)o[x]+2]++; tot+=f->fn[i]; }
+    for(uint32_t i=0;i<N;i++) f->ro[(size_t)i+2]+=f->ro[(size_t)i+1];
+    f->rv=kf_m(f,sizeof(uint32_t)*(tot+1)); if(f->oom){ kf_free(f); return -1; }
+    for(uint32_t i=0;i<N;i++){ const uint32_t *o=f->fw+(size_t)i*M0; for(int x=0;x<f->fn[i];x++) f->rv[f->ro[(size_t)o[x]+1]++]=i; }   /* now ro[i]..ro[i+1] = the rows that picked i */
+    free(f->fw); f->fw=NULL; free(f->fn); f->fn=NULL;
+    kf_par(f,N,256,kf_link);
+    if(f->oom){ kf_free(f); return -1; }
+    kf_free(f); memset(&F,0,sizeof F); f->v=v; f->N=N; f->T=T<1?1:T>64?64:T;
+    kf_par(f,N,(N+(uint32_t)f->T*8u-1u)/((uint32_t)f->T*8u),kf_upper);
+    return 0;
+}
+
 /* ── public: build ──────────────────────────────────────────────────────── */
-int kci_vec_build(KciVec *v, int threads, double *out_secs){
+static int kv_build(KciVec *v, int threads, double *out_secs, int fast){
     if(!v || v->count==0 || !v->vf || v->img) return -1;
     if(kv_l2_fin(v)!=0) return -1;
     graph_free(v);
@@ -904,10 +1085,14 @@ int kci_vec_build(KciVec *v, int threads, double *out_secs){
     v->ep=0; v->maxlevel=v->level[0]; v->bnext=1; v->bstep=kv_build_step(N);
     int T = default_threads(threads);
     struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
-    pthread_t th[64]; BuildArg ba = { v };
-    for(int t=0;t<T-1;t++) pthread_create(&th[t],NULL,build_worker,&ba);
-    build_worker(&ba);
-    for(int t=0;t<T-1;t++) pthread_join(th[t],NULL);
+    if(fast && N>=KV_FAST_MIN && N<=(1u<<29) && v->M0<=128){
+        if(kv_fast_graph(v,T)!=0){ graph_free(v); return -1; }
+    } else {
+        pthread_t th[64]; BuildArg ba = { v };
+        for(int t=0;t<T-1;t++) pthread_create(&th[t],NULL,build_worker,&ba);
+        build_worker(&ba);
+        for(int t=0;t<T-1;t++) pthread_join(th[t],NULL);
+    }
     repair_reach(v);
     clock_gettime(CLOCK_MONOTONIC,&t1);
     v->built=1;
@@ -920,6 +1105,8 @@ int kci_vec_build(KciVec *v, int threads, double *out_secs){
     if(out_secs) *out_secs=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)/1e9;
     return 0;
 }
+int kci_vec_build(KciVec *v, int threads, double *out_secs){ return kv_build(v, threads, out_secs, 0); }
+int kci_vec_build_fast(KciVec *v, int threads, double *out_secs){ return kv_build(v, threads, out_secs, 1); }
 
 /* ── public: search ─────────────────────────────────────────────────────── */
 static int search_collect(KciVec *v, const int8_t *q, int ef, Scr *s){

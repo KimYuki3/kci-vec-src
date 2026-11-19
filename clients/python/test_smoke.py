@@ -76,7 +76,8 @@ except RuntimeError:
 os.remove(path)
 
 g = KciVec(d, M=16, efc=100, rerank=50)
-g.add_many(ids, X); g.build()
+g.add_many(ids, X); g.build(fast=True)
+g.build()
 g.build_qg(dims_per_code=2, code_dims=32); g.set_qg_exact(2)
 img = os.path.join(tempfile.gettempdir(), "kci_vec_smoke.kvimg")
 check(g.save_image(img), "save_image")

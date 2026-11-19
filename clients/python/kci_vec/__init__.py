@@ -75,6 +75,7 @@ def _bind(lib):
     s.kci_vec_reserve.argtypes = [C.c_void_p, C.c_uint32]
     s.kci_vec_add.restype = C.c_int64;             s.kci_vec_add.argtypes = [C.c_void_p, C.c_uint64, c_f32p]
     s.kci_vec_build.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_double)]
+    s.kci_vec_build_fast.restype = C.c_int;        s.kci_vec_build_fast.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_double)]
     s.kci_vec_build_ivf_p.restype = C.c_int;       s.kci_vec_build_ivf_p.argtypes = [C.c_void_p, C.POINTER(_IvfParams)]
     s.kci_vec_searcher_new.restype = C.c_void_p;   s.kci_vec_searcher_new.argtypes = [C.c_void_p]
     s.kci_vec_searcher_free.argtypes = [C.c_void_p]
@@ -230,10 +231,12 @@ class KciVec:
         for i, vid in enumerate(ids):
             self.lib.kci_vec_add(self._v, int(vid), C.cast(base + i * d * 4, c_f32p))
 
-    def build(self, threads=0):
-        """Build the int8 HNSW graph. Returns the build seconds."""
+    def build(self, threads=0, fast=False):
+        """Build the int8 HNSW graph."""
         secs = C.c_double(0.0)
-        self.lib.kci_vec_build(self._v, threads, C.byref(secs))
+        rc = (self.lib.kci_vec_build_fast if fast else self.lib.kci_vec_build)(self._v, threads, C.byref(secs))
+        if fast and rc != 0:
+            raise RuntimeError("kci_vec_build_fast failed (out of memory, or no vectors)")
         self.qg = False              # a rebuild drops the quantized graph
         self._searcher(reset=True)
         return secs.value

@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.4: cosine, Euclidean (L2) distance and inner product). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.5: cosine, Euclidean (L2) distance and inner product). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -46,6 +46,7 @@ or over data that should not leave the machine.
     (`kci_vec_searcher_set_eps`), and an optional quantized layer 0 (`kci_vec_build_qg`) that keeps each node's
     neighbours' 4-bit codes in one block.
 - Insert, delete and compact after the build; a filter predicate on ids during search.
+- A quick build (`kci_vec_build_fast`, from 0.2.5): builds the graph in less time; it does not reach the quality of the regular build (`kci_vec_build`).
 - Optional encrypted saves (AES-256-CTR + AES-256-CMAC; wrong keys and altered files are refused) and a read-only
   image that several processes can map.
 - A Python client (`clients/python`, ctypes + NumPy) with a small BM25 index for hybrid keyword + vector ranking.

@@ -30,7 +30,7 @@ static void mk(float *v, float spread){
 static float dot(const float *a, const float *b){ float s = 0; for (int i = 0; i < DIM; i++) s += a[i] * b[i]; return s; }
 static int cmp_desc(const void *a, const void *b){ float x = *(const float*)a, y = *(const float*)b; return x < y ? 1 : x > y ? -1 : 0; }
 
-static int run(int threads, int M){
+static int run(int threads, int M, int fast){
     int total = N + NDUP, ok = 1;
     float *base = malloc((size_t)total * DIM * sizeof *base), *q = malloc((size_t)NQ * DIM * sizeof *q), *sc = malloc((size_t)total * sizeof *sc);
     if (!base || !q || !sc) return 0;
@@ -45,7 +45,7 @@ static int run(int threads, int M){
     KciVec *v = kci_vec_new(DIM, M, 200);
     kci_vec_keep_float(v, 1);
     for (int i = 0; i < total; i++) kci_vec_add(v, (uint64_t)i + 1, base + (size_t)i * DIM);
-    kci_vec_build(v, threads, NULL);
+    if (fast) kci_vec_build_fast(v, threads, NULL); else kci_vec_build(v, threads, NULL);
     KciVecSearcher *s = kci_vec_searcher_new(v);
     uint64_t ids[10]; float out[10]; double sum = 0; int zero = 0, low = 0;
     for (int qi = 0; qi < NQ; qi++){
@@ -58,7 +58,7 @@ static int run(int threads, int M){
         for (int i = 0; i < n; i++) hit += got[i] >= sc[9] - 1e-5f;
         sum += hit / 10.0; zero += hit == 0; low += hit < 5;
     }
-    printf("M %d, %d thread(s): top 10 against exact %.4f, queries with 0 of 10: %d, with fewer than 5: %d\n", M, threads, sum / NQ, zero, low);
+    printf("%sM %d, %d thread(s): top 10 against exact %.4f, queries with 0 of 10: %d, with fewer than 5: %d\n", fast ? "build_fast, " : "", M, threads, sum / NQ, zero, low);
     ok &= zero == 0 && low <= 5 && sum / NQ >= 0.92;
     /* the group itself: its vector as the query must return rows of the group (score 1) */
     {
@@ -75,8 +75,10 @@ static int run(int threads, int M){
 
 int main(void){
     int ok = 1;
-    ok &= run(1, 16);
-    ok &= run(8, 16);
+    ok &= run(1, 16, 0);
+    ok &= run(8, 16, 0);
+    ok &= run(1, 16, 1);
+    ok &= run(8, 16, 1);
 
     printf(ok ? "PASS\n" : "FAIL\n");
     return ok ? 0 : 1;

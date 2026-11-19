@@ -4,7 +4,7 @@
 
 *[English](README.md)* · **紹介ページ:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A#ja>
 
-このリポジトリは KCI-Vec の **ソース** です (版 0.2.4。cosine・ユークリッド (L2) 距離・内積)。評価用の wheel (pip で入る実行ファイル) は
+このリポジトリは KCI-Vec の **ソース** です (版 0.2.5。cosine・ユークリッド (L2) 距離・内積)。評価用の wheel (pip で入る実行ファイル) は
 **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)** にあります。
 
 ---
@@ -45,6 +45,7 @@
   - *グラフ方式* (`kci_vec_build` / `kci_vec_search*`): 整数の内積で動く HNSW、ε 半径の探索 (`kci_vec_searcher_set_eps`)、
     最下層を「近傍の 4 ビット符号の塊」として持つ量子化グラフ (`kci_vec_build_qg`、選択肢)。
 - 作った後の追加・削除・詰め直し、検索中の id への条件での絞り込み。
+- 急いで作る選択肢 (`kci_vec_build_fast`、0.2.5 から): グラフを短い時間で作ります。ふつうの作り方 (`kci_vec_build`) の質には届きません。
 - 暗号化した保存 (AES-256-CTR + AES-256-CMAC。鍵違いや書き換えられたファイルは読み込まない。選択肢)、
   いくつものプロセスで共有できる読み取り専用の像。
 - Python の包み (`clients/python`、ctypes + NumPy)。キーワードとベクトルを合わせる小さな BM25 付き。
