@@ -68,6 +68,21 @@ static int run(int threads, int M, int fast){
         printf("  the repeated vector as the query: %d of 10 are rows of the group\n", same);
         ok &= same == 10;
     }
+    {
+        uint64_t st[8]; int r = kci_vec_dup_stats(v, st);
+        printf("  dup_stats: rows %llu, groups %llu, rows in groups %llu, largest %llu, over 2M %llu, distinct %llu\n", (unsigned long long)st[0],
+               (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3], (unsigned long long)st[4], (unsigned long long)st[5]);
+        ok &= r == 0 && st[0] == (uint64_t)total && st[1] == 1 && st[2] == NDUP && st[3] == NDUP && st[4] == (NDUP > 2 * M) && st[5] == (uint64_t)total - NDUP + 1;
+        int del = 0;                                    /* delete 10 rows of the group: they are not counted any more */
+        for (int i = 0; i < total && del < 10; i++) if (i % (total / NDUP) == 7 && i / (total / NDUP) < NDUP){ ok &= kci_vec_delete(v, (uint64_t)i + 1) == 0; del++; }
+        r = kci_vec_dup_stats(v, st);
+        ok &= r == 0 && st[0] == (uint64_t)total - 10 && st[1] == 1 && st[2] == NDUP - 10 && st[3] == NDUP - 10 && st[5] == (uint64_t)total - NDUP + 1;
+        KciVec *e = kci_vec_new(DIM, M, 200);           /* not built: refused */
+        kci_vec_add(e, 1, base);
+        ok &= kci_vec_dup_stats(e, st) == -1 && kci_vec_dup_stats(NULL, st) == -1 && kci_vec_dup_stats(v, NULL) == -1;
+        kci_vec_free(e);
+        if (!ok) printf("  dup_stats check FAILED\n");
+    }
     kci_vec_searcher_free(s); kci_vec_free(v);
     free(base); free(q); free(sc);
     return ok;

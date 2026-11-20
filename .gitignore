@@ -10,3 +10,4 @@ test_*
 __pycache__/
 *.kv
 !tests/data/*.kv
+!pg/test_pg1.sql

@@ -103,7 +103,11 @@ struct KciVec {
     int ivf_dp; float ivf_avqt;
     int ivf_km_iters; uint32_t ivf_km_sample;
     const uint8_t *img; size_t imglen; int img_mmap;
+    int dedup;
+    struct KvTw *tw;    /* the ids that share a row with another id (NULL = none) */
+    int so;
 };
+#define KV_RO(v) ((v)->img || (v)->so)
 struct KvIvf;
 static void kv_ivf_free(struct KvIvf *f);
 static void kv_ivf_scr_free(void *z);
@@ -210,6 +214,223 @@ static uint32_t h_get(KciVec *v, uint64_t id){
     while(v->hval[s]!=KV_HEMPTY){ if(v->hkey[s]==id) return v->hval[s]; s=(s+1)&m; }
     return KV_HEMPTY;
 }
+/* remove id from the id hash (linear probing: the entries after it move up where they may) */
+static void h_del(KciVec *v, uint64_t id){
+    if(!v->hval) return;
+    uint32_t m=(1u<<v->hbits)-1, i=(uint32_t)hmix(id)&m;
+    while(v->hval[i]!=KV_HEMPTY && v->hkey[i]!=id) i=(i+1)&m;
+    if(v->hval[i]==KV_HEMPTY) return;
+    for(uint32_t j=i;;){
+        j=(j+1)&m;
+        if(v->hval[j]==KV_HEMPTY) break;
+        uint32_t h=(uint32_t)hmix(v->hkey[j])&m;
+        if(i<=j ? (i<h && h<=j) : (i<h || h<=j)) continue;      /* j's home lies after the hole: it stays */
+        v->hkey[i]=v->hkey[j]; v->hval[i]=v->hval[j]; i=j; }
+    v->hval[i]=KV_HEMPTY;
+}
+
+typedef struct { uint64_t *k, *val; uint8_t *st; uint32_t bits, n, used; } KvM64;   /* u64 -> u64; st: 0 empty, 1 full, 2 deleted */
+static void m64_free(KvM64 *m){ free(m->k); free(m->val); free(m->st); memset(m,0,sizeof *m); }
+static int m64_put(KvM64 *m, uint64_t k, uint64_t val);
+static int m64_resize(KvM64 *m, uint32_t bits){
+    KvM64 o=*m; uint32_t sz=1u<<bits;
+    m->k=malloc((size_t)sz*8); m->val=malloc((size_t)sz*8); m->st=calloc(sz,1);
+    if(!m->k||!m->val||!m->st){ free(m->k); free(m->val); free(m->st); *m=o; return -1; }
+    m->bits=bits; m->n=0; m->used=0;
+    if(o.st){ uint32_t osz=1u<<o.bits; for(uint32_t i=0;i<osz;i++) if(o.st[i]==1) m64_put(m,o.k[i],o.val[i]); }
+    free(o.k); free(o.val); free(o.st);
+    return 0;
+}
+static int m64_put(KvM64 *m, uint64_t k, uint64_t val){
+    if(!m->st || ((uint64_t)m->used+1)*4 >= ((uint64_t)1<<m->bits)*3){
+        uint32_t bits=4; while(((uint64_t)1<<bits) < ((uint64_t)m->n+1)*2) bits++;
+        if(m->st && bits<=m->bits && (uint64_t)m->n*2 >= ((uint64_t)1<<m->bits)) bits=m->bits+1;
+        if(m64_resize(m,bits)!=0) return -1; }
+    uint32_t mk=(1u<<m->bits)-1, s=(uint32_t)hmix(k)&mk, hole=UINT32_MAX;
+    while(m->st[s]){ if(m->st[s]==1 && m->k[s]==k){ m->val[s]=val; return 0; } if(m->st[s]==2 && hole==UINT32_MAX) hole=s; s=(s+1)&mk; }
+    if(hole!=UINT32_MAX) s=hole; else m->used++;
+    m->st[s]=1; m->k[s]=k; m->val[s]=val; m->n++;
+    return 0;
+}
+static int m64_get(const KvM64 *m, uint64_t k, uint64_t *val){
+    if(!m->st) return 0;
+    uint32_t mk=(1u<<m->bits)-1, s=(uint32_t)hmix(k)&mk;
+    while(m->st[s]){ if(m->st[s]==1 && m->k[s]==k){ if(val) *val=m->val[s]; return 1; } s=(s+1)&mk; }
+    return 0;
+}
+static void m64_del(KvM64 *m, uint64_t k){
+    if(!m->st) return;
+    uint32_t mk=(1u<<m->bits)-1, s=(uint32_t)hmix(k)&mk;
+    while(m->st[s]){ if(m->st[s]==1 && m->k[s]==k){ m->st[s]=2; m->n--; return; } s=(s+1)&mk; }
+}
+struct KvTw {
+    KvM64 rep;          /* id of a representative that has company -> its group */
+    KvM64 tw;           /* an id that shares another id's row -> the group */
+    KvM64 con;          /* hash of a float row -> the id of the row (made at the first insert: kv_tw_con) */
+    int con_ok;
+    uint64_t **ids; uint32_t *n, *cap; uint32_t ng, gcap;
+    uint64_t ntw;       /* ids held outside the rows */
+};
+static void kv_tw_free(struct KvTw *w){
+    if(!w) return;
+    for(uint32_t g=0;g<w->ng;g++) free(w->ids[g]);
+    free(w->ids); free(w->n); free(w->cap); m64_free(&w->rep); m64_free(&w->tw); m64_free(&w->con); free(w);
+}
+static uint64_t kv_row_hash(const void *row, size_t bytes){
+    const uint8_t *r=row; uint64_t h=0x9E3779B97F4A7C15ULL; size_t d=0;
+    for(; d+8<=bytes; d+=8){ uint64_t w; memcpy(&w, r+d, 8); h=hmix(h^w)+0x9E3779B97F4A7C15ULL; }
+    for(; d<bytes; d++) h=hmix(h^r[d])+1;
+    return h;
+}
+/* id joins the row of representative `rp`. 0 / -1 (out of memory) */
+static int kv_tw_add(KciVec *v, uint64_t rp, uint64_t id){
+    if(!v->tw){ v->tw=calloc(1,sizeof(struct KvTw)); if(!v->tw) return -1; }
+    struct KvTw *w=v->tw; uint64_t g;
+    if(!m64_get(&w->rep, rp, &g)){
+        if(w->ng==w->gcap){ uint32_t nc=w->gcap? w->gcap*2 : 64;
+            uint64_t **a=realloc(w->ids,(size_t)nc*sizeof *a); if(!a) return -1; w->ids=a;
+            uint32_t *b=realloc(w->n,(size_t)nc*4); if(!b) return -1; w->n=b;
+            uint32_t *c=realloc(w->cap,(size_t)nc*4); if(!c) return -1; w->cap=c; w->gcap=nc; }
+        g=w->ng; w->ids[g]=NULL; w->n[g]=0; w->cap[g]=0;
+        if(m64_put(&w->rep, rp, g)!=0) return -1;
+        w->ng++; }
+    if(w->n[g]==w->cap[g]){ uint32_t nc=w->cap[g]? w->cap[g]*2 : 4; uint64_t *a=realloc(w->ids[g],(size_t)nc*8); if(!a) return -1; w->ids[g]=a; w->cap[g]=nc; }
+    if(m64_put(&w->tw, id, g)!=0) return -1;
+    w->ids[g][w->n[g]++]=id; w->ntw++;
+    return 0;
+}
+/* the group of representative rp, or -1 */
+static int64_t kv_tw_group(const KciVec *v, uint64_t rp){ uint64_t g; return v->tw && m64_get(&v->tw->rep, rp, &g) ? (int64_t)g : -1; }
+/* take an id that shares a row off its list. 1 = it was one, 0 = not */
+static int kv_tw_drop(KciVec *v, uint64_t id){
+    struct KvTw *w=v->tw; uint64_t g;
+    if(!w || !m64_get(&w->tw, id, &g)) return 0;
+    uint64_t *a=w->ids[g]; uint32_t n=w->n[g];
+    for(uint32_t j=0;j<n;j++) if(a[j]==id){ a[j]=a[n-1]; w->n[g]=n-1; break; }
+    m64_del(&w->tw, id); w->ntw--;
+    if(w->n[g]==0){                                 /* the representative is alone again: find it and forget the group */
+        uint32_t sz=1u<<w->rep.bits; for(uint32_t s=0;s<sz;s++) if(w->rep.st[s]==1 && w->rep.val[s]==g){ w->rep.st[s]=2; w->rep.n--; break; } }
+    return 1;
+}
+/* the representative `rp` (row idx) is deleted but has company: one of the others takes the row over. 1 = done, 0 = rp has no company */
+static int kv_tw_promote(KciVec *v, uint64_t rp, uint32_t idx){
+    int64_t g=kv_tw_group(v, rp); if(g<0) return 0;
+    struct KvTw *w=v->tw; uint64_t heir=w->ids[g][w->n[g]-1];
+    w->n[g]--; m64_del(&w->tw, heir); w->ntw--;
+    m64_del(&w->rep, rp);
+    if(w->n[g]>0) m64_put(&w->rep, heir, (uint64_t)g);
+    v->vid[idx]=heir; h_del(v, rp); h_put(v, heir, idx);
+    if(w->con_ok && v->vf) m64_put(&w->con, kv_row_hash(v->vf+(size_t)idx*v->dim, (size_t)v->dim*sizeof(float)), heir);
+    return 1;
+}
+/* at a build: rows whose floats are byte for byte another row's leave the row arrays, their ids join that row's list.
+ * 0 / -1 (out of memory; nothing is changed then) */
+typedef struct { uint64_t h; uint32_t i; } KvTwKey;
+static __thread const uint8_t *kv_tw_rows; static __thread size_t kv_tw_rb;
+static int kv_tw_cmp_h(const void *a, const void *b){ uint64_t x=((const KvTwKey*)a)->h, y=((const KvTwKey*)b)->h; return x<y ? -1 : x>y; }
+static int kv_tw_cmp_row(const void *a, const void *b){
+    uint32_t x=((const KvTwKey*)a)->i, y=((const KvTwKey*)b)->i;
+    int c=memcmp(kv_tw_rows+(size_t)x*kv_tw_rb, kv_tw_rows+(size_t)y*kv_tw_rb, kv_tw_rb);
+    return c ? c : (x<y ? -1 : x>y); }
+static int kv_dedup_rows(KciVec *v){
+    if(!v->dedup || !v->vf || v->vf_mmap || v->ffn || v->count<2) return 0;
+    uint32_t N=v->count; size_t rb=(size_t)v->dim*sizeof(float);
+    KvTwKey *k=malloc(sizeof(KvTwKey)*(size_t)N); uint32_t *to=malloc(sizeof(uint32_t)*(size_t)N);   /* to[i] = the row i joins, or i */
+    if(!k || !to){ free(k); free(to); return -1; }
+    for(uint32_t i=0;i<N;i++){ k[i].h=kv_row_hash(v->vf+(size_t)i*v->dim, rb); k[i].i=i; to[i]=i; }
+    qsort(k, N, sizeof(KvTwKey), kv_tw_cmp_h);
+    kv_tw_rows=(const uint8_t*)v->vf; kv_tw_rb=rb;
+    uint32_t gone=0;
+    for(uint32_t a=0;a<N;){
+        uint32_t e=a+1; while(e<N && k[e].h==k[a].h) e++;
+        if(e-a>1){
+            qsort(k+a, e-a, sizeof(KvTwKey), kv_tw_cmp_row);                     /* equal rows side by side, the lowest row number first */
+            for(uint32_t s=a;s<e;){ uint32_t z=s+1;
+                while(z<e && memcmp(v->vf+(size_t)k[s].i*v->dim, v->vf+(size_t)k[z].i*v->dim, rb)==0){ to[k[z].i]=k[s].i; gone++; z++; }
+                s=z; } }
+        a=e; }
+    free(k);
+    if(!gone){ free(to); return 0; }
+    int rc=0;
+    for(uint32_t i=0;i<N && rc==0;i++) if(to[i]!=i){
+        uint64_t rp=v->vid[to[i]], id=v->vid[i];
+        if(id==rp) continue;                                                     /* the same id twice: one row is enough */
+        int64_t g=kv_tw_group(v, id);
+        if(g>=0){                                                                /* this row had company of its own: they all move over */
+            struct KvTw *w=v->tw; uint32_t n=w->n[g]; uint64_t *a=malloc((size_t)n*8+8); if(!a){ rc=-1; break; }
+            memcpy(a, w->ids[g], (size_t)n*8);
+            for(uint32_t j=0;j<n;j++) kv_tw_drop(v, a[j]);
+            for(uint32_t j=0;j<n && rc==0;j++) rc=kv_tw_add(v, rp, a[j]);
+            free(a); }
+        if(rc==0 && !(v->tw && m64_get(&v->tw->tw, id, NULL))) rc=kv_tw_add(v, rp, id); }
+    if(rc!=0){ free(to); return -1; }
+    uint32_t j=0;
+    for(uint32_t i=0;i<N;i++) if(to[i]==i){
+        if(j!=i){ memcpy(v->vf+(size_t)j*v->dim, v->vf+(size_t)i*v->dim, rb); v->vid[j]=v->vid[i]; }
+        j++; }
+    kv_wipe(v->vf+(size_t)j*v->dim, (size_t)(N-j)*rb);
+    v->count=j;
+    free(to);
+    if(v->tw){ m64_free(&v->tw->con); v->tw->con_ok=0; }
+    return 0;
+}
+/* row i (floats written, not yet counted) against the rows there are: 1 = its id joined an identical live row, 0 = it is new, -1 */
+static int kv_tw_insert(KciVec *v, uint64_t id, uint32_t i){
+    if(!v->dedup || !v->vf || v->vf_mmap) return 0;
+    if(!v->tw){ v->tw=calloc(1,sizeof(struct KvTw)); if(!v->tw) return -1; }
+    struct KvTw *w=v->tw; size_t rb=(size_t)v->dim*sizeof(float);
+    if(!w->con_ok){                                 /* the first insert: every live row's hash -> its id */
+        m64_free(&w->con);
+        for(uint32_t r=0;r<i;r++) if(!(v->dead && v->dead[r]) && m64_put(&w->con, kv_row_hash(v->vf+(size_t)r*v->dim, rb), v->vid[r])!=0){ m64_free(&w->con); return -1; }
+        w->con_ok=1; }
+    uint64_t h=kv_row_hash(v->vf+(size_t)i*v->dim, rb), rp;
+    if(m64_get(&w->con, h, &rp) && rp!=id){
+        uint32_t r=h_get(v, rp);
+        if(r!=KV_HEMPTY && r<i && !(v->dead && v->dead[r]) && v->vid[r]==rp && memcmp(v->vf+(size_t)r*v->dim, v->vf+(size_t)i*v->dim, rb)==0){
+            if(kv_tw_add(v, rp, id)!=0) return -1;
+            kv_wipe(v->vf+(size_t)i*v->dim, rb);
+            return 1; } }
+    if(m64_put(&w->con, h, id)!=0) return -1;
+    return 0;
+}
+static __thread int kv_tw_depth;
+typedef struct { const KciVec *v; KciVecFilter f; void *ctx; } KvTwF;
+static int kv_tw_filt(uint64_t id, void *c){        /* a representative passes when it or one that shares its row passes */
+    KvTwF *x=c; if(x->f(id, x->ctx)) return 1;
+    int64_t g=kv_tw_group(x->v, id); if(g<0) return 0;
+    const uint64_t *a=x->v->tw->ids[g]; uint32_t n=x->v->tw->n[g];
+    for(uint32_t j=0;j<n;j++) if(x->f(a[j], x->ctx)) return 1;
+    return 0;
+}
+static int kv_tw_expand(const KciVec *v, int uniq, KciVecFilter f, void *ctx, int r, int k, uint64_t *ids, float *sc){
+    if(r<=0 || !v || !v->tw || !v->tw->ntw) return r;
+    if(uniq && !f) return r;
+    if(k<1) k=1;
+    int any=0; for(int i=0;i<r && !any;i++) any = kv_tw_group(v, ids[i])>=0;
+    if(!any) return r;
+    uint64_t *ti=malloc((size_t)r*8); float *ts= sc ? malloc((size_t)r*sizeof(float)) : NULL;
+    if(!ti || (sc && !ts)){ free(ti); free(ts); return r; }
+    memcpy(ti, ids, (size_t)r*8); if(sc) memcpy(ts, sc, (size_t)r*sizeof(float));
+    int o=0;
+    for(int i=0;i<r && o<k;i++){
+        int took=0;
+        if(!f || f(ti[i], ctx)){ ids[o]=ti[i]; if(sc) sc[o]=ts[i]; o++; took=1; }
+        int64_t g=kv_tw_group(v, ti[i]); if(g<0) continue;
+        const uint64_t *a=v->tw->ids[g]; uint32_t n=v->tw->n[g];
+        for(uint32_t j=0;j<n && o<k;j++){
+            if(uniq && took) break;
+            if(!f || f(a[j], ctx)){ ids[o]=a[j]; if(sc) sc[o]=ts[i]; o++; took=1; } }
+    }
+    free(ti); free(ts);
+    return o;
+}
+static int kv_tw_out(const KciVec *v, int uniq, KciVecFilter f, void *ctx, int r, int k, uint64_t *ids, float *sc){
+    if(--kv_tw_depth>0) return r;
+    return kv_tw_expand(v, uniq, f, ctx, r, k, ids, sc);
+}
+int kci_vec_set_dedup(KciVec *v, int on){ if(!v || v->img) return -1; v->dedup = on?1:0; return 0; }
+int kci_vec_searcher_set_unique(KciVecSearcher *s, int on);
+
 static void kv_move(void **dst, void *nb, size_t used, size_t newsz, size_t oldsz){
     if(*dst && used) memcpy(nb, *dst, used);
     memset((char*)nb+used, 0, newsz-used);
@@ -313,6 +534,7 @@ static inline int visited(Scr *s, uint32_t id){ uint64_t *w=&s->bm[id>>6], m=1UL
     if(!*w) s->bl[s->bn++]=id>>6;               /* first bit of this word since scr_next: at most one entry a word */
     *w|=m; return 0; }
 static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore8);
+static int kv_qg_has_short(const KciVec *v);
 static int scr_fit(Scr *s, uint32_t N){
     if(s->visn>=N) return 0;
     size_t ow=kv_bm_words(s->visn), nw=kv_bm_words(N);
@@ -662,6 +884,7 @@ void kci_vec_free(KciVec *v){
         if(v->img_mmap) munmap((void*)v->img, v->imglen);
         pthread_mutex_destroy(&v->epmtx);
         free(v); return; }
+    kv_tw_free(v->tw); v->tw=NULL;
     graph_free(v);
     kv_ivf_free(v->ivf);
     kv_vfree(v, v->vq, (size_t)v->cap * v->dim); v->vq = NULL;
@@ -678,7 +901,7 @@ void kci_vec_free(KciVec *v){
  * by re-rank fault in. Call once after build (with kci_vec_keep_float). The float
  * store then becomes read-only: no insert/compact afterwards. Returns 0 on success. */
 int kci_vec_float_mmap(KciVec *v, const char *path){
-    if(!v || !v->built || !v->keepf || !v->vf || v->vf_mmap || v->img) return -1;
+    if(!v || !v->built || !v->keepf || !v->vf || v->vf_mmap || KV_RO(v)) return -1;
     size_t n = (size_t)v->count * v->dim * sizeof(float);
     FILE *f=fopen(path,"wb"); if(!f) return -1;
     if(fwrite(v->vf,1,n,f)!=n){ fclose(f); remove(path); return -1; }
@@ -700,7 +923,7 @@ int kci_vec_set_params(KciVec *v, int M, int efc){
 }
 
 int kci_vec_reserve(KciVec *v, uint32_t need){
-    if(!v || v->img) return -1;
+    if(!v || KV_RO(v)) return -1;
     if(need <= v->cap) return 0;
     if(need > (1u<<31)) return -1;
     uint32_t nc = v->cap ? v->cap : 1024;
@@ -729,7 +952,7 @@ int kci_vec_reserve(KciVec *v, uint32_t need){
 /* Retain the unit-norm float vectors after build to enable full-precision
  * re-ranking. Otherwise they are freed at build (pure SQ8 codes remain). */
 int kci_vec_keep_float(KciVec *v, int on){
-    if(!v || v->count>0 || v->img) return -1;
+    if(!v || v->count>0 || KV_RO(v)) return -1;
     v->keepf = on?1:0;
     return 0;
 }
@@ -1063,7 +1286,8 @@ static int kv_fast_graph(KciVec *v, int T){
 
 /* ── public: build ──────────────────────────────────────────────────────── */
 static int kv_build(KciVec *v, int threads, double *out_secs, int fast){
-    if(!v || v->count==0 || !v->vf || v->img) return -1;
+    if(!v || v->count==0 || !v->vf || KV_RO(v)) return -1;
+    if(kv_dedup_rows(v)!=0) return -1;
     if(kv_l2_fin(v)!=0) return -1;
     graph_free(v);
     kv_ivf_free(v->ivf); v->ivf=NULL;
@@ -1249,8 +1473,9 @@ static int kv_search_(KciVec *v, const float *query, int k, int ef,
     scr_free(&s); free(q); free(tmp);
     return no;
 }
-int kci_vec_search(KciVec *v, const float *query, int k, int ef,
+static int kci_vec_search_0(KciVec *v, const float *query, int k, int ef,
                    uint64_t *out_ids, float *out_scores){
+    if(v && v->so) return -1;
     if(v && v->l2){
         float *b=malloc((size_t)v->dim*sizeof(float)); if(!b) return -1;
         double qn2=kv_l2_query(v, query, b);
@@ -1262,13 +1487,13 @@ int kci_vec_search(KciVec *v, const float *query, int k, int ef,
 }
 
 /* reusable per-thread searcher: amortizes the visited-set allocation */
-struct KciVecSearcher { KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
+struct KciVecSearcher { int uniq; KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
 static int kv_l2_qs(KciVecSearcher *s, const float **q, double *qn2){
     if(!s || !s->v->l2 || !s->l2q || *q==s->l2q) return 0;
     *qn2 = kv_l2_query(s->v, *q, s->l2q); *q = s->l2q;
     return 1;
 }
-int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
+static int kci_vec_search_ivf_filtered_0(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
                                 KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
     if(!s) return -1;
     s->filt=filt; s->fctx=ctx;
@@ -1323,6 +1548,9 @@ static int kv_search_rerank_(KciVecSearcher *s, const float *query, int k, int e
     if(k<1) k=1;
     if(rerank_n<k) rerank_n=k;
     if(ef<rerank_n) ef=rerank_n;
+    if(v->so){
+        if(!(s->s.use_qg && v->qg)) return -1;      /* the plain graph is gone */
+        if(!kv_qg_has_short(v) && rerank_n<ef) rerank_n=ef; }   /* no short rows: a narrow pass would need the int8 rows to pick its rows */
     enc_query(v, query, s->qf, s->q);       /* s->qf = unit query; s->q = code */
     int m = (s->s.use_qg && v->qg) ? kv_qg_collect(v, &s->s, s->q, ef, rerank_n<ef ? 2 : 0) : search_collect(v, s->q, ef, &s->s);
     He *t=s->s.tmp;
@@ -1390,6 +1618,7 @@ static int kv_search_filtered_(KciVecSearcher *s, const float *query, int k, int
     enc_query(v, query, s->qf, s->q);
     int budget = ef*64; if(budget<4096) budget=4096;
     int reranked = rerank_n>0 && ((v->keepf && v->vf) || v->vh);
+    if(v->so && !(s->s.use_qg && v->qg && reranked)) return -1;
     int m;
     if(s->s.use_qg && v->qg && scr_fit(&s->s, v->gN)==0){
         s->s.filt=filt; s->s.fctx=ctx; s->s.fbudget=budget;
@@ -1767,7 +1996,7 @@ static int kv_ensure_dead(KciVec *v){            /* tombstones for an index with
 }
 
 int kci_vec_build_ivf_p(KciVec *v, const KciVecIvfParams *P){
-    if(!v || !v->vf || v->count==0 || v->vf_mmap || v->img) return -1;
+    if(!v || !v->vf || v->count==0 || v->vf_mmap || KV_RO(v)) return -1;
     if(kv_l2_fin(v)!=0) return -1;
     int nlist = P ? P->nlist : 0, threads = P ? P->threads : 0, d1 = P ? P->code_dims : 0, lr = P ? P->lowrank : 0; float soar = P ? P->soar : 0;
     int D=v->dim; size_t n=v->count;
@@ -2386,7 +2615,8 @@ struct KvQg { int M, dp, nblk, nfull, half; size_t stride, hdr; float *pq; doubl
                int8_t *R8; float *r8inv;
                int8_t *P8; float ps;
                int gd;
-               int ro; };
+               int ro;
+               int res; size_t bo; float *wd; };
 static void kv_qg_free(struct KvQg *g){
     if(!g) return;
     if(g->ro){ free(g); return; }
@@ -2395,7 +2625,7 @@ static void kv_qg_free(struct KvQg *g){
     if(g->R) kv_wipe(g->R, (size_t)g->D*g->cd*sizeof(float));
     if(g->R8) kv_wipe(g->R8, (size_t)g->D*g->cd);
     if(g->P8 && g->n) kv_wipe(g->P8, (size_t)g->n*g->cd);
-    free(g->P8); free(g->R8); free(g->r8inv); free(g->R); free(g->blocks); free(g->pq); free(g);
+    free(g->wd); free(g->P8); free(g->R8); free(g->r8inv); free(g->R); free(g->blocks); free(g->pq); free(g);
 }
 /* a node's unit vector: the retained float row, or the int8 row scaled back */
 static void kv_qg_row(const KciVec *v, uint32_t i, float *x){
@@ -2414,7 +2644,7 @@ static void kv_qg_enc_run(void *a, size_t lo, size_t hi){ KvQgEnc *e=a; int D=e-
     float x[D], zero[D]; memset(zero,0,sizeof zero);
     const int cd=e->g->cd; float y[cd ? cd : 1];
     for(size_t i=lo;i<hi;i++){ kv_qg_row(e->v, (uint32_t)i, x);
-        if(cd){ kv_qg_proj(e->g, x, y); kv_encode_res(e->g->pq, e->g->M, e->g->dp, e->g->eta, y, zero, e->g->gd, e->cv+i*(size_t)e->g->M);
+        if(cd){ kv_qg_proj(e->g, x, y); if(!e->g->res) kv_encode_res(e->g->pq, e->g->M, e->g->dp, e->g->eta, y, zero, e->g->gd, e->cv+i*(size_t)e->g->M);
             if(e->g->P8){ int8_t *r=e->g->P8+i*(size_t)cd; const float ps=e->g->ps;
                 for(int j=0;j<cd;j++){ int t=(int)lrintf(y[j]*ps); r[j]=(int8_t)(t < -127 ? -127 : (t > 127 ? 127 : t)); } } }
         else kv_encode_res(e->g->pq, e->g->M, e->g->dp, e->g->eta, x, zero, D, e->cv+i*(size_t)e->g->M); }
@@ -2440,12 +2670,36 @@ static void kv_qg_fill_run(void *a, size_t lo, size_t hi){ KvQgFill *f=a; KciVec
         *(uint32_t*)b=w;
     }
 }
-static int kv_qg_build(KciVec *v, int dims_per_code, int cdims, int gdims, int threads){
+static void kv_qg_resfill_run(void *a, size_t lo, size_t hi){ KvQgFill *f=a; KciVec *v=f->v; struct KvQg *g=f->g; const int M=g->M, G=g->gd, cdn=g->cd;
+    uint8_t cd[M]; const float ips=1.0f/g->ps;
+    for(size_t i=lo;i<hi;i++){
+        uint8_t *b=g->blocks+i*g->stride; memset(b,0,g->stride);
+        const int8_t *pc=g->P8+i*(size_t)cdn;
+        const uint32_t *lk=g_l0(v,(uint32_t)i); uint32_t cnt=lk[0]; if(cnt>(uint32_t)v->M0) cnt=(uint32_t)v->M0;
+        uint32_t *ids=(uint32_t*)(b+4), w=0; float *B=(float*)(b+g->bo);
+        for(uint32_t j=0;j<cnt;j++){ uint32_t nb=lk[1+j]; if(nb>=v->gN) continue;
+            ids[w]=nb; const int8_t *po=g->P8+(size_t)nb*cdn; memset(cd,0,(size_t)M); double num=0, den=0;
+            for(int d=0;d<G;d++){ float r=(float)(po[d]-pc[d])*ips, wdd=g->wd[d]; int sg=r>0, big=fabsf(r)>wdd; float lev=(big?1.5f:0.5f)*wdd;
+                num+=(double)fabsf(r)*lev; den+=(double)lev*lev; cd[d>>1]|=(uint8_t)((sg|(big<<1))<<((d&1)*2)); }
+            B[w]= den>0 ? (float)(num/den) : 0.0f;
+            if(w < (uint32_t)g->nfull*32){
+                uint8_t *codes=b+g->hdr+(size_t)(w>>5)*M*16; int lo16=(w&31)<16;
+                for(int m=0;m<M;m++){ uint8_t *byte=codes+(size_t)m*16+(w&15); *byte = lo16 ? (uint8_t)((*byte&0xF0)|cd[m]) : (uint8_t)((*byte&0x0F)|(cd[m]<<4)); }
+            } else {
+                uint8_t *codes=b+g->hdr+(size_t)g->nfull*M*16; uint32_t jj=w-(uint32_t)g->nfull*32;
+                for(int m=0;m<M;m++){ uint8_t *byte=codes+(size_t)(m>>1)*16+jj; *byte = (m&1) ? (uint8_t)((*byte&0x0F)|(cd[m]<<4)) : (uint8_t)((*byte&0xF0)|cd[m]); }
+            }
+            w++; }
+        *(uint32_t*)b=w;
+    }
+}
+static int kv_qg_build(KciVec *v, int dims_per_code, int cdims, int gdims, int threads, int res){
     if(!v || !v->built || !v->l0 || v->gN==0 || v->gN!=v->count) return -1;
     if(dims_per_code!=0 && dims_per_code!=1 && dims_per_code!=2) return -1;
     int D=v->dim, dp = dims_per_code ? dims_per_code : 1;
     if(cdims<0 || (cdims && (cdims<8 || (cdims&1) || cdims>=D))) return -1;
     if(gdims<0 || (gdims && (!cdims || gdims<8 || (gdims&1) || gdims>cdims))) return -1;
+    if(res && (!cdims || dims_per_code!=2)) return -1;
     if(!gdims) gdims=cdims;
     const int Dc = cdims ? gdims : D;                  /* what the codes cover */
     struct KvQg *g=calloc(1,sizeof *g); if(!g) return -1;
@@ -2453,7 +2707,9 @@ static int kv_qg_build(KciVec *v, int dims_per_code, int cdims, int gdims, int t
     g->nfull=v->M0/32; g->half = v->M0%32>0 && v->M0%32<=16;
     if(!g->half) g->nfull=g->nblk;
     { const char *e=getenv("KCI_VEC_QG_NO_HALF"); if(e && *e=='1'){ g->half=0; g->nfull=g->nblk; } }
+    g->res = res ? 1 : 0;
     g->hdr=((size_t)4+4*(size_t)v->M0+63)/64*64;
+    if(g->res){ g->bo=(size_t)4+4*(size_t)v->M0; g->hdr=((size_t)4+8*(size_t)v->M0+63)/64*64; }
     g->stride=(g->hdr+(size_t)g->nfull*g->M*16+(g->half ? (size_t)((g->M+1)/2)*16 : 0)+63)/64*64;
     float t = v->ivf_avqt>0 ? v->ivf_avqt : (float)KV_IVF_T;
     g->eta=(Dc-1)*(double)t*t/(1-(double)t*t);
@@ -2491,10 +2747,24 @@ static int kv_qg_build(KciVec *v, int dims_per_code, int cdims, int gdims, int t
                 g->r8inv[j] = v->gs>0 ? 1.0f/(sc*v->gs) : 1.0f/sc; }
 #endif
         }
-        if(ok){ size_t np = ns<KV_PQ_SAMPLE ? ns : KV_PQ_SAMPLE;
+        if(ok && !g->res){ size_t np = ns<KV_PQ_SAMPLE ? ns : KV_PQ_SAMPLE;
         KvPqJob pj={S, np, ns/np, Dc, g->M, g->pq, 0, dp}; kv_par((size_t)g->M, threads, kv_pq_run, &pj); ok=!pj.fail; }
     }
     if(ok){ KvQgEnc e={v,g,cv}; kv_par(N, threads, kv_qg_enc_run, &e); }                   /* 2. every node's codes */
+    if(ok && g->res && !g->P8) ok=0;                    /* the residuals are taken between short rows */
+    if(ok && g->res){
+        const int G=g->gd; double *acc=calloc((size_t)G,sizeof(double)); size_t np=0; g->wd=malloc((size_t)G*sizeof(float)); ok = acc && g->wd;
+        if(ok){ size_t st = N>20000 ? N/20000 : 1;
+            for(size_t i=0;i<N;i+=st){ const int8_t *pc=g->P8+i*(size_t)cdims; const uint32_t *lk=g_l0(v,(uint32_t)i); uint32_t cnt=lk[0]; if(cnt>(uint32_t)v->M0) cnt=(uint32_t)v->M0;
+                for(uint32_t j=0;j<cnt;j++){ uint32_t nb=lk[1+j]; if(nb>=v->gN) continue; const int8_t *po=g->P8+(size_t)nb*cdims;
+                    for(int d=0;d<G;d++){ double r=(double)(po[d]-pc[d]); acc[d]+=r*r; } np++; } }
+            for(int d=0;d<G;d++) g->wd[d]=(float)(sqrt(acc[d]/(double)(np?np:1))/g->ps);
+            for(int m=0;m<g->M;m++) for(int k=0;k<16;k++){ float *c=g->pq+(size_t)m*32+2*k;
+                c[0]=((k&1)?1.0f:-1.0f)*((k&2)?1.5f:0.5f)*g->wd[2*m];
+                c[1]= 2*m+1<G ? ((k&4)?1.0f:-1.0f)*((k&8)?1.5f:0.5f)*g->wd[2*m+1] : 0.0f; }
+            KvQgFill fj={v,g,cv}; kv_par(N, threads, kv_qg_resfill_run, &fj); g->n=(uint32_t)N; }
+        free(acc); free(g->wd); g->wd=NULL; }
+    else
     if(ok){ KvQgFill fj={v,g,cv}; kv_par(N, threads, kv_qg_fill_run, &fj); g->n=(uint32_t)N; } /* 3. the blocks */
     if(S) kv_wipe(S, ns*(size_t)D*sizeof(float)); if(cv) kv_wipe(cv, N*(size_t)g->M);
     free(S); free(cv);
@@ -2504,10 +2774,10 @@ static int kv_qg_build(KciVec *v, int dims_per_code, int cdims, int gdims, int t
 }
 static int kv_qg_shape_ok(const struct KvQg *g, size_t D, size_t M0){
     const int cd=g->cd, Dc = cd ? g->gd : (int)D;
-    return (g->dp==1 || g->dp==2) && (cd==0 ? g->gd==0 : (cd>=8 && !(cd&1) && cd<(int)D && g->gd>=8 && !(g->gd&1) && g->gd<=cd))
+    return (g->dp==1 || g->dp==2) && (g->res==0 || (g->res==1 && cd && g->dp==2)) && (cd==0 ? g->gd==0 : (cd>=8 && !(cd&1) && cd<(int)D && g->gd>=8 && !(g->gd&1) && g->gd<=cd))
         && g->M==(g->dp==2 ? (Dc+1)/2 : Dc) && g->nblk==(int)((M0+31)/32) && (g->half==0 || g->half==1)
         && (g->half ? (g->nfull==(int)(M0/32) && M0%32>0 && M0%32<=16) : g->nfull==g->nblk)
-        && g->hdr==((size_t)4+4*M0+63)/64*64
+        && g->hdr==((size_t)4+(g->res ? 8 : 4)*M0+63)/64*64
         && g->stride==(g->hdr+(size_t)g->nfull*g->M*16+(g->half ? (size_t)((g->M+1)/2)*16 : 0)+63)/64*64
         && isfinite(g->eta);
 }
@@ -2518,9 +2788,14 @@ static void *kv_big_alloc(size_t bytes){
 #endif
     return malloc(bytes ? bytes : 1);
 }
-int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads){ return kv_qg_build(v, dims_per_code, 0, 0, threads); }
-int kci_vec_build_qg_ex(KciVec *v, int dims_per_code, int code_dims, int threads){ return kv_qg_build(v, dims_per_code, code_dims, 0, threads); }
-int kci_vec_build_qg_gate(KciVec *v, int dims_per_code, int code_dims, int gate_dims, int threads){ return kv_qg_build(v, dims_per_code, code_dims, gate_dims, threads); }
+int kci_vec_build_qg(KciVec *v, int dims_per_code, int threads){ return kv_qg_build(v, dims_per_code, 0, 0, threads, 0); }
+int kci_vec_build_qg_ex(KciVec *v, int dims_per_code, int code_dims, int threads){ return kv_qg_build(v, dims_per_code, code_dims, 0, threads, 0); }
+int kci_vec_build_qg_gate(KciVec *v, int dims_per_code, int code_dims, int gate_dims, int threads){ return kv_qg_build(v, dims_per_code, code_dims, gate_dims, threads, 0); }
+int kci_vec_build_qg_res(KciVec *v, int code_dims, int gate_dims, int threads){
+    if(code_dims<=0) return -1;
+    int r=kv_qg_build(v, 2, code_dims, gate_dims, threads, 1);
+    if(r==0 && !v->qg->P8){ kv_qg_free(v->qg); v->qg=NULL; return -1; }   /* needs the short rows */
+    return r; }
 int64_t kci_vec_qg_bytes(const KciVec *v){ return v && v->qg ? (int64_t)((size_t)v->qg->n*v->qg->stride + (size_t)(v->qg->M+1)*32*sizeof(float)) : 0; }
 
 static inline void kv_qg_sum32(const uint8_t *blk, const uint8_t *lut, int M, uint16_t *out){
@@ -2644,6 +2919,21 @@ static size_t kv_qg_pfn_bytes(size_t stride){
         lines=n; }
     return lines>0 && (size_t)lines*64<stride ? (size_t)lines*64 : stride;
 }
+static int kv_qg_has_short(const KciVec *v){ return v->qg && v->qg->P8 != NULL; }
+static inline float kv_so_dot(const KciVec *v, const float *qf, uint32_t i){
+    return v->vh ? hdot(v->dim, qf, v->vh+(size_t)i*v->dim) : fdot(v->dim, qf, v->vf+(size_t)i*v->dim);
+}
+static uint32_t kv_so_upper(const KciVec *v, const float *qf, uint32_t ep){
+    float best=kv_so_dot(v, qf, ep);
+    for(int l=v->maxlevel;l>0;l--){
+        for(int moved=1; moved; ){ moved=0;
+            const uint32_t *lk=v->lu[ep]+(size_t)(l-1)*(v->M+1); uint32_t cnt=lk[0]; if(cnt>(uint32_t)v->M) cnt=(uint32_t)v->M;
+            uint32_t to=ep;
+            for(uint32_t e=1;e<=cnt;e++){ uint32_t nb=lk[e]; if(nb>=v->gN) continue;
+                float d=kv_so_dot(v, qf, nb); if(d>best){ best=d; to=nb; moved=1; } }
+            ep=to; } }
+    return ep;
+}
 static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore8){
     const struct KvQg *g=v->qg; const int M=g->M;
     if(scr_fit(s, v->gN)!=0) return 0;
@@ -2657,20 +2947,34 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
         else kv_qg_proj(g, s->qf, qp); }
     kv_lut_build(g->pq, M, g->dp, g->cd ? qp : s->qf, g->cd ? g->gd : v->dim, s->lutf, s->lut, &base, &invs, KV_QG_LUT_TOP);
     uint32_t ep=v->ep;
-    for(int l=v->maxlevel;l>0;l--){ search_layer(v,q,ep,1,l,s); ep=hp_top(&s->W).id; }   /* upper layers: int8 rows */
+    if(!v->so) for(int l=v->maxlevel;l>0;l--){ search_layer(v,q,ep,1,l,s); ep=hp_top(&s->W).id; }   /* upper layers: int8 rows */
     Heap *W=&s->W; scr_next(s); W->n=0;
     const float k1 = s->eps>0 ? 1.0f+s->eps : 0.0f;
-    float d0 = -(float)sdot(v,q,vrow(v,ep)) / (v->gs*v->gs);          /* the entry point exactly, in cosine units */
     if(!s->bq && !(s->bq=kv_bq_new())) return 0; struct KvBq *BQ=s->bq; kv_bq_reset(BQ);
 #define KV_QG_KEEP(row) (!s->filt || ((!v->dead || !v->dead[row]) && s->filt(v->vid[row], s->fctx)))
     s->fvis=1;
-    visited(s,ep); kv_bq_push(BQ,d0,ep); if(KV_QG_KEEP(ep)) hp_push(W,d0,ep);
-    const int qgx = s->qgx<0 ? (g->P8 ? 2 : 0) : s->qgx;
+    int qgx_ = s->qgx<0 ? (g->P8 ? 2 : 0) : s->qgx;
+    if(v->so && qgx_ && !g->P8) qgx_ = 0;
+    if(v->so && qgx_==1) qgx_ = 2;
+    if(g->res) qgx_ = 2;
+    const int qgx = qgx_;
     const int shortr = qgx==2 && g->P8; const int cdn = shortr ? g->cd : 1; int8_t qp8[cdn]; float pinv=0;
     if(shortr){ float mx=0; for(int j=0;j<cdn;j++){ float a=fabsf(qp[j]); if(a>mx) mx=a; }
         float qs = mx>0 ? 127.0f/mx : 1.0f;
         for(int j=0;j<cdn;j++){ int t=(int)lrintf(qp[j]*qs); qp8[j]=(int8_t)(t < -127 ? -127 : (t > 127 ? 127 : t)); }
         pinv=1.0f/(qs*g->ps); }
+    if(v->so){
+        if(shortr){ int best=sdot_n(cdn,qp8,g->P8+(size_t)ep*cdn);
+            for(int l=v->maxlevel;l>0;l--) for(int moved=1; moved; ){ moved=0;
+                const uint32_t *lk=v->lu[ep]+(size_t)(l-1)*(v->M+1); uint32_t cnt=lk[0], to=ep; if(cnt>(uint32_t)v->M) cnt=(uint32_t)v->M;
+                for(uint32_t e=1;e<=cnt;e++) if(lk[e]<v->gN) __builtin_prefetch(g->P8+(size_t)lk[e]*cdn);
+                for(uint32_t e=1;e<=cnt;e++){ uint32_t nb=lk[e]; if(nb>=v->gN) continue;
+                    int d=sdot_n(cdn,qp8,g->P8+(size_t)nb*cdn); if(d>best){ best=d; to=nb; moved=1; } }
+                ep=to; } }
+        else ep=kv_so_upper(v, s->qf, ep); }
+    float d0 = v->so ? (shortr ? -(float)sdot_n(cdn,qp8,g->P8+(size_t)ep*cdn)*pinv : -kv_so_dot(v, s->qf, ep))
+                     : -(float)sdot(v,q,vrow(v,ep)) / (v->gs*v->gs);   /* the entry point exactly, in cosine units */
+    visited(s,ep); kv_bq_push(BQ,d0,ep); if(KV_QG_KEEP(ep)) hp_push(W,d0,ep);
     uint16_t sums[g->nblk*32];
     const size_t pfn=kv_qg_pfn_bytes(g->stride);
     const int P=(M+1)/2; uint8_t lutE[g->half ? P*16 : 1], lutO[g->half ? P*16 : 1];
@@ -2690,16 +2994,19 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
         for(uint32_t k=0;k<(uint32_t)g->nfull && k*32<cnt;k++) kv_qg_sum32(b+g->hdr+(size_t)k*M*16, s->lut, M, sums+k*32);
         if(g->half && cnt>full32) kv_qg_sum16(b+g->hdr+(size_t)g->nfull*M*16, lutE, lutO, P, sums+full32);
         float bound=sl_bound(W,ef,k1,1.0f);
+        const float *Bf = g->res ? (const float*)(b+g->bo) : NULL;
+#define KV_QG_EST(j) (Bf ? c.d - Bf[j]*(base+(float)sums[j]*invs) : -(base+(float)sums[j]*invs))
 #if defined(__AVX2__)
         { const __m256 vb=_mm256_set1_ps(-base), vi=_mm256_set1_ps(-invs), vbound=_mm256_set1_ps(bound);
           for(uint32_t k0=0;k0<cnt;k0+=32){ uint32_t mask=0, lim = cnt-k0<32 ? cnt-k0 : 32;
             for(uint32_t u=0;u<lim;u+=8){
                 __m256 dv=_mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(sums+k0+u)))),vi,vb);
+                if(Bf) dv=_mm256_fmadd_ps(_mm256_loadu_ps(Bf+k0+u),dv,_mm256_set1_ps(c.d));
                 mask |= (uint32_t)_mm256_movemask_ps(_mm256_cmp_ps(dv,vbound,_CMP_LT_OQ))<<u; }
             if(lim<32) mask &= (1u<<lim)-1;
             if(qgx){ uint32_t cand[32]; int nc=0; const float gg=v->gs*v->gs;
                 while(mask){ uint32_t j=k0+(uint32_t)__builtin_ctz(mask); mask&=mask-1;
-                    if(!(-(base+(float)sums[j]*invs)<bound)) continue;
+                    if(!(KV_QG_EST(j)<bound)) continue;
                     uint32_t nb=ids[j];
                     if(nb>=v->gN || visited(s,nb)) continue;
                     cand[nc++]=nb;
@@ -2714,7 +3021,7 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
                     if(W->n<ef){ hp_push(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); } else if(d<hp_top(W).d){ hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,1.0f); } }
                 continue; }
             while(mask){ uint32_t j=k0+(uint32_t)__builtin_ctz(mask); mask&=mask-1;
-                float d=-(base+(float)sums[j]*invs);
+                float d=KV_QG_EST(j);
                 if(!(d<bound)) continue;
                 uint32_t nb=ids[j];
                 if(nb>=v->gN || visited(s,nb)) continue;
@@ -2725,7 +3032,7 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
             } } }
 #else
         for(uint32_t j=0;j<cnt;j++){
-            float d=-(base+(float)sums[j]*invs);
+            float d=KV_QG_EST(j);
             if(!(d<bound)) continue;
             uint32_t nb=ids[j];
             if(nb>=v->gN || visited(s,nb)) continue;
@@ -2741,14 +3048,14 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
     if(m>s->tmpcap){ He *nt=realloc(s->tmp,sizeof(He)*(size_t)m); if(!nt) return 0; s->tmp=nt; s->tmpcap=m; }
     memcpy(s->tmp, W->a, sizeof(He)*(size_t)m);
     if(rescore8==1 && qgx && !shortr){ He *t=s->tmp; const float gg=v->gs*v->gs; for(int i=0;i<m;i++) t[i].d=(float)lrintf(t[i].d*gg); }
-    else if(rescore8==1 || (rescore8 && !qgx)){ He *t=s->tmp;
+    else if(!v->so && (rescore8==1 || (rescore8 && !qgx))){ He *t=s->tmp;
         for(int i=0;i<m;i++){ const int8_t *r=vrow(v,t[i].id); __builtin_prefetch(r); __builtin_prefetch(r+v->dim-1); }
         for(int i=0;i<m;i++) t[i].d=vdist(v,q,vrow(v,t[i].id)); }
     return m;
 }
 
 int kci_vec_half_floats(KciVec *v){
-    if(!v || !v->built || !v->keepf || !v->vf || v->vf_mmap || v->img || v->ffn || v->vh || v->gN!=v->count || v->count==0) return -1;
+    if(!v || !v->built || !v->keepf || !v->vf || v->vf_mmap || KV_RO(v) || v->ffn || v->vh || v->gN!=v->count || v->count==0) return -1;
     size_t n=v->count, hb=n*(size_t)v->dim*sizeof(uint16_t);
     uint16_t *h=kv_valloc(v, hb); if(!h) return -1;
     if(v->protect) kv_protect_region(h, hb);
@@ -2758,8 +3065,18 @@ int kci_vec_half_floats(KciVec *v){
     return 0;
 }
 
+int kci_vec_search_only(KciVec *v){
+    if(!v || !v->built || KV_RO(v) || !v->qg || v->qg->n!=v->count || v->gN!=v->count || v->count==0) return -1;
+    if(v->ivf || v->ql || v->vt || v->vf_mmap || v->ffn) return -1;        /* lists, learned lists, votes, floats elsewhere: they read the rows */
+    if(!v->vh && !(v->keepf && v->vf)) return -1;                          /* an exact pass is needed: halves or floats */
+    kv_vfree(v, v->vq, (size_t)v->cap*v->dim); v->vq=NULL;                 /* wiped */
+    kv_wipe(v->l0, (size_t)v->gcap*(v->M0+1)*sizeof(uint32_t)); free(v->l0); v->l0=NULL;
+    v->so=1;
+    return 0;
+}
+
 int kci_vec_set_float_source(KciVec *v, KciVecFloatFn fn, void *ctx, void (*ctx_free)(void *)){
-    if(!v || !fn || !v->ivf || v->built || v->vf_mmap || v->l2 || v->img) return -1;
+    if(!v || !fn || !v->ivf || v->built || v->vf_mmap || v->l2 || KV_RO(v)) return -1;
     if(v->ffree) v->ffree(v->fctx);
     v->ffn=fn; v->fctx=ctx; v->ffree=ctx_free;
     if(v->vf){ kv_wipe(v->vf, (size_t)v->cap*v->dim*sizeof(float));
@@ -2828,7 +3145,7 @@ static int kv_search_exact_(KciVec *v, const float *query, int k, int threads,
  * (realloc may move it), so they must not run concurrently with searches — pause
  * serving, batch the updates, resume. Bulk loads should still use add()+build(). */
 int64_t kci_vec_insert(KciVec *v, uint64_t id, const float *vec){
-    if(!v || (!v->built && !v->ivf) || v->img) return -1;
+    if(!v || (!v->built && !v->ivf) || KV_RO(v)) return -1;
     if(v->l2 && (v->ffn || !v->l2fin || !kv_l2_fits(v, vec))) return -1;
     if(v->ffn && !v->built){
         uint32_t i = v->count;
@@ -2843,11 +3160,13 @@ int64_t kci_vec_insert(KciVec *v, uint64_t id, const float *vec){
         return v->count;
     }
     if(!v->keepf || !v->vf || v->vf_mmap) return -2;   /* need retained, writable floats */
+    if(v->tw) kv_tw_drop(v, id);
     uint32_t i = v->count;
     if(kci_vec_reserve(v, i+1) != 0) return -1;   /* grows vq/vid/vf (keepf) */
     if(!v->built){
         if(kv_ensure_dead(v) != 0) return -1;
         store_float_norm(v, i, vec);
+        { int tw=kv_tw_insert(v, id, i); if(tw<0) return -1; if(tw) return v->count; }
         sq_encode(v, v->vf+(size_t)i*v->dim, v->vq+(size_t)i*v->dim);
         v->vid[i]=id; v->dead[i]=0; v->count=i+1;
         if(kv_ivf_add(v, i) != 0) return -1;
@@ -2856,6 +3175,7 @@ int64_t kci_vec_insert(KciVec *v, uint64_t id, const float *vec){
     }
     if(ensure_graph_cap(v, i+1) != 0) return -1;  /* grows level/l0/lu/lock/dead */
     store_float_norm(v, i, vec);                  /* vf[i] = unit(vec) */
+    { int tw=kv_tw_insert(v, id, i); if(tw<0) return -1; if(tw) return v->count; }
     sq_encode(v, v->vf+(size_t)i*v->dim, v->vq+(size_t)i*v->dim);
     v->vid[i] = id;
     v->dead[i] = 0;
@@ -2877,9 +3197,11 @@ int64_t kci_vec_insert(KciVec *v, uint64_t id, const float *vec){
 /* Tombstone the vector with caller id. Returns 0 on success, -1 if not found.
  * The node stays in the graph as a routing hop but is excluded from results. */
 int kci_vec_delete(KciVec *v, uint64_t id){
-    if(!v || (!v->built && !v->ivf) || v->img) return -1;
+    if(!v || (!v->built && !v->ivf) || KV_RO(v)) return -1;
+    if(v->tw && kv_tw_drop(v, id)) return 0;
     uint32_t idx = h_get(v, id);
     if(idx==KV_HEMPTY || idx>=v->count) return -1;
+    if(v->tw && !(v->dead && v->dead[idx]) && kv_tw_promote(v, id, idx)) return 0;   /* others share the row: one of them keeps it */
     if(v->dead && !v->dead[idx]){ v->dead[idx]=1; v->ndead++; }
     return 0;
 }
@@ -2921,8 +3243,12 @@ static int kv_ivf_recenter(KciVec *v, int c){
 }
 
 int kci_vec_forget(KciVec *v, uint64_t id){
-    if(!v || v->img) return -1;
+    if(!v || KV_RO(v)) return -1;
     if(v->built || v->vf_mmap) return -2;
+    if(v->tw){
+        if(kv_tw_drop(v, id)) return 1;
+        uint32_t ix=h_get(v, id);
+        if(ix!=KV_HEMPTY && ix<v->count && !(v->dead && v->dead[ix]) && kv_tw_promote(v, id, ix)) return 1; }
     if(v->ivf && (v->ivf->lr || (!v->vf && !v->ffn))) return -2;
     uint8_t *aff = v->ivf ? calloc((size_t)v->ivf->nlist, 1) : NULL;
     if(v->ivf && !aff) return -1;
@@ -2965,7 +3291,7 @@ int kci_vec_forget(KciVec *v, uint64_t id){
 uint32_t kci_vec_compact(KciVec *v){
     if(v){ v->rowgen++; kv_ql_free(v->ql); v->ql=NULL; kv_vt_free(v->vt); v->vt=NULL; }
     if(!v || (!v->built && !v->ivf)) return 0;
-    if(v->img) return v->count;
+    if(KV_RO(v)) return v->count;
     if(v->ndead==0) return v->count;
     if(!v->keepf || !v->vf) return v->count;      /* cannot rebuild without floats */
     uint32_t live=0; for(uint32_t i=0;i<v->count;i++) if(!v->dead[i]) live++;
@@ -2992,10 +3318,11 @@ uint32_t kci_vec_compact(KciVec *v){
         v->vid[i]=nid[i]; }
     v->count=live;
     kv_wipe(nf, (size_t)live*v->dim*sizeof(float)); free(nf); free(nid);
+    if(v->tw){ m64_free(&v->tw->con); v->tw->con_ok=0; }
     double secs;
     if(had_graph) kci_vec_build(v, 0, &secs);
     if(nl) kci_vec_build_ivf(v, nl, 0);
-    return v->count;
+    return v->count + (v->tw ? (uint32_t)v->tw->ntw : 0);
 }
 
 #define CC_ROT(x,n) (((x)<<(n))|((x)>>(32-(n))))
@@ -3104,6 +3431,7 @@ static int kv_verify_file(FILE *f, KvCmac *m){
 #define KV_FLAG_FLOAT_EXT 16u
 #define KV_FLAG_QG 64u
 #define KV_QG_SEC 0x4751564Bu      /* 'KVQG' */
+#define KV_TW_SEC 0x5754564Bu
 #define KV_FLAG_RAWKEY 32u
 #define KV_KC_TWEAK   0xFFFFFFFEu           /* keycheck CTR nonce (≠ payload chunks) */
 #define KV_LABEL_ENC  "KCIVEC05 encryption key"
@@ -3113,7 +3441,7 @@ int kci_vec_save(KciVec *v, const char *path, const uint8_t *key, int keylen){
     return kci_vec_save_ex(v, path, key, keylen, 0);
 }
 int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen, int sflags){
-    if(!v || kv_l2_fin(v)!=0) return -1;
+    if(!v || v->so || kv_l2_fin(v)!=0) return -1;
     int nofloat = (sflags & KCI_VEC_SAVE_NO_FLOAT) && v->vf && !v->vf_mmap;
     int rawkey = (sflags & KCI_VEC_SAVE_RAW_KEY) != 0;
     if(rawkey && (!key || keylen != 32)) return -1;
@@ -3135,13 +3463,16 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
     FILE *f=fopen(tmp,"wb");
     if(!f) return -1;
     const int wqg = v->built && v->qg && v->qg->n==v->count && v->count>0, wvh = v->built && v->vh && v->vhn==v->count && v->count>0;
+    const int wtw = v->dedup || (v->tw && v->tw->ntw);
     uint32_t flags = (io.kind?KV_FLAG_ENC:0) | (v->built?KV_FLAG_GRAPH:0) | (v->vf && !nofloat?KV_FLAG_FLOAT:0) | (v->ivf?KV_FLAG_IVF:0)
                    | (nofloat?KV_FLAG_FLOAT_EXT:0) | (rawkey && io.kind?KV_FLAG_RAWKEY:0) | (wqg || wvh ? KV_FLAG_QG : 0);
     uint32_t hdr[8] = { flags, (uint32_t)v->dim, (uint32_t)v->M, (uint32_t)v->efc,
                         v->count, v->built?(uint32_t)v->maxlevel:0, v->ep, 0 };
     memcpy(&hdr[7], &v->gs, sizeof(float));            /* global SQ scale */
     int ok=1;
-    ok &= kv_wraw(f, v->l2==2 ? (io.kind?KCIVEC_MAGIC9:KCIVEC_MAGIC8) : v->l2 ? (io.kind?KCIVEC_MAGIC7:KCIVEC_MAGIC6) : (io.kind?KCIVEC_MAGIC5:KCIVEC_MAGIC), 8, &io)==0;
+    { char m8[8]; memcpy(m8, v->l2==2 ? (io.kind?KCIVEC_MAGIC9:KCIVEC_MAGIC8) : v->l2 ? (io.kind?KCIVEC_MAGIC7:KCIVEC_MAGIC6) : (io.kind?KCIVEC_MAGIC5:KCIVEC_MAGIC), 8);
+      if(wtw){ m8[4]='T'; m8[5]='W'; }
+      ok &= kv_wraw(f, m8, 8, &io)==0; }
     ok &= kv_wraw(f, hdr, sizeof(hdr), &io)==0;
     if(v->l2){ uint32_t lh[6]={ (uint32_t)v->udim }; float p5[5]={ v->l2s, v->l2lam, v->l2ab, v->l2M2, v->l2me };
         memcpy(&lh[1], p5, sizeof p5);
@@ -3183,7 +3514,7 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
         const struct KvQg *g = wqg ? v->qg : NULL;
         uint32_t qh[12]={ KV_QG_SEC, (g ? 1u : 0u) | (g && g->P8 ? 2u : 0u) | (g && g->R8 && g->r8inv ? 4u : 0u) | (wvh ? 8u : 0u),
                           g ? (uint32_t)g->M : 0, g ? (uint32_t)g->dp : 0, g ? (uint32_t)g->nblk : 0, g ? (uint32_t)g->nfull : 0,
-                          g ? (uint32_t)g->half : 0, g ? (uint32_t)g->cd : 0, g ? (uint32_t)g->gd : 0, 0, 0, 0 };
+                          g ? (uint32_t)g->half : 0, g ? (uint32_t)g->cd : 0, g ? (uint32_t)g->gd : 0, g ? (uint32_t)g->res : 0, 0, 0 };
         uint64_t q8[2]={ g ? (uint64_t)g->stride : 0, g ? (uint64_t)g->hdr : 0 }; double qe = g ? g->eta : 0; float qp = g ? g->ps : 0;
         ok &= enc_fwrite(f, qh, sizeof qh, &io)==0 && enc_fwrite(f, q8, sizeof q8, &io)==0 && enc_fwrite(f, &qe, sizeof qe, &io)==0 && enc_fwrite(f, &qp, sizeof qp, &io)==0;
         if(g){ const size_t n=v->count, D=(size_t)v->dim;
@@ -3193,6 +3524,14 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
                        else ok &= enc_fwrite(f, g->R, D*(size_t)g->cd*sizeof(float), &io)==0;
                        if(g->P8) ok &= enc_fwrite(f, g->P8, n*(size_t)g->cd, &io)==0; } }
         if(wvh) ok &= enc_fwrite(f, v->vh, (size_t)v->count*v->dim*sizeof(uint16_t), &io)==0;
+    }
+    if(wtw){                                        /* 'KVTW', 0, groups, ids; then per group: the row's id, n, the n ids */
+        const struct KvTw *w=v->tw; uint64_t ng=w ? w->rep.n : 0, nt=w ? w->ntw : 0;
+        uint32_t th[2]={ KV_TW_SEC, 0 }; uint64_t t8[2]={ ng, nt };
+        ok &= enc_fwrite(f, th, sizeof th, &io)==0 && enc_fwrite(f, t8, sizeof t8, &io)==0;
+        if(w && ng){ uint32_t sz=1u<<w->rep.bits;
+            for(uint32_t s=0;s<sz && ok;s++) if(w->rep.st[s]==1){ uint64_t g=w->rep.val[s], rp=w->rep.k[s]; uint32_t n=w->n[g];
+                ok &= enc_fwrite(f, &rp, 8, &io)==0 && enc_fwrite(f, &n, 4, &io)==0 && enc_fwrite(f, w->ids[g], (size_t)n*8, &io)==0; } }
     }
     if(io.kind){ uint8_t tag[16]; kv_cmac_final(&io.mac,tag); ok &= fwrite(tag,16,1,f)==1; }
     memset(&io,0,sizeof io);
@@ -3206,6 +3545,8 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
 static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lflags){
     char magic[8]; uint32_t hdr[8];
     if(fread(magic,8,1,f)!=1) return NULL;
+    int twf = magic[4]=='T' && magic[5]=='W';
+    if(twf){ magic[4]='E'; magic[5]='C'; }
     int l2 = memcmp(magic,KCIVEC_MAGIC6,8)==0 || memcmp(magic,KCIVEC_MAGIC7,8)==0;
     if(memcmp(magic,KCIVEC_MAGIC8,8)==0 || memcmp(magic,KCIVEC_MAGIC9,8)==0) l2=2;
 #ifdef KCI_VEC_NO_L2
@@ -3342,9 +3683,10 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
         const size_t n=count, D=(size_t)dim;
         if(ok && (qh[1]&1)){
             struct KvQg *g=calloc(1,sizeof *g); ok = g!=NULL;
-            if(ok){ g->M=(int)qh[2]; g->dp=(int)qh[3]; g->nblk=(int)qh[4]; g->nfull=(int)qh[5]; g->half=(int)qh[6]; g->cd=(int)qh[7]; g->gd=(int)qh[8];
+            if(ok){ g->M=(int)qh[2]; g->dp=(int)qh[3]; g->nblk=(int)qh[4]; g->nfull=(int)qh[5]; g->half=(int)qh[6]; g->cd=(int)qh[7]; g->gd=(int)qh[8]; g->res=(int)qh[9];
                 g->D=dim; g->stride=(size_t)q8[0]; g->hdr=(size_t)q8[1]; g->eta=qe; g->ps=qp; g->n=count;
-                ok = qh[2]<=(1u<<16) && qh[4]<=64 && q8[0]<=((uint64_t)1<<24) && kv_qg_shape_ok(g, D, (size_t)v->M0)
+                g->bo=(size_t)4+4*(size_t)v->M0;
+                ok = qh[2]<=(1u<<16) && qh[4]<=64 && q8[0]<=((uint64_t)1<<24) && qh[9]<=1 && (!qh[9] || (qh[1]&2)) && kv_qg_shape_ok(g, D, (size_t)v->M0)
                   && ((qh[1]&6)==0 || g->cd) && (!(qh[1]&2) || (isfinite(g->ps) && g->ps>0));
                 if(ok){ g->blocks=kv_big_alloc(n*g->stride); g->pq=malloc((size_t)(g->M+1)*32*sizeof(float));
                     ok = g->blocks && g->pq && enc_fread(f, g->blocks, n*g->stride, io)==0 && enc_fread(f, g->pq, (size_t)(g->M+1)*32*sizeof(float), io)==0; }
@@ -3358,6 +3700,25 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
         if(ok && (qh[1]&8)){ size_t hb=n*D*sizeof(uint16_t);
             v->vh=kv_valloc(v, hb); v->vhn = v->vh ? count : 0;
             ok = v->vh && !v->vf && enc_fread(f, v->vh, hb, io)==0; }
+    }
+    if(ok && twf){
+        uint32_t th[2]; uint64_t t8[2];
+        ok = enc_fread(f, th, sizeof th, io)==0 && enc_fread(f, t8, sizeof t8, io)==0 && th[0]==KV_TW_SEC && th[1]==0
+          && t8[0]<=count && t8[1]<=((uint64_t)1<<32) && t8[0]<=t8[1];
+        if(ok){ struct stat st; if(fstat(fileno(f),&st)==0 && S_ISREG(st.st_mode) && t8[1]*8 > (uint64_t)st.st_size) ok=0; }
+        if(ok && !v->hval){ uint32_t bits=1; while((1u<<bits) < count*2u) bits++; ok = h_rebuild(v, bits)==0; }
+        v->dedup=1;
+        uint64_t seen=0;
+        for(uint64_t g=0; ok && g<t8[0]; g++){ uint64_t rp; uint32_t n;
+            ok = enc_fread(f, &rp, 8, io)==0 && enc_fread(f, &n, 4, io)==0 && n>0 && seen+n<=t8[1];
+            if(!ok) break;
+            uint32_t r=h_get(v, rp);
+            ok = r!=KV_HEMPTY && r<count && !(v->dead && v->dead[r]) && kv_tw_group(v, rp)<0 && !(v->tw && m64_get(&v->tw->tw, rp, NULL));
+            uint64_t *a = ok ? malloc((size_t)n*8) : NULL; ok = ok && a && enc_fread(f, a, (size_t)n*8, io)==0;
+            for(uint32_t j=0; ok && j<n; j++)
+                ok = h_get(v, a[j])==KV_HEMPTY && !(v->tw && (m64_get(&v->tw->tw, a[j], NULL) || m64_get(&v->tw->rep, a[j], NULL))) && kv_tw_add(v, rp, a[j])==0;
+            free(a); seen+=n; }
+        ok = ok && seen==t8[1];
     }
     memset(mk,0,32);
     if(!ok){ kci_vec_free(v); return NULL; }
@@ -3391,7 +3752,8 @@ typedef struct {
 } KvImgG;
 
 int kci_vec_image_save(const KciVec *v, const char *path){
-    if(!v || !path || v->vf_mmap) return -1;
+    if(!v || !path || v->vf_mmap || v->so) return -1;
+    if(v->tw && v->tw->ntw) return -1;
     if(v->l2 && !v->l2fin) return -1;
     const struct KvIvf *f = v->ivf;
     KvImg h; memset(&h, 0, sizeof h);
@@ -3426,7 +3788,7 @@ int kci_vec_image_save(const KciVec *v, const char *path){
         x.len[KVG_LEVEL]=n; x.len[KVG_L0]=n*(size_t)(v->M0+1)*sizeof(uint32_t);
         for(size_t i=0;i<n;i++) x.len[KVG_UP] += (uint64_t)v->level[i]*(v->M+1)*sizeof(uint32_t);
         if(g){ x.flags|=1u; x.qM=(uint32_t)g->M; x.qdp=(uint32_t)g->dp; x.qnblk=(uint32_t)g->nblk; x.qnfull=(uint32_t)g->nfull;
-            x.qhalf=(uint32_t)g->half; x.qcd=(uint32_t)g->cd; x.qgd=(uint32_t)g->gd; x.qstride=g->stride; x.qhdr=g->hdr; x.qeta=g->eta; x.qps=g->ps;
+            x.qhalf=(uint32_t)g->half; x.qcd=(uint32_t)g->cd; x.qgd=(uint32_t)g->gd; x.pad=(uint32_t)g->res; x.qstride=g->stride; x.qhdr=g->hdr; x.qeta=g->eta; x.qps=g->ps;
             x.len[KVG_BLOCKS]=n*g->stride; x.len[KVG_PQ]=(size_t)(g->M+1)*32*sizeof(float);
             if(g->cd){ if(g->R8 && g->r8inv){ x.len[KVG_R8]=D*(size_t)g->cd; x.len[KVG_R8INV]=(size_t)g->cd*sizeof(float); }
                        else x.len[KVG_R]=D*(size_t)g->cd*sizeof(float);
@@ -3512,16 +3874,17 @@ static int kv_img_graph(KciVec *v, const uint8_t *p, size_t len, uint64_t base){
     struct KvQg *g=NULL;
     if(ok && (x.flags&1)){
         g=calloc(1, sizeof *g); ok = g!=NULL;
-        if(ok){ g->ro=1; g->M=(int)x.qM; g->dp=(int)x.qdp; g->nblk=(int)x.qnblk; g->nfull=(int)x.qnfull; g->half=(int)x.qhalf; g->cd=(int)x.qcd; g->gd=(int)x.qgd;
+        if(ok){ g->ro=1; g->M=(int)x.qM; g->dp=(int)x.qdp; g->nblk=(int)x.qnblk; g->nfull=(int)x.qnfull; g->half=(int)x.qhalf; g->cd=(int)x.qcd; g->gd=(int)x.qgd; g->res=(int)x.pad; g->bo=(size_t)4+4*M0;
             g->D=(int)D; g->stride=(size_t)x.qstride; g->hdr=(size_t)x.qhdr; g->eta=x.qeta; g->ps=x.qps; g->n=(uint32_t)n;
             const int cd=g->cd;
-            ok = kv_qg_shape_ok(g, D, M0) && x.len[KVG_BLOCKS]==n*g->stride && x.len[KVG_PQ]==(size_t)(g->M+1)*32*sizeof(float);
+            ok = x.pad<=1 && kv_qg_shape_ok(g, D, M0) && x.len[KVG_BLOCKS]==n*g->stride && x.len[KVG_PQ]==(size_t)(g->M+1)*32*sizeof(float);
             if(ok && cd){
                 if(x.len[KVG_R8]){ ok = x.len[KVG_R8]==D*(size_t)cd && x.len[KVG_R8INV]==(size_t)cd*sizeof(float);
                     g->R8=(int8_t*)(p+x.off[KVG_R8]); g->r8inv=(float*)(p+x.off[KVG_R8INV]); }
                 else { ok = x.len[KVG_R]==D*(size_t)cd*sizeof(float); g->R=(float*)(p+x.off[KVG_R]); }
                 if(ok && x.len[KVG_P8]){ ok = x.len[KVG_P8]==n*(size_t)cd && isfinite(g->ps) && g->ps>0; g->P8=(int8_t*)(p+x.off[KVG_P8]); } }
             else if(ok) ok = !x.len[KVG_R] && !x.len[KVG_R8] && !x.len[KVG_P8];
+            if(ok && g->res && !g->P8) ok=0;
             g->blocks=(uint8_t*)(p+x.off[KVG_BLOCKS]); g->pq=(float*)(p+x.off[KVG_PQ]); }
     }
     if(ok && (x.flags&2)) ok = x.len[KVG_VH]==n*D*sizeof(uint16_t);
@@ -3672,7 +4035,7 @@ KciVec *kci_vec_thaw(const KciVec *a){
 }
 
 int64_t kci_vec_squeeze(KciVec *v){
-    if(!v || v->img) return -1;
+    if(!v || KV_RO(v)) return -1;
     if(v->built || !v->ivf) return -2;
     if(v->ndead==0 || !v->dead) return 0;
     struct KvIvf *f=v->ivf; size_t D=(size_t)v->dim; uint32_t n=v->count, live=0;
@@ -3750,7 +4113,7 @@ int kci_vec_plain_bytes(const KciVec *v, uint64_t out[6]){
 }
 
 int kci_vec_protect(KciVec *v){
-    if(!v || v->img) return -1;
+    if(!v || KV_RO(v)) return -1;
     int r = 3;                      /* bits that held for every buffer */
     v->protect = 1;
     size_t q_b = (size_t)v->cap * v->dim, ps = kv_pagesz();
@@ -3788,7 +4151,7 @@ int kci_vec_protect(KciVec *v){
 }
 
 int kci_vec_set_float(KciVec *v, uint64_t id, const float *vec){
-    if(!v || !vec || !v->keepf || !v->vf || v->vf_mmap || v->img || !kv_l2_fits(v, vec)) return -1;
+    if(!v || !vec || !v->keepf || !v->vf || v->vf_mmap || KV_RO(v) || !kv_l2_fits(v, vec)) return -1;
     uint32_t i = h_get(v, id);
     if(i==KV_HEMPTY || i>=v->count) return -1;
     store_float_norm(v, i, vec);
@@ -3796,7 +4159,7 @@ int kci_vec_set_float(KciVec *v, uint64_t id, const float *vec){
 }
 
 int kci_vec_get_float(const KciVec *v, uint32_t i, float *out){
-    if(!v || i>=v->count) return -1;
+    if(!v || i>=v->count || v->so) return -1;
     if(v->l2){
         const float *r = v->keepf && v->vf ? v->vf+(size_t)i*v->dim : NULL;
         if(r && !v->l2fin){ memcpy(out, r, (size_t)v->udim*sizeof(float)); return 0; }
@@ -3809,34 +4172,36 @@ int kci_vec_get_float(const KciVec *v, uint32_t i, float *out){
     return -1;
 }
 
-int kci_vec_search_r(KciVecSearcher *s, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
+static int kci_vec_search_r_0(KciVecSearcher *s, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
+    if(s && s->v->so) return -1;
     double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
     int r=kv_search_r_(s, query, k, ef, out_ids, out_scores);
     if(t) kv_l2_scores(s->v, r, out_scores, qn2);
     return r;
 }
-int kci_vec_search_rerank(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
+static int kci_vec_search_rerank_0(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
                           uint64_t *out_ids, float *out_scores){
     double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
     int r=kv_search_rerank_(s, query, k, ef, rerank_n, out_ids, out_scores);
     if(t) kv_l2_scores(s->v, r, out_scores, qn2);
     return r;
 }
-int kci_vec_search_filtered(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
+static int kci_vec_search_filtered_0(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
                             KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
     double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
     int r=kv_search_filtered_(s, query, k, ef, rerank_n, filt, ctx, out_ids, out_scores);
     if(t) kv_l2_scores(s->v, r, out_scores, qn2);
     return r;
 }
-int kci_vec_search_ivf(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
+static int kci_vec_search_ivf_0(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
                        uint64_t *out_ids, float *out_scores){
     double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
     int r=kv_search_ivf_(s, query, k, nprobe, rerank_n, out_ids, out_scores);
     if(t) kv_l2_scores(s->v, r, out_scores, qn2);
     return r;
 }
-int kci_vec_search_exact(KciVec *v, const float *query, int k, int threads, uint64_t *out_ids, float *out_scores){
+static int kci_vec_search_exact_0(KciVec *v, const float *query, int k, int threads, uint64_t *out_ids, float *out_scores){
+    if(v && v->so) return -1;
     if(v && v->l2){
         if(kv_l2_fin(v)!=0) return -1;
         float *b=malloc((size_t)v->dim*sizeof(float)); if(!b) return -1;
@@ -3864,7 +4229,7 @@ static int kv_qlf_cmp(const void *a, const void *b){ const KvQlP *x=a, *y=b;   /
 
 int kci_vec_learn(KciVec *v, const float *queries, uint32_t nq, const uint64_t *answers, int per_query,
                   int nclusters, int list_cap, int threads, float *out_top5){
-    if(!v || !queries || !answers || nq==0 || per_query<=0 || v->img || (!v->built && !v->ivf) || !v->hval) return -1;
+    if(!v || !queries || !answers || nq==0 || per_query<=0 || KV_RO(v) || (!v->built && !v->ivf) || !v->hval) return -1;
     int D=kci_vec_dim(v), T=default_threads(threads);
     if(nclusters<=0) nclusters=1024;
     if((uint32_t)nclusters>nq) nclusters=(int)nq;
@@ -3936,7 +4301,7 @@ int kci_vec_searcher_set_learned_pages(KciVecSearcher *s, int pages){ if(!s || p
 int kci_vec_searcher_set_learned_hot(KciVecSearcher *s, int rows){ if(!s || rows<0) return -1; s->lhot=rows; return 0; }
 
 int kci_vec_learn_pack(KciVec *v){
-    if(!v || !v->ql || v->ql->gen!=v->rowgen || !v->vf || v->img) return -1;
+    if(!v || !v->ql || v->ql->gen!=v->rowgen || !v->vf || KV_RO(v)) return -1;
     struct KvQl *g=v->ql; int D=v->dim; uint32_t N=v->count, tot=g->off[g->C]+g->hot;
     if(tot==0 || N==0) return -1;
     double *acc=calloc((size_t)D,sizeof(double)); float *mean=malloc((size_t)D*sizeof(float)), *smp=NULL;
@@ -4033,9 +4398,9 @@ static int kv_search_learned_(KciVecSearcher *s, const float *uq, const float *q
     s->s.seeds=NULL; s->s.nseeds=0; s->s.use_qg=uqg;
     return r;
 }
-int kci_vec_search_learned(KciVecSearcher *s, const float *query, int k, int nclusters, int per_list, int ef,
+static int kci_vec_search_learned_0(KciVecSearcher *s, const float *query, int k, int nclusters, int per_list, int ef,
                            uint64_t *out_ids, float *out_scores){
-    if(!s || !query || !out_ids) return -1;
+    if(!s || !query || !out_ids || s->v->so) return -1;
     if(!s->v->ql || s->v->ql->gen!=s->v->rowgen) return -2;
     const float *uq=query; double qn2=0; int t=kv_l2_qs(s, &query, &qn2);
     int r=kv_search_learned_(s, uq, query, k, nclusters, per_list, ef, out_ids, out_scores);
@@ -4050,7 +4415,7 @@ static void kv_vt_free(struct KvVt *g){ if(!g) return;
     if(g->ss) kv_wipe(g->ss, g->n*(size_t)g->sd);
     free(g->rows); free(g->si); free(g->ss); free(g); }
 int kci_vec_vote_set(KciVec *v, const uint64_t *answers, uint32_t nq, int per_query){
-    if(!v || !answers || nq==0 || per_query<=0 || v->img || (!v->built && !v->ivf) || !v->hval || !v->vf || !v->keepf) return -1;
+    if(!v || !answers || nq==0 || per_query<=0 || KV_RO(v) || (!v->built && !v->ivf) || !v->hval || !v->vf || !v->keepf) return -1;
     int D=v->dim; uint32_t N=v->count; if(N==0) return -1;
     struct KvVt *g=calloc(1,sizeof *g); double *acc=calloc((size_t)D,sizeof(double)); float *mean=malloc((size_t)D*sizeof(float)), *smp=NULL;
     if(!g || !acc || !mean){ free(g); free(acc); free(mean); return -1; }
@@ -4104,13 +4469,14 @@ int kci_vec_vote_short(KciVec *v, const uint64_t *ids, const float *rows, uint32
 }
 static int kv_search_voted_(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
                             int k, int rerank, uint64_t *out_ids, float *out_scores);
-int kci_vec_search_voted(KciVecSearcher *s, const float *query, const uint32_t *voters, int nvoters, int k, int rerank,
+static int kci_vec_search_voted_0(KciVecSearcher *s, const float *query, const uint32_t *voters, int nvoters, int k, int rerank,
                          uint64_t *out_ids, float *out_scores){
+    if(s && s->v->so) return -1;
     return kv_search_voted_(s, query, NULL, 0, voters, nvoters, k, rerank, out_ids, out_scores);
 }
-int kci_vec_search_voted_short(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
+static int kci_vec_search_voted_short_0(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
                                int k, int rerank, uint64_t *out_ids, float *out_scores){
-    if(!qshort || keep<1) return -1;
+    if(!qshort || keep<1 || (s && s->v->so)) return -1;
     return kv_search_voted_(s, query, qshort, keep, voters, nvoters, k, rerank, out_ids, out_scores);
 }
 static int kv_search_voted_(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
@@ -4171,6 +4537,85 @@ static int kv_search_voted_(KciVecSearcher *s, const float *query, const float *
     return r;
 }
 
-uint32_t kci_vec_count(const KciVec *v){ return v?v->count:0; }
+uint32_t kci_vec_count(const KciVec *v){ return v ? v->count + (v->tw ? (uint32_t)v->tw->ntw : 0) : 0; }
+
+typedef struct { uint64_t h; uint32_t i; } KvDupKey;
+static __thread const int8_t *kv_dup_rows; static __thread int kv_dup_dim;
+static int kv_dup_cmp_h(const void *a, const void *b){ uint64_t x=((const KvDupKey*)a)->h, y=((const KvDupKey*)b)->h; return x<y ? -1 : x>y; }
+static int kv_dup_cmp_row(const void *a, const void *b){
+    uint32_t x=((const KvDupKey*)a)->i, y=((const KvDupKey*)b)->i;
+    int c=memcmp(kv_dup_rows+(size_t)x*kv_dup_dim, kv_dup_rows+(size_t)y*kv_dup_dim, (size_t)kv_dup_dim);
+    return c ? c : (x<y ? -1 : x>y); }
+int kci_vec_dup_stats(const KciVec *v, uint64_t out[8]){
+    if(!v || !out || !v->vq || (!v->built && !v->ivf)) return -1;
+    for(int j=0;j<8;j++) out[j]=0;
+    uint32_t N=v->count, n=0; int dim=v->dim;
+    KvDupKey *k=(KvDupKey*)malloc(sizeof(KvDupKey)*((size_t)N+1)); if(!k) return -1;
+    for(uint32_t i=0;i<N;i++){
+        if(v->dead && v->dead[i]) continue;
+        const uint8_t *r=(const uint8_t*)v->vq+(size_t)i*dim; uint64_t h=0x9E3779B97F4A7C15ULL; int d=0;
+        for(; d+8<=dim; d+=8){ uint64_t w; memcpy(&w, r+d, 8); h=hmix(h^w)+0x9E3779B97F4A7C15ULL; }
+        for(; d<dim; d++) h=hmix(h^r[d])+1;
+        k[n].h=h; k[n].i=i; n++; }
+    qsort(k, n, sizeof(KvDupKey), kv_dup_cmp_h);
+    kv_dup_rows=v->vq; kv_dup_dim=dim;
+    uint64_t groups=0, in_groups=0, largest=0, over=0;
+    for(uint32_t a=0;a<n;){
+        uint32_t b=a+1; while(b<n && k[b].h==k[a].h) b++;
+        if(b-a>1){
+            qsort(k+a, b-a, sizeof(KvDupKey), kv_dup_cmp_row);
+            for(uint32_t s=a;s<b;){ uint32_t e=s+1;
+                while(e<b && memcmp(v->vq+(size_t)k[s].i*dim, v->vq+(size_t)k[e].i*dim, (size_t)dim)==0) e++;
+                if(e-s>1){ uint64_t g=e-s; groups++; in_groups+=g; if(g>largest) largest=g; if(g>(uint64_t)v->M0) over++; }
+                s=e; } }
+        a=b; }
+    free(k);
+    out[0]=n; out[1]=groups; out[2]=in_groups; out[3]=largest; out[4]=over; out[5]=(uint64_t)n-in_groups+groups;
+    if(v->tw){ out[6]=v->tw->ntw; out[7]=v->tw->rep.n; }
+    return 0;
+}
 int kci_vec_dim(const KciVec *v){ return v ? (v->l2 ? v->udim : v->dim) : 0; }
 int kci_vec_is_built(const KciVec *v){ return v?v->built:0; }
+
+#define KV_TW_S(s) ((s) ? (s)->v : NULL), ((s) ? (s)->uniq : 0)
+int kci_vec_searcher_set_unique(KciVecSearcher *s, int on){ if(!s) return -1; s->uniq = on?1:0; return 0; }
+int kci_vec_search(KciVec *v, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_0(v, query, k, ef, out_ids, out_scores);
+    return kv_tw_out(v, 0, NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_exact(KciVec *v, const float *query, int k, int threads, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_exact_0(v, query, k, threads, out_ids, out_scores);
+    return kv_tw_out(v, 0, NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_r(KciVecSearcher *s, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_r_0(s, query, k, ef, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_rerank(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_rerank_0(s, query, k, ef, rerank_n, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_ivf(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_ivf_0(s, query, k, nprobe, rerank_n, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_learned(KciVecSearcher *s, const float *query, int k, int nclusters, int per_list, int ef, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_learned_0(s, query, k, nclusters, per_list, ef, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_voted(KciVecSearcher *s, const float *query, const uint32_t *voters, int nvoters, int k, int rerank, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_voted_0(s, query, voters, nvoters, k, rerank, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_voted_short(KciVecSearcher *s, const float *query, const float *qshort, int keep, const uint32_t *voters, int nvoters,
+                               int k, int rerank, uint64_t *out_ids, float *out_scores){
+    kv_tw_depth++; int r=kci_vec_search_voted_short_0(s, query, qshort, keep, voters, nvoters, k, rerank, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
+/* with a filter: inside, a row passes when any id on it passes (kv_tw_filt); outside, only the ids that pass are given */
+int kci_vec_search_filtered(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n,
+                            KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
+    KvTwF w={ s ? s->v : NULL, filt, ctx };
+    int wrap = s && filt && s->v->tw && s->v->tw->ntw && kv_tw_depth==0;
+    kv_tw_depth++;
+    int r=kci_vec_search_filtered_0(s, query, k, ef, rerank_n, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), wrap ? filt : NULL, ctx, r, k, out_ids, out_scores); }
+int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
+                                KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
+    KvTwF w={ s ? s->v : NULL, filt, ctx };
+    int wrap = s && filt && s->v->tw && s->v->tw->ntw && kv_tw_depth==0;
+    kv_tw_depth++;
+    int r=kci_vec_search_ivf_filtered_0(s, query, k, nprobe, rerank_n, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
+    return kv_tw_out(KV_TW_S(s), wrap ? filt : NULL, ctx, r, k, out_ids, out_scores); }

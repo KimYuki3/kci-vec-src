@@ -72,10 +72,15 @@ def _bind(lib):
     s.kci_vec_keep_float.argtypes = [C.c_void_p, C.c_int]
     if hasattr(s, "kci_vec_half_floats"):
         s.kci_vec_half_floats.restype = C.c_int; s.kci_vec_half_floats.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_build_qg_res"):
+        s.kci_vec_build_qg_res.restype = C.c_int; s.kci_vec_build_qg_res.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int]
+    if hasattr(s, "kci_vec_search_only"):
+        s.kci_vec_search_only.restype = C.c_int; s.kci_vec_search_only.argtypes = [C.c_void_p]
     s.kci_vec_reserve.argtypes = [C.c_void_p, C.c_uint32]
     s.kci_vec_add.restype = C.c_int64;             s.kci_vec_add.argtypes = [C.c_void_p, C.c_uint64, c_f32p]
     s.kci_vec_build.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_double)]
-    s.kci_vec_build_fast.restype = C.c_int;        s.kci_vec_build_fast.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_double)]
+    if hasattr(s, "kci_vec_build_fast"):
+        s.kci_vec_build_fast.restype = C.c_int;    s.kci_vec_build_fast.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_double)]
     s.kci_vec_build_ivf_p.restype = C.c_int;       s.kci_vec_build_ivf_p.argtypes = [C.c_void_p, C.POINTER(_IvfParams)]
     s.kci_vec_searcher_new.restype = C.c_void_p;   s.kci_vec_searcher_new.argtypes = [C.c_void_p]
     s.kci_vec_searcher_free.argtypes = [C.c_void_p]
@@ -113,6 +118,11 @@ def _bind(lib):
     s.kci_vec_save.restype = C.c_int;              s.kci_vec_save.argtypes = [C.c_void_p, C.c_char_p, C.c_void_p, C.c_int]
     s.kci_vec_load.restype = C.c_void_p;           s.kci_vec_load.argtypes = [C.c_char_p, C.c_void_p, C.c_int]
     s.kci_vec_count.restype = C.c_uint32;          s.kci_vec_count.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_set_dedup"):             # identical vectors kept once
+        s.kci_vec_set_dedup.restype = C.c_int;     s.kci_vec_set_dedup.argtypes = [C.c_void_p, C.c_int]
+        s.kci_vec_searcher_set_unique.restype = C.c_int; s.kci_vec_searcher_set_unique.argtypes = [C.c_void_p, C.c_int]
+    if hasattr(s, "kci_vec_dup_stats"):             # exact copies among the rows
+        s.kci_vec_dup_stats.restype = C.c_int;     s.kci_vec_dup_stats.argtypes = [C.c_void_p, C.POINTER(C.c_uint64)]
     if hasattr(s, "kci_vec_plain_bytes"):
         s.kci_vec_plain_bytes.restype = C.c_int
         s.kci_vec_plain_bytes.argtypes = [C.c_void_p, C.POINTER(C.c_uint64)]
@@ -171,8 +181,9 @@ def _make_filter(filt):
 class KciVec:
     """One index."""
 
-    def __init__(self, dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, centre=False, _handle=None):
+    def __init__(self, dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, centre=False, _handle=None, dedup=False):
         self.lib = _lib()
+        self._unique = False
         self.dim = dim
         self.rerank = rerank
         if metric not in ("cosine", "l2", "ip"):
@@ -202,6 +213,11 @@ class KciVec:
                 raise RuntimeError("kci_vec_new failed (dim must be > 0; l2 / ip: max_norm >= 0)")
             if rerank:
                 self.lib.kci_vec_keep_float(self._v, 1)
+            # dedup=True: identical vectors are kept once, their ids beside the row (kci_vec_set_dedup). For data with
+            # texts that repeat: see dup_stats(). Searches still answer with every id; .unique = True gives one id per
+            if dedup:
+                if not hasattr(self.lib, "kci_vec_set_dedup") or self.lib.kci_vec_set_dedup(self._v, 1) != 0:
+                    raise RuntimeError("dedup=True is not available in this libkci_vec; rebuild it from the current kci_vec.c")
         self._s = None
         self._lists = False          # lists built (fast path)?
         self._dirty = False
@@ -234,6 +250,8 @@ class KciVec:
     def build(self, threads=0, fast=False):
         """Build the int8 HNSW graph."""
         secs = C.c_double(0.0)
+        if fast and not hasattr(self.lib, "kci_vec_build_fast"):
+            raise RuntimeError("this libkci_vec has no kci_vec_build_fast (built before 2026-11-20); rebuild it, or use build()")
         rc = (self.lib.kci_vec_build_fast if fast else self.lib.kci_vec_build)(self._v, threads, C.byref(secs))
         if fast and rc != 0:
             raise RuntimeError("kci_vec_build_fast failed (out of memory, or no vectors)")
@@ -241,14 +259,19 @@ class KciVec:
         self._searcher(reset=True)
         return secs.value
 
-    def build_qg(self, dims_per_code=1, threads=0, code_dims=0, gate_dims=0):
+    def build_qg(self, dims_per_code=1, threads=0, code_dims=0, gate_dims=0, residual=False):
         """Quantized graph lay layer 0 out as blocks of the neighbours' 4-bit codes, so a hop reads one block and scores
         every neighbour with table lookups. Dropped by insert() / compact() / build(); call again after. Returns the
         bytes it takes. code_dims > 0 the codes cover the top code_dims principal directions only (even, 8..dim-1), a
         smaller block per node."""
         if not hasattr(self.lib, "kci_vec_build_qg"):
             raise RuntimeError("this libkci_vec has no kci_vec_build_qg (rebuild the library)")
-        if int(gate_dims):
+        if residual:
+            if not hasattr(self.lib, "kci_vec_build_qg_res"):
+                raise RuntimeError("this libkci_vec has no kci_vec_build_qg_res (rebuild the library)")
+            if self.lib.kci_vec_build_qg_res(self._v, int(code_dims), int(gate_dims), int(threads)) != 0:
+                raise RuntimeError("kci_vec_build_qg_res failed (no graph yet? code_dims must be even, 8..dim-1, gate_dims even, 8..code_dims; out of memory?)")
+        elif int(gate_dims):
             if not hasattr(self.lib, "kci_vec_build_qg_gate"):
                 raise RuntimeError("this libkci_vec has no kci_vec_build_qg_gate (rebuild the library)")
             if self.lib.kci_vec_build_qg_gate(self._v, int(dims_per_code), int(code_dims), int(gate_dims), int(threads)) != 0:
@@ -331,12 +354,24 @@ class KciVec:
         if self._s:
             self.lib.kci_vec_searcher_set_qg_exact(self._s, self.qg_exact)
 
+    @property
+    def unique(self):
+        """With dedup=True: True = a search answers with one id per distinct vector (k results are k different
+        vectors); False (the default) = every id, the ids of one vector one after the other."""
+        return self._unique
+    @unique.setter
+    def unique(self, on):
+        self._unique = bool(on)
+        if getattr(self, "_s", None): self._searcher(reset=True)
+
     def _searcher(self, reset=False):
         if (reset or self._dirty) and self._s:
             self.lib.kci_vec_searcher_free(self._s); self._s = None
         self._dirty = False
         if not self._s:
             self._s = self.lib.kci_vec_searcher_new(self._v)
+            if self._unique and hasattr(self.lib, "kci_vec_searcher_set_unique"):
+                self.lib.kci_vec_searcher_set_unique(self._s, 1)
             if self.rerank_mode == "int8":
                 self.lib.kci_vec_searcher_set_rerank_int8(self._s, 1)
             if self.probe_gap[0] > 0:
@@ -571,6 +606,16 @@ class KciVec:
         if self.lib.kci_vec_half_floats(self._v) != 0:
             raise RuntimeError("kci_vec_half_floats failed (needs a built index with floats kept in RAM)")
 
+    def search_only(self):
+        """Give up what a quantized-graph search does not read — the int8 rows and the plain graph's layer-0 links
+        (kci_vec_search_only) — for an index that will only be searched. Needs build(), build_qg() and an exact pass
+        (half_floats(), or rerank > 0 at creation)."""
+        if not hasattr(self.lib, "kci_vec_search_only"):
+            raise RuntimeError("this libkci_vec has no kci_vec_search_only (rebuild the library)")
+        if self.lib.kci_vec_search_only(self._v) != 0:
+            raise RuntimeError("kci_vec_search_only failed (needs a built index with a quantized graph and halves or floats; no lists)")
+        self._searcher(reset=True)
+
     def plain_bytes(self):
         """Plaintext bytes of the index in RAM, by kind (kci_vec_plain_bytes): codes, floats, derived (centroids,
         codebooks), graph, ids, total. Allocated sizes; the last query in a searcher is not counted."""
@@ -580,6 +625,18 @@ class KciVec:
         return dict(zip(("codes", "floats", "derived", "graph", "ids", "total"), (int(x) for x in out)))
     @property
     def count(self): return self.lib.kci_vec_count(self._v)
+
+    def dup_stats(self):
+        """How many rows are exact copies of another row (a built index; kci_vec_dup_stats): a dict with rows, groups (of
+        2 or more identical rows), rows_in_groups, largest, groups_over_m0 (larger than the layer-0 neighbour list)
+        and distinct."""
+        if not hasattr(self.lib, "kci_vec_dup_stats"):
+            raise RuntimeError("this libkci_vec has no kci_vec_dup_stats; rebuild it from the current kci_vec.c")
+        out = (C.c_uint64 * 8)()
+        if self.lib.kci_vec_dup_stats(self._v, out) != 0:
+            raise RuntimeError("dup_stats: the index is not built (or its int8 rows were given up: search_only)")
+        return dict(rows=out[0], groups=out[1], rows_in_groups=out[2], largest=out[3], groups_over_m0=out[4], distinct=out[5],
+                    ids_beside_rows=out[6], rows_with_company=out[7])     # the last two: with dedup=True
     def is_built(self): return self.lib.kci_vec_is_built(self._v) != 0
     @property
     def has_lists(self): return self._lists

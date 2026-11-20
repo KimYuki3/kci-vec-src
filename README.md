@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.7: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.8: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -51,6 +51,7 @@ or over data that should not leave the machine.
   image that several processes can map.
 - A Python client (`clients/python`, ctypes + NumPy) with a small BM25 index for hybrid keyword + vector ranking.
 - An ANN-Benchmarks component (`integrations/ann-benchmarks`).
+- A PostgreSQL extension (`pg/`, a prototype, from 0.2.8): see "From PostgreSQL" below.
 
 **New in the source with 0.2.3:** the Euclidean (L2) index (`kci_vec_new_l2`) and the inner-product index (`kci_vec_new_ip`).
 The quantized graph now goes into both the read-only image and the encrypted save, so an opened index uses it as it is.
@@ -89,6 +90,51 @@ much weaker, replacing its model helps more than tuning the merge (rows 2 and 3 
 queries, `choose_weight` picks the weight (with 20 it sometimes picked a poor one).
 
 ---
+
+## From PostgreSQL (the extension in `pg/`, a prototype)
+
+KCI-Vec can be called from inside PostgreSQL as SQL functions (`CREATE EXTENSION kci_vec_pg`). Usage, the list of
+functions and the limits are in `pg/README.md`.
+
+- Changes of the table show in the next search. Searches work on a hot standby. The metric is cosine, L2 or inner
+  product. Tested on PostgreSQL 15 / 16 / 17.
+- **It is not written like pgvector.** Functions instead of `CREATE INDEX` and `<=>`.
+- **It is for a PostgreSQL you run yourself.** Managed services that do not let you install extensions cannot use it.
+- The extension's index file is not encrypted (it is protected as PostgreSQL's own table files are).
+
+Against pgvector 0.8.1's HNSW in the same PostgreSQL 16.15, on the same table, through the same SQL round trip
+(glove-100, 1.18 M rows, one connection, 10,000 queries, k = 10, Ryzen 7 8845HS, 2026-11-20, minimum to maximum of
+three alternating rounds):
+
+| | recall@10 | queries / s |
+|---|---|---|
+| KCI-Vec (nprobe 64 / rerank 200) | 0.9005 | 3,261–3,906 |
+| pgvector HNSW (ef_search 240) | 0.8947 | 199–210 |
+| KCI-Vec (nprobe 200 / rerank 600) | 0.9632 | 1,776–2,206 |
+| pgvector HNSW (ef_search 1000, its limit) | 0.9612 | 58–59 |
+
+The author's own measurement: one data set, one machine, one connection. L2 and inner-product indexes, several
+connections and filtered searches were not measured with this version. This compares the two inside PostgreSQL; do not
+combine it with the numbers under "Speed" above. Conditions: `pg/README.md`.
+
+## Options added in 0.2.8
+
+All are off by default; an index that does not ask for them is unchanged.
+
+- **Keeping identical vectors once** (`kci_vec_set_dedup`; `KciVec(dedup=True)` in Python): for data in which the same
+  text, or empty text, comes many times. A vector identical to one already there is stored once, and every id is
+  remembered. Searches answer with all the ids as before (`kci_vec_searcher_set_unique` gives one id per distinct
+  vector instead). Off by default; an index that does not ask is unchanged. A file saved with it cannot be read by
+  versions up to 0.2.7 (they refuse it). `kci_vec_dup_stats` (`dup_stats()` in Python) counts how many identical
+  vectors your data hold.
+- **A search-only index** (`kci_vec_search_only`; `search_only()` in Python): an index that is only searched through
+  its quantized graph gives up what those searches do not use, and takes less memory. One way: afterwards it cannot be
+  added to, deleted from, saved or rebuilt, so save it first.
+- **A memory-first quantized graph** (`kci_vec_build_qg_res`; `build_qg(code_dims=..., residual=True)` in Python): a
+  smaller form of the quantized graph. Files and images saved in this form cannot be read by versions up to 0.2.7
+  (they refuse them). In the author's own measurement (agnews, 1024 dimensions, one machine), together with the
+  search-only index above, the index took about 40 % less memory and recall did not drop. Not yet checked on other
+  data or in the VIBE flow.
 
 ## Compared with other products
 

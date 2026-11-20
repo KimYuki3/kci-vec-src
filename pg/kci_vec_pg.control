@@ -1,0 +1,5 @@
+# kci_vec_pg extension
+comment = 'KCI-Vec approximate nearest-neighbour search as SQL functions'
+default_version = '0.3'
+module_pathname = '$libdir/kci_vec_pg'
+relocatable = true

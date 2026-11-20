@@ -217,6 +217,13 @@ int kci_vec_build_qg_ex(KciVec *v, int dims_per_code, int code_dims, int threads
  * ranking inside the search stays as fine. Use it for the memory, with set_qg_exact(s, 2). Returns 0, or -1 (as
  * kci_vec_build_qg_ex, or a bad gate_dims). */
 int kci_vec_build_qg_gate(KciVec *v, int dims_per_code, int code_dims, int gate_dims, int threads);
+/* A quantized graph with residual codes: the memory-first form. Each neighbour is kept as its difference from the
+ * node on the first gate_dims of the code_dims principal directions (2 bits a dimension; gate_dims 0 = code_dims),
+ * with one scale per neighbour, so a neighbour takes gate_dims / 4 + 4 bytes. The search always scores with the
+ * short rows (as kci_vec_searcher_set_qg_exact(s, 2)); use it with kci_vec_search_rerank. code_dims as
+ * kci_vec_build_qg_ex (required, > 0). Saved and loaded like the other forms; a library older than this one
+ * refuses such a file. Returns 0, or -1 (as kci_vec_build_qg_ex, code_dims 0, or no memory for the short rows). */
+int kci_vec_build_qg_res(KciVec *v, int code_dims, int gate_dims, int threads);
 /* Bytes the quantized graph takes (0 = none). */
 int64_t kci_vec_qg_bytes(const KciVec *v);
 /* Search over the quantized graph (on = 1): kci_vec_search_r re-scores the result set with the int8 rows,
@@ -359,6 +366,15 @@ int     kci_vec_protect(KciVec *v);
 /* One way: the floats are wiped and freed. Returns 0, or -1 (not built, no resident floats, floats mapped from a
  * file, halves made already). */
 int     kci_vec_half_floats(KciVec *v);
+/* Search-only: for a built index with a quantized graph (kci_vec_build_qg*) and an exact pass (the halves of
+ * kci_vec_half_floats, or the retained floats), give up what a quantized-graph search does not read: the int8 rows
+ * (dim bytes a row) and the plain graph's layer-0 links. One way. Afterwards only kci_vec_search_rerank and
+ * kci_vec_search_filtered (with rerank_n > 0) work, over the quantized graph (a searcher set to the plain graph
+ * gets -1); kci_vec_search, _search_r, _search_exact, insert, delete, save, image_save, protect and every build
+ * return -1. Without short rows (no code_dims) the exact pass always covers the whole result set (rerank_n is
+ * taken as ef). To get the rest back, build the index again from the vectors. Returns 0, or -1 (not built, no
+ * quantized graph, no halves or floats, lists / learned lists / votes present, an attached image). */
+int     kci_vec_search_only(KciVec *v);
 
 /* How much of the index is plaintext in RAM, in bytes, by kind: out[0] vector codes (int8 rows, 4-bit / low-rank
  * list codes) out[1] floats kept in RAM (0 if mmap'd or absent; or the halves) out[2] derived from the vectors
@@ -373,6 +389,24 @@ int     kci_vec_plain_bytes(const KciVec *v, uint64_t out[6]);
 int      kci_vec_get_float(const KciVec *v, uint32_t i, float *out);
 
 uint32_t kci_vec_count(const KciVec *v);
+/* How many rows are exact copies of another row? Counted on the int8 rows of a built index (graph or lists),
+ * deleted rows left out. out[0] = live rows, out[1] = groups of 2 or more identical rows, out[2] = rows in those
+ * groups, out[3] = the largest group, out[4] = groups larger than the layer-0 neighbour list (2 M; such a group
+ * cannot even link all of its own members), out[5] = distinct rows (what is left when every group is kept once),
+ * out[6], out[7] = 0 (reserved). Returns 0, or -1 (NULL, not built, no int8 rows any more: after
+ * kci_vec_search_only; out of memory). Why look: texts that repeat (boilerplate, empty fields) give identical
+ * embeddings, and a graph search spends its steps inside such groups. When out[2] is more than a few percent of
+ * out[0], put identical rows in once (keep the list of their ids yourself) or search with a larger ef. */
+int      kci_vec_dup_stats(const KciVec *v, uint64_t out[8]);
+/* A filter sees every id. kci_vec_delete of an id that shares its vector removes the id only. kci_vec_count counts
+ * ids; kci_vec_dup_stats: out[6] = ids kept beside rows, out[7] = rows that have such ids (out[0..5] then count
+ * the rows, which hold no duplicates any more). Default 0: nothing changes for an index that does not ask. Needs
+ * the floats in memory while building (as the build does); an index with a float source or mmap'd floats is left
+ * as it is. kci_vec_save writes such an index with the ids, under a magic of its own (KCIVTW04 .. 09 for KCIVEC04
+ * .. An index loaded from such a file has dedup on. NOT YET: kci_vec_image_save refuses (-1) an index that holds
+ * such ids (the image has no place for them yet). Returns 0, or -1 (NULL, an attached image). */
+int      kci_vec_set_dedup(KciVec *v, int on);
+int      kci_vec_searcher_set_unique(KciVecSearcher *s, int on);
 int      kci_vec_dim(const KciVec *v);
 int      kci_vec_is_built(const KciVec *v);
 
