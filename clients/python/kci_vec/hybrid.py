@@ -122,6 +122,79 @@ def rrf(rankings, k=10, c=60.0, weights=None):
     return [(id, float(s), ranks[id]) for id, s in top]
 
 
+def mix(rankings, k=10, weights=None):
+    """Merge several [(id, score)] lists (best first) by score: fused(id) = sum_i w_i * s_i(id), where s_i is list
+    i's score stretched so that its first row is 1 and its last row is 0 (0 when list i does not hold id). The
+    same as kci_hybrid_mix in kci_sparse.h . Unlike rrf it uses how far apart the scores are. When one side is
+    much weaker than the other give it a small weight (see choose_weight); equal weights can then do worse than
+    the strong side alone. Returns [(id, fused, [rank_i or None ...])], best first."""
+    weights = weights or [1.0] * len(rankings)
+    fused, ranks = defaultdict(float), defaultdict(lambda: [None] * len(rankings))
+    for i, (lst, w) in enumerate(zip(rankings, weights)):
+        if not lst:
+            continue
+        hi, lo = lst[0][1], lst[-1][1]
+        span = hi - lo
+        for r, (id, s) in enumerate(lst):
+            if ranks[id][i] is not None:
+                continue
+            v = (s - lo) / span if span != 0 else 1.0
+            fused[id] += w * min(1.0, max(0.0, v))
+            ranks[id][i] = r + 1
+    top = sorted(fused.items(), key=lambda x: (-x[1], x[0]))[:k]
+    return [(id, float(s), ranks[id]) for id, s in top]
+
+
+def ndcg_at(ids, gains, k=10):
+    """(see the header for this function)"""
+    dcg = sum(gains.get(i, 0) / math.log2(r + 2) for r, i in enumerate(ids[:k]))
+    ideal = sorted((g for g in gains.values() if g > 0), reverse=True)[:k]
+    idcg = sum(g / math.log2(r + 2) for r, g in enumerate(ideal))
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def choose_weight(lists_a, lists_b, answers, k=10, method="mix", steps=10, prefer=None):
+    """Pick the weight of side a (side b gets 1 - weight) from a few queries whose right answers are known.
+
+    lists_a[q], lists_b[q]: the two [(id, score)] lists of query q (e.g. dense and sparse, the depth you will
+    use). answers[q]: the right ids of query q, a set / list or {id: grade}. method: "mix" (by score) or "rrf" (by
+    rank).
+
+    prefer=None: the weight with the highest mean (of equally good ones the middle one)."""
+    if len(lists_a) != len(lists_b) or len(lists_a) != len(answers) or not lists_a:
+        raise ValueError("choose_weight: the three inputs must have one entry per query (at least one)")
+    if method not in ("mix", "rrf"):
+        raise ValueError("choose_weight: method must be 'mix' or 'rrf'")
+    if prefer is not None and not 0.0 <= prefer <= 1.0:
+        raise ValueError("choose_weight: prefer must be between 0 and 1")
+    fuse = mix if method == "mix" else rrf
+    gains = [a if isinstance(a, dict) else {i: 1 for i in a} for a in answers]
+    ws = [s / steps for s in range(steps + 1)]
+    per = []                                        # per[weight][query]
+    for w in ws:
+        row = []
+        for la, lb, g in zip(lists_a, lists_b, gains):
+            if w == 0:   ids = [i for i, _ in lb[:k]]
+            elif w == 1: ids = [i for i, _ in la[:k]]
+            else:        ids = [i for i, _, _ in fuse([la, lb], k=k, weights=[w, 1 - w])]
+            row.append(ndcg_at(ids, g, k))
+        per.append(row)
+    n = len(gains)
+    table = [(w, sum(r) / n) for w, r in zip(ws, per)]
+    best = max(v for _, v in table)
+    if prefer is None:
+        good = [w for w, v in table if v >= best - 1e-12]
+        return good[len(good) // 2], table
+    bi = max(range(len(ws)), key=lambda i: table[i][1])
+    ok = []
+    for i in range(len(ws)):
+        d = [x - y for x, y in zip(per[bi], per[i])]
+        m = sum(d) / n
+        se = math.sqrt(sum((x - m) ** 2 for x in d) / (n - 1) / n) if n > 1 else 0.0
+        if m <= se: ok.append(ws[i])                # not clearly worse than the best
+    return min(ok, key=lambda w: (abs(w - prefer), w)), table
+
+
 def hybrid_search(vec, bm25, query_vec, query_text, k=10, depth=None, filter=None, w_vec=1.0, w_text=1.0, **search_kw):
     """Vector search (kci_vec.KciVec) + BM25 fused by RRF. depth: candidates taken from each side (default 4k).
     filter: a set of allowed ids (applied to both sides) or a callable id -> bool (vector side; BM25 filtered after).

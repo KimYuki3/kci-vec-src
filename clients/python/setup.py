@@ -11,24 +11,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))   # kci_vec.c / .h live at repo root
 
 
-def _compile_lib(dst_dir):
-    src = os.path.join(REPO, "kci_vec.c")
+def _compile_lib(dst_dir, name="kci_vec"):
+    src = os.path.join(REPO, name + ".c")
     if not os.path.exists(src):
-        raise SystemExit(f"kci_vec.c not found at {src}; build from the repo tree")
+        raise SystemExit(f"{name}.c not found at {src}; build from the repo tree")
     os.makedirs(dst_dir, exist_ok=True)
     cc = os.environ.get("CC") or ("gcc" if sys.platform == "win32" else "cc")
     mach = platform.machine().lower()
     if sys.platform == "win32":
-        out = os.path.join(dst_dir, "libkci_vec.dll")
+        out = os.path.join(dst_dir, "lib" + name + ".dll")
         cmd = [cc, "-O3", "-std=gnu11", "-march=native", "-mprefer-vector-width=256",
                "-shared", "-static", "-static-libgcc", "-I", REPO, "-o", out, src]
     else:
         ext = "dylib" if sys.platform == "darwin" else "so"
-        out = os.path.join(dst_dir, "libkci_vec." + ext)
+        out = os.path.join(dst_dir, "lib" + name + "." + ext)
         arch = ["-mcpu=native"] if ("arm" in mach or "aarch64" in mach) else ["-march=native", "-mprefer-vector-width=256"]
         cmd = [cc, "-O3", "-std=gnu11", *arch, "-shared", "-fPIC", "-I", REPO,
                "-o", out, src, "-lpthread", "-lm"]
-    print("kci_vec: building shared library:\n  " + " ".join(cmd))
+    print(name + ": building shared library:\n  " + " ".join(cmd))
     subprocess.check_call(cmd)
     return out
 
@@ -42,6 +42,8 @@ class BuildWithLib(build_py):
             print("kci_vec: KCI_VEC_PREBUILT set, bundling the prebuilt libraries")
             return
         _compile_lib(os.path.join(self.build_lib, "kci_vec"))
+        if os.path.exists(os.path.join(REPO, "kci_sparse.c")):
+            _compile_lib(os.path.join(self.build_lib, "kci_vec"), "kci_sparse")
 
 
 setup(cmdclass={"build_py": BuildWithLib})

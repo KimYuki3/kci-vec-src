@@ -29,3 +29,10 @@ echo "built $SHARED"
 
 $CC $OPT $MARCH -I. example_kci_vec.c libkci_vec.a -lpthread -lm -o example_kci_vec
 echo "built example_kci_vec"
+
+# (2026-11-19) the sparse index is its own file and its own library; the hybrid example links both.
+$CC $OPT $MARCH -c kci_sparse.c -o kci_sparse.o
+ar rcs libkci_sparse.a kci_sparse.o
+echo "built libkci_sparse.a"
+$CC $OPT $MARCH -I. example_hybrid.c libkci_vec.a libkci_sparse.a -lpthread -lm -o example_hybrid
+echo "built example_hybrid"

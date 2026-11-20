@@ -1,11 +1,11 @@
 # KCI-Vec — source
 
-**Fast, compact vector search you embed in your application.** One C file (`kci_vec.c`) and two headers (`kci_vec.h`, `kci_crypt.h`), no
+**Fast, compact vector search you embed in your application.** The dense index is one C file (`kci_vec.c`) and two headers (`kci_vec.h`, `kci_crypt.h`); no
 dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.5: cosine, Euclidean (L2) distance and inner product). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.6: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -54,6 +54,39 @@ or over data that should not leave the machine.
 
 **New in the source with 0.2.3:** the Euclidean (L2) index (`kci_vec_new_l2`) and the inner-product index (`kci_vec_new_ip`).
 The quantized graph now goes into both the read-only image and the encrypted save, so an opened index uses it as it is.
+
+---
+
+## Sparse index and hybrid search (experimental, from 0.2.6)
+
+An index for sparse vectors — documents as weighted terms, as produced by learned models such as SPLADE or by BM25 — is
+added as separate files, `kci_sparse.c` / `kci_sparse.h`. It is independent of the dense index (`kci_vec.c`); either can be used alone.
+
+- **What it does**: add, build and search sparse vectors; encrypted save (the same AES-256-CTR + CMAC as the dense index);
+  two ways to merge a dense and a sparse result into one ranking (by rank, `kci_hybrid_rrf`; by score, `kci_hybrid_mix`).
+  In Python: `kci_vec.sparse` and `kci_vec.hybrid`.
+- **Experimental**: function signatures and settings may change. Files written by a published version will stay readable by later versions.
+- **Limits**:
+  - The grouped search is approximate: the scores it returns are exact, but it can miss some of the top results (tune it with its settings).
+  - Rows added after the build (`kci_sparse_insert`) are scored one by one at every query until the index is rebuilt.
+  - With a vocabulary of 65,536 terms or more the index is larger and `kci_sparse_drop_rows` (which frees the original rows to save memory) is not available.
+  - Little-endian machines only. `global_cut` is for experiments; leave it at 0.
+- **Checked on**: Linux (gcc, clang), Windows (MinGW-w64, also as a DLL from Python), x86-64 without AVX2, aarch64 under an emulator.
+  Not checked on ARM hardware, macOS or MSVC. There is no SIMD code for ARM; plain C runs there.
+- **No text layer yet**: the model that turns text into sparse vectors is yours to choose and run.
+
+Whether merging helps depends on the data and on how strong the dense model is. nDCG@10 on public judged data, measured once each by the developer
+(both sides searched exhaustively, 100 results each, then merged; 648 queries for FiQA, 1,667 for JQaRA).
+
+| data (dense model / sparse model) | dense only | sparse only | merged by rank, equal weights | merged by score (weight chosen on 50 other queries) |
+|---|---|---|---|---|
+| BEIR FiQA (intfloat/multilingual-e5-small / naver/splade-cocondenser-ensembledistil) | 0.331 | 0.348 | 0.384 | 0.389 |
+| JQaRA (cl-nagoya/ruri-v3-30m / hotchpotch/japanese-splade-v2) | 0.584 | 0.606 | 0.633 | 0.643 |
+| JQaRA (intfloat/multilingual-e5-small / hotchpotch/japanese-splade-v2) | 0.479 | 0.606 | 0.573 | 0.609 |
+
+As the third row shows, merging with equal weights when the dense side is weak is worse than the sparse side alone. With a chosen weight it is no longer worse, but hardly better (0.606 to 0.609). When one side is
+much weaker, replacing its model helps more than tuning the merge (rows 2 and 3 differ only in the dense model). With about 50 judged
+queries, `choose_weight` picks the weight (with 20 it sometimes picked a poor one).
 
 ---
 
@@ -167,7 +200,7 @@ ScaNN's anisotropic loss, NGT's ε search).
 ## Build
 
 ```sh
-sh build_kci_vec.sh          # libkci_vec.a, libkci_vec.so (or .dylib) and ./example_kci_vec
+sh build_kci_vec.sh          # libkci_vec.a, libkci_vec.so (or .dylib), ./example_kci_vec, libkci_sparse.a and ./example_hybrid
 ./example_kci_vec
 ```
 

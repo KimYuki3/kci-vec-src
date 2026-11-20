@@ -1,10 +1,10 @@
 # KCI-Vec — ソース
 
-**アプリに組み込む、速くて軽いベクトル検索。** C の 1 ファイル (`kci_vec.c`) とヘッダ 2 つ (`kci_vec.h`、`kci_crypt.h`)、依存なし、サーバ不要。
+**アプリに組み込む、速くて軽いベクトル検索。** 密なベクトルの索引は C の 1 ファイル (`kci_vec.c`) とヘッダ 2 つ (`kci_vec.h`、`kci_crypt.h`)。依存なし、サーバ不要。
 
 *[English](README.md)* · **紹介ページ:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A#ja>
 
-このリポジトリは KCI-Vec の **ソース** です (版 0.2.5。cosine・ユークリッド (L2) 距離・内積)。評価用の wheel (pip で入る実行ファイル) は
+このリポジトリは KCI-Vec の **ソース** です (版 0.2.6。cosine・ユークリッド (L2) 距離・内積、実験的なスパースの索引)。評価用の wheel (pip で入る実行ファイル) は
 **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)** にあります。
 
 ---
@@ -53,6 +53,39 @@
 
 **版 0.2.3 から入ったもの:** ユークリッド (L2) 距離の索引 (`kci_vec_new_l2`) と内積の索引 (`kci_vec_new_ip`) のソース。
 量子化グラフは、読み取り専用の像と暗号化した保存の両方に入るようになり、開いた索引でそのまま使えます。
+
+---
+
+## スパースの索引とハイブリッド検索 (実験的、0.2.6 から)
+
+語ごとの重みで文書を表すスパースなベクトル (SPLADE などの学習済みモデルや BM25 の出力) の索引を、別のファイル
+`kci_sparse.c` / `kci_sparse.h` として足しました。密なベクトルの索引 (`kci_vec.c`) とは独立した部品で、片方だけでも使えます。
+
+- **できること**: スパースなベクトルの追加・索引づくり・検索、暗号化した保存 (密の索引と同じ AES-256-CTR + CMAC)、
+  密の結果とスパースの結果を 1 つの順位に合わせる 2 通り (順位で合わせる `kci_hybrid_rrf`、点数で合わせる `kci_hybrid_mix`)。
+  Python は `kci_vec.sparse` と `kci_vec.hybrid`。
+- **実験的です**: 関数の形と設定は今後変わることがあります。公開した版が書いたファイルは、後の版でも読めるようにします。
+- **制限**:
+  - まとまりを使う探し方は近似です。返る点数は正確ですが、上位を取りこぼすことがあります (設定で調整します)。
+  - 作ったあとに足した行 (`kci_sparse_insert`) は、作り直すまで毎回総当たりで測ります。
+  - 語彙が 65,536 以上のときは、索引が大きくなり、`kci_sparse_drop_rows` (元の行を手放してメモリを減らす) は使えません。
+  - little-endian の機械だけです。`global_cut` は実験用で、0 のままにしてください。
+- **確かめた環境**: Linux (gcc、clang)、Windows (MinGW-w64。DLL と Python からも)、AVX2 の無い x86-64、エミュレータ上の aarch64。
+  ARM の実機、macOS、MSVC では確かめていません。ARM 用の SIMD のコードは無く、素の C で動きます。
+- **文章を渡すだけの層はまだありません**: 文章をスパースなベクトルにするモデルは、利用者が選んで用意します。
+
+合わせると良くなるかは、データと、密の側のモデルの強さで変わります。公開されている判定つきのデータで、開発者が各 1 回測った nDCG@10 です
+(どちらの側も総当たりで 100 件ずつ取って合わせた値。質問は FiQA 648、JQaRA 1,667)。
+
+| データ (密のモデル / スパースのモデル) | 密だけ | スパースだけ | 順位で対等に合わせる | 点数で合わせる (重みは別の 50 問で選ぶ) |
+|---|---|---|---|---|
+| BEIR FiQA (intfloat/multilingual-e5-small / naver/splade-cocondenser-ensembledistil) | 0.331 | 0.348 | 0.384 | 0.389 |
+| JQaRA (cl-nagoya/ruri-v3-30m / hotchpotch/japanese-splade-v2) | 0.584 | 0.606 | 0.633 | 0.643 |
+| JQaRA (intfloat/multilingual-e5-small / hotchpotch/japanese-splade-v2) | 0.479 | 0.606 | 0.573 | 0.609 |
+
+3 行めのように、密の側が弱いときに対等に合わせると、スパースだけより悪くなります。重みを選べば下回りませんが、得はほとんどありません (0.606 → 0.609)。片側がずっと弱いときは、合わせ方を工夫するより、
+弱い側のモデルを替えるほうが効きます (2 行めと 3 行めの違いは密のモデルだけです)。重みは、判定つきの質問が 50 問ほどあれば
+`choose_weight` で決められます (20 問では、外れた重みを選ぶことがありました)。
 
 ---
 
@@ -160,7 +193,7 @@ k=100、索引作りも検索も 1 コア、各設定 5 回の最速。recall@10
 ## 組み立て
 
 ```sh
-sh build_kci_vec.sh          # libkci_vec.a、libkci_vec.so (または .dylib)、./example_kci_vec
+sh build_kci_vec.sh          # libkci_vec.a、libkci_vec.so (または .dylib)、./example_kci_vec、libkci_sparse.a、./example_hybrid
 ./example_kci_vec
 ```
 

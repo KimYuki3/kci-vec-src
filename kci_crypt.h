@@ -1,9 +1,9 @@
 /* kci_crypt.h — the standard primitives behind KCI-Vec's encrypted files, shared by kci_vec.c and
- * the library's other source files: SHA-256 (FIPS 180-4), HMAC-SHA256, PBKDF2-HMAC-SHA256, AES-256 (FIPS 197) in CTR mode,
+ * kci_sparse.c: SHA-256 (FIPS 180-4), HMAC-SHA256, PBKDF2-HMAC-SHA256, AES-256 (FIPS 197) in CTR mode,
  * AES-256-CMAC (NIST SP 800-38B), and a source of random salt.
  *
- * (2026-11-19) Before: these lived inside kci_vec.c as static functions, so another index
- * (a separate source file that does not include kci_vec) could not save an encrypted file without a second copy
+ * (2026-11-19) Before: these lived inside kci_vec.c as static functions, so the sparse index
+ * (kci_sparse.c, which does not include kci_vec) could not save an encrypted file without a second copy
  * of the same code. Now: moved here unchanged, byte for byte; both files include this header. Files
  * written before the move read as before (tests/test_crypto.c, tests/data/kcivec04_chacha.kv).
  * Everything is static: include it from one .c file per library, after <stdint.h>-style basics.
