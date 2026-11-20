@@ -4,7 +4,7 @@
 
 *[English](README.md)* · **紹介ページ:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A#ja>
 
-このリポジトリは KCI-Vec の **ソース** です (版 0.2.8。cosine・ユークリッド (L2) 距離・内積、実験的なスパースの索引)。評価用の wheel (pip で入る実行ファイル) は
+このリポジトリは KCI-Vec の **ソース** です (版 0.2.9。cosine・ユークリッド (L2) 距離・内積、実験的なスパースの索引)。評価用の wheel (pip で入る実行ファイル) は
 **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)** にあります。
 
 ---
@@ -73,7 +73,7 @@
   - little-endian の機械だけです。`global_cut` は実験用で、0 のままにしてください。
 - **確かめた環境**: Linux (gcc、clang)、Windows (MinGW-w64。DLL と Python からも)、AVX2 の無い x86-64、エミュレータ上の aarch64。
   ARM の実機、macOS、MSVC では確かめていません。ARM 用の SIMD のコードは無く、素の C で動きます。
-- **文章を渡すだけの層はまだありません**: 文章をスパースなベクトルにするモデルは、利用者が選んで用意します。
+- **文章を渡すだけで使うには**: 0.2.9 からの `kci_vec.text` (実験的、下の節) がモデルを動かします。スパースの索引だけを使うときは、文章をスパースなベクトルにするモデルを利用者が選んで用意します。
 
 合わせると良くなるかは、データと、密の側のモデルの強さで変わります。公開されている判定つきのデータで、開発者が各 1 回測った nDCG@10 です
 (どちらの側も総当たりで 100 件ずつ取って合わせた値。質問は FiQA 648、JQaRA 1,667)。
@@ -89,6 +89,33 @@
 `choose_weight` で決められます (20 問では、外れた重みを選ぶことがありました)。
 
 ---
+
+## 文章を渡すだけで探す (`kci_vec.text`、実験的)
+
+ベクトルを自分で用意しなくても、文章を渡せば探せます。
+
+    from kci_vec.text import TextIndex
+
+    ix = TextIndex("ja")                         # "ja" 日本語、"en" 英語
+    ix.add(["有給休暇は入社半年後に10日付与されます。", "経費の精算は月末締めです。"])
+    for hit in ix.search("有給は何日もらえる?", k=3):
+        print(hit.id, round(hit.score, 3), hit.text)
+    ix.save("my_index", key="passphrase")        # 索引も文章も暗号化して保存。あとで TextIndex.load("my_index", key="passphrase")
+
+- 文章と質問は、この機械の中で動く 2 つの言語モデルでベクトルに直します (意味を見るものと、言葉を見るもの)。
+  2 つの検索の結果を合わせて返します。モデルを最初に取ってきたあとは、外に何も送りません。
+- 長い文章は自動で分けて入れます。答えは文章の単位で、一番合った部分が `hit.text`、その場所が `hit.span` です。
+- **要るもの**: `pip install torch transformers`。日本語はさらに `fugashi unidic-lite`。最初に使うときにモデルを取ってきます (数百 MB)。
+- **既定のモデル** (各モデルのページの表示によるライセンス。使う前に自分でも確かめてください):
+  日本語 `cl-nagoya/ruri-v3-30m` (Apache-2.0) と `hotchpotch/japanese-splade-v2` (MIT)、
+  英語 `intfloat/multilingual-e5-small` (MIT) と `opensearch-project/opensearch-neural-sparse-encoding-v2-distill` (Apache-2.0)。
+  自分のモデルを使うこともできます (`TextIndex(dense=..., sparse=..., sparse_dim=...)`)。
+- **文章を入れるのは遅いです**: CPU だけで 1 秒に 4〜8 件ほど (1 万件で 20〜40 分)。探すのは質問 1 つ 0.07 秒ほどです (Ryzen 7 8845HS)。
+- **実験的です**: 関数の名前・引数・保存の形は変わることがあります。
+
+測った値 (nDCG@10、開発者自身の計測、各データ付属の正解): 英語 SciFact (文書 5,183、質問 300) で、意味だけ 0.673、言葉だけ 0.729、
+合わせて 0.736。日本語の論文の導入部 637 件 (JMTEB の NLP Journal、中央値 1,990 字) を論文の題名で探す 510 問で、0.956 / 0.942 / 0.970。
+データとモデルの組み合わせで変わります (同じデータを論文の要旨で探すと 0.990 / 0.959 / 0.983 で、意味だけのほうがわずかに上でした)。
 
 ## PostgreSQL から使う (拡張 `pg/`、試作)
 

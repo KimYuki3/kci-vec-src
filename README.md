@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.8: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.9: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -74,7 +74,7 @@ added as separate files, `kci_sparse.c` / `kci_sparse.h`. It is independent of t
   - Little-endian machines only. `global_cut` is for experiments; leave it at 0.
 - **Checked on**: Linux (gcc, clang), Windows (MinGW-w64, also as a DLL from Python), x86-64 without AVX2, aarch64 under an emulator.
   Not checked on ARM hardware, macOS or MSVC. There is no SIMD code for ARM; plain C runs there.
-- **No text layer yet**: the model that turns text into sparse vectors is yours to choose and run.
+- **Handing over texts**: from 0.2.9 `kci_vec.text` (experimental, below) runs the models for you. With the sparse index alone, the model that turns text into sparse vectors is yours to choose and run.
 
 Whether merging helps depends on the data and on how strong the dense model is. nDCG@10 on public judged data, measured once each by the developer
 (both sides searched exhaustively, 100 results each, then merged; 648 queries for FiQA, 1,667 for JQaRA).
@@ -90,6 +90,39 @@ much weaker, replacing its model helps more than tuning the merge (rows 2 and 3 
 queries, `choose_weight` picks the weight (with 20 it sometimes picked a poor one).
 
 ---
+
+## Search by handing over texts (`kci_vec.text`, experimental)
+
+No vectors of your own needed: hand over the texts and search them.
+
+    from kci_vec.text import TextIndex
+
+    ix = TextIndex("en")                         # "ja" Japanese, "en" English
+    ix.add(["Paid leave: 10 days after six months.", "Expense reports close at the end of the month."])
+    for hit in ix.search("how many days of paid leave?", k=3):
+        print(hit.id, round(hit.score, 3), hit.text)
+    ix.save("my_index", key="passphrase")        # the indexes and the texts are encrypted; later TextIndex.load("my_index", key="passphrase")
+
+- Texts and questions are turned into vectors by two language models that run on this machine (one for the meaning,
+  one for the words), and the results of the two searches are merged. After the models have been downloaded once,
+  nothing is sent anywhere.
+- Long texts are split by themselves. An answer is a text; the part that matched best is `hit.text`, its place
+  `hit.span`.
+- **Needs**: `pip install torch transformers`; for Japanese also `fugashi unidic-lite`. The first use downloads the
+  models (a few hundred MB).
+- **Built-in models** (licences as their model pages state them; check for yourself before relying on it):
+  Japanese `cl-nagoya/ruri-v3-30m` (Apache-2.0) and `hotchpotch/japanese-splade-v2` (MIT); English
+  `intfloat/multilingual-e5-small` (MIT) and `opensearch-project/opensearch-neural-sparse-encoding-v2-distill`
+  (Apache-2.0). Your own models can be passed instead (`TextIndex(dense=..., sparse=..., sparse_dim=...)`).
+- **Adding texts is slow**: about 4 to 8 texts a second on a CPU (20 to 40 minutes for 10,000). A question takes
+  about 0.07 s (Ryzen 7 8845HS).
+- **Experimental**: names, arguments and the saved form may change.
+
+Measured (nDCG@10, the author's own measurement, against each data set's judgements): English SciFact (5,183
+documents, 300 questions): meaning alone 0.673, words alone 0.729, merged 0.736. Japanese: 637 introductions of journal
+papers (JMTEB NLP Journal, median 1,990 characters) searched by the papers' titles, 510 questions: 0.956 / 0.942 / 0.970.
+It depends on the data and the models (the same texts searched by the papers' abstracts: 0.990 / 0.959 / 0.983, the
+meaning alone slightly ahead).
 
 ## From PostgreSQL (the extension in `pg/`, a prototype)
 
