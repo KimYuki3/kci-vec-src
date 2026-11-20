@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.6: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.7: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 

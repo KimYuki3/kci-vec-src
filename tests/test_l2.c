@@ -115,7 +115,10 @@ static void run_dim(int D, double lo, double hi){
     { float big[128]; for(int d=0;d<D;d++) big[d]=(float)(10.0*hi);   /* longer than anything added: refused */
       CHECK(kci_vec_insert(v, 50000, big)==-1, "insert longer than the scale refused");
       for(int d=0;d<D;d++) big[d]=(float)(lo*0.01/sqrt((double)D));   /* far shorter than the range fixed at the build */
-      CHECK(kci_vec_insert(v, 50001, big)==-1, "insert far shorter than the range refused");
+      CHECK(kci_vec_insert(v, 50001, big)>0, "insert far shorter than the lengths of the build is taken (wide range of lengths)");
+      { uint64_t one[1]; float os[1]; int m=kci_vec_search_exact(v, big, 1, 2, one, os);
+        CHECK(m==1 && one[0]==50001 && os[0]<1e-3f*(float)(hi*hi), "the short vector is its own nearest (id %llu, dist2 %g)", (unsigned long long)one[0], (double)os[0]); }
+      CHECK(kci_vec_delete(v, 50001)==0, "and can be deleted again");
       float *Y=malloc(sizeof(float)*(N+40)*D); memcpy(Y,X,sizeof(float)*N*D);
       unsigned char *dead=calloc(N+40,1); int n=N;
       for(int i=0;i<40;i++){ float *y=Y+(size_t)n*D; mkvec(y,D); for(int d=0;d<D;d++) y[d]*=0.9f;   /* within the range of lengths seen at the build */
@@ -140,6 +143,25 @@ static void run_dim(int D, double lo, double hi){
     v=kci_vec_new_l2(D, 16, 200, 25.0f);
     { float x[128]; for(int d=0;d<D;d++) x[d]=0; x[0]=24.0f; CHECK(kci_vec_add(v,1,x)==1, "add within max_norm");
       x[0]=26.0f; CHECK(kci_vec_add(v,2,x)==-1, "add longer than max_norm refused"); }
+    kci_vec_free(v);
+    v=kci_vec_new_l2(D, 16, 200, 0.0f); kci_vec_keep_float(v,1);
+    { float x[128]; int ok=1;
+      for(int i=0;i<2000;i++){ double n2=0, want=0.9+0.1*(i%11)/10.0; mkvec(x,D); for(int d=0;d<D;d++) n2+=(double)x[d]*x[d];
+          for(int d=0;d<D;d++) x[d]=(float)(x[d]/sqrt(n2)*want); ok &= kci_vec_add(v,(uint64_t)i+1,x)>0; }
+      CHECK(ok && kci_vec_build_ivf(v, 16, 2)==0, "narrow lengths: build");
+      for(int d=0;d<D;d++) x[d]=(float)(0.95/sqrt((double)D)); CHECK(kci_vec_insert(v, 70001, x)>0, "narrow lengths: a vector inside the range is taken");
+      for(int d=0;d<D;d++) x[d]=(float)(0.05/sqrt((double)D)); CHECK(kci_vec_insert(v, 70002, x)==-1, "narrow lengths: a far shorter vector is refused");
+      for(int d=0;d<D;d++) x[d]=(float)(3.0/sqrt((double)D));  CHECK(kci_vec_insert(v, 70003, x)==-1, "narrow lengths: a longer vector is refused"); }
+    kci_vec_free(v);
+    v=kci_vec_new_l2(D, 16, 200, 17.0f); kci_vec_keep_float(v,1);
+    { float x[128]; int ok=1;
+      for(int i=0;i<2000;i++){ mkvec(x,D); for(int d=0;d<D;d++) x[d]*=(float)(1+i%7)/(float)hi; ok &= kci_vec_add(v,(uint64_t)i+1,x)>0; }
+      for(int d=0;d<D;d++) x[d]=(float)(16.99/sqrt((double)D)); ok &= kci_vec_add(v, 9000, x)>0;
+      CHECK(ok && kci_vec_build_ivf(v, 16, 2)==0, "max_norm with one long vector: build");
+      for(int d=0;d<D;d++) x[d]=0; x[0]=0.001f; CHECK(kci_vec_insert(v, 9001, x)>0, "a vector shorter than any of the build is taken");
+      { uint64_t one[1]; float os[1]; CHECK(kci_vec_search_exact(v, x, 1, 2, one, os)==1 && one[0]==9001, "and found as its own nearest"); }
+      x[0]=0; CHECK(kci_vec_insert(v, 9002, x)>0, "the zero vector is taken");
+      x[0]=17.5f; CHECK(kci_vec_insert(v, 9003, x)==-1, "longer than max_norm is still refused"); }
     kci_vec_free(v);
     free(X); free(Q);
 }

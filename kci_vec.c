@@ -749,7 +749,9 @@ static int kv_l2_fits(const KciVec *v, const float *x){
     if(!(n2 <= 1.0+1e-5)) return 0;
     if(!v->l2fin || v->l2==2) return 1;
     double e=fabs(-n2/2 - v->l2ab);
-    return e <= v->l2me*(1.0+1e-4) + 1e-7;
+    if(e <= v->l2me*(1.0+1e-4) + 1e-7) return 1;
+    double le=(double)v->l2lam*e;
+    return (double)v->l2M2 - n2 - le*le >= 0.0;
 }
 static void kv_l2_row(const KciVec *v, const float *x, float *out){   /* out must not alias x */
     int D=v->udim; double s=v->l2s, n2=0;
