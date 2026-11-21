@@ -237,6 +237,32 @@ int main(void){
       printf("after insert / delete / compact: re-ranked recall at ef 100 against the original rows %.4f\n", f1);
       CHECK(f1 >= 0.93, "the index still answers (%.4f)", f1); }
 
+    { KciVec *g = kci_vec_new(DIM, 16, 200); kci_vec_keep_float(g, 1); kci_vec_set_dedup(g, 1);
+      for (int i = 0; i < total; i++) kci_vec_add(g, (uint64_t)i + 1, base + (size_t)i * DIM);
+      CHECK(kci_vec_build(g, 4, NULL) == 0 && kci_vec_build_qg(g, 1, 4) == 0, "dedup index + quantized graph");
+      KciVecSearcher *sg = kci_vec_searcher_new(g);
+      CHECK(kci_vec_searcher_set_qg(sg, 1) == 0, "the searcher uses the quantized graph");
+      double f = recall(sg, base, total, q, 200, 200, sc);
+      printf("quantized graph on the dedup index: re-ranked recall at ef 200 %.4f\n", f);
+      CHECK(f >= 0.97, "quantized graph: recall (%.4f)", f);
+      uint64_t ids[10]; float out[10]; int n, in;
+      for (int pass = 0; pass < 2; pass++){
+          for (int gi = 0; gi < 6; gi++){
+              n = kci_vec_search_rerank(sg, gvec + (size_t)gi * DIM, 10, 100, 100, ids, out); in = 0;
+              for (int i = 0; i < n; i++) in += grp[ids[i] - 1] == gi && out[i] > 0.9999f;
+              CHECK(n == 10 && in == 10, "%s: group %d as the query returns 10 of its ids (%d)", pass ? "search-only" : "quantized graph", gi, in); }
+          n = kci_vec_search_filtered(sg, gvec, 10, 200, 200, even_only, NULL, ids, out); in = 0;
+          for (int i = 0; i < n; i++) in += grp[ids[i] - 1] == 0 && (ids[i] & 1) == 0;
+          CHECK(n == 10 && in == 10, "%s: the filter sees every id (%d)", pass ? "search-only" : "quantized graph", in);
+          kci_vec_searcher_set_unique(sg, 1);
+          n = kci_vec_search_rerank(sg, gvec, 10, 100, 100, ids, out); in = 0;
+          for (int i = 0; i < n; i++) in += grp[ids[i] - 1] == 0;
+          CHECK(n == 10 && in == 1, "%s: unique gives one id of the group (%d)", pass ? "search-only" : "quantized graph", in);
+          kci_vec_searcher_set_unique(sg, 0);
+          if (pass == 0){ kci_vec_searcher_free(sg); CHECK(kci_vec_search_only(g) == 0, "search_only on the dedup index"); sg = kci_vec_searcher_new(g);
+              CHECK(kci_vec_count(g) == (uint32_t)total, "it still counts every id (%u)", kci_vec_count(g)); } }
+      kci_vec_searcher_free(sg); kci_vec_free(g); }
+
     kci_vec_searcher_free(s0); kci_vec_searcher_free(s1); kci_vec_free(off); kci_vec_free(on);
     free(base); free(q); free(sc); free(gvec); free(grp); free(gsize);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);

@@ -184,6 +184,14 @@ static void kv_vfree(const KciVec *v, void *p, size_t n){
     if(v->protect) kv_unlock_region(p, n);
     free(p);
 }
+static void kv_zero_lazy(void *p, size_t n){
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    size_t ps = kv_pagesz(); uintptr_t a = (uintptr_t)p, e = a + n, pa = (a + ps - 1) / ps * ps, pe = e / ps * ps;
+    if(pe > pa && pe - pa >= 64 * ps && madvise((void *)pa, pe - pa, MADV_DONTNEED) == 0){
+        memset(p, 0, pa - a); memset((void *)pe, 0, e - pe); return; }
+#endif
+    memset(p, 0, n);
+}
 
 /* ── id → index hash (open addressing, for delete-by-id) ─────────────────── */
 static inline uint64_t hmix(uint64_t x){ x^=x>>33; x*=0xff51afd7ed558ccdULL; x^=x>>33; return x; }
@@ -2975,6 +2983,12 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
     float d0 = v->so ? (shortr ? -(float)sdot_n(cdn,qp8,g->P8+(size_t)ep*cdn)*pinv : -kv_so_dot(v, s->qf, ep))
                      : -(float)sdot(v,q,vrow(v,ep)) / (v->gs*v->gs);   /* the entry point exactly, in cosine units */
     visited(s,ep); kv_bq_push(BQ,d0,ep); if(KV_QG_KEEP(ep)) hp_push(W,d0,ep);
+    for(int i=0;i<s->nseeds;i++){ uint32_t nb=s->seeds[i]; if(nb>=v->gN || visited(s,nb)) continue;
+        float d = v->so ? (shortr ? -(float)sdot_n(cdn,qp8,g->P8+(size_t)nb*cdn)*pinv : -kv_so_dot(v, s->qf, nb))
+                        : -(float)sdot(v,q,vrow(v,nb)) / (v->gs*v->gs);
+        if(kv_bq_push(BQ,d,nb)<0) return 0;
+        s->fvis++; if(!KV_QG_KEEP(nb)) continue;
+        if(W->n<ef) hp_push(W,d,nb); else if(d<hp_top(W).d) hp_replace_top(W,d,nb); }
     uint16_t sums[g->nblk*32];
     const size_t pfn=kv_qg_pfn_bytes(g->stride);
     const int P=(M+1)/2; uint8_t lutE[g->half ? P*16 : 1], lutO[g->half ? P*16 : 1];
@@ -3604,12 +3618,12 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
     if(flags & KV_FLAG_FLOAT){
         v->keepf=1; v->vf=kv_valloc(v, (size_t)v->cap*dim*sizeof(float));
         if(!v->vf){ kci_vec_free(v); return NULL; }
-        if(v->cap>count) memset(v->vf+(size_t)count*dim, 0, (size_t)(v->cap-count)*dim*sizeof(float));
+        if(v->cap>count) kv_zero_lazy(v->vf+(size_t)count*dim, (size_t)(v->cap-count)*dim*sizeof(float));
         ok &= enc_fread(f, v->vf, (size_t)count*dim*sizeof(float), io)==0;
     } else if(flags & KV_FLAG_FLOAT_EXT){                /* the caller fills the floats (kci_vec_set_float) */
         v->keepf=1; v->vf=kv_valloc(v, (size_t)v->cap*dim*sizeof(float));
         if(!v->vf){ kci_vec_free(v); return NULL; }
-        memset(v->vf, 0, (size_t)v->cap*dim*sizeof(float));
+        kv_zero_lazy(v->vf, (size_t)v->cap*dim*sizeof(float));
     }
     v->count=count; v->gs=gs;
     if(flags & KV_FLAG_GRAPH){
@@ -4393,9 +4407,9 @@ static int kv_search_learned_(KciVecSearcher *s, const float *uq, const float *q
             t[i].id=r; t[i].d=-fdot(dim, s->qf, v->vf+(size_t)r*dim); }
         return emit_topk(v, t, ns, k, 1.0f, out_ids, out_scores); }
     if(!v->built) return -1;                             /* seeds for the graph */
-    int uqg=s->s.use_qg; s->s.use_qg=0; s->s.seeds=s->lseed; s->s.nseeds=ns;
+    s->s.seeds=s->lseed; s->s.nseeds=ns;
     int r=kv_search_rerank_(s, query, k, ef, ef, out_ids, out_scores);
-    s->s.seeds=NULL; s->s.nseeds=0; s->s.use_qg=uqg;
+    s->s.seeds=NULL; s->s.nseeds=0;
     return r;
 }
 static int kci_vec_search_learned_0(KciVecSearcher *s, const float *query, int k, int nclusters, int per_list, int ef,

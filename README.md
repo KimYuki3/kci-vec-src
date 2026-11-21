@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.12: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.13: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -164,6 +164,13 @@ three alternating rounds):
 The author's own measurement: one data set, one machine, one connection. L2 and inner-product indexes, several
 connections and filtered searches were not measured with this version. This compares the two inside PostgreSQL; do not
 combine it with the numbers under "Speed" above. Conditions: `pg/README.md`.
+
+## Changed in 0.2.13
+
+- Loading a large saved index takes less memory (Linux).
+- `kci_vec_search_learned` (ef > 0) walks the quantized graph when the index has one. An index that has both a
+  quantized graph and learned lists answers differently from 0.2.12 (`kci_vec_searcher_set_qg(s, 0)` gives the
+  earlier behaviour).
 
 ## Options added in 0.2.8
 

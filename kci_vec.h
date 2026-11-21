@@ -288,7 +288,10 @@ int     kci_vec_set_float(KciVec *v, uint64_t id, const float *vec);
  * (1..64) nearest clusters, the first `per_list` vectors of each, then ef = 0 : those are scored exactly on the
  * kept floats and the best k returned. Fast; a query unlike the sample gets a poor answer, there is no fallback;
  * ef > 0 : they are added as starting points of the graph search (ef as in kci_vec_search_rerank, re-rank of the
- * ef best), so the graph completes what the lists miss. Needs the graph (kci_vec_build). ef < 0 : needs
+ * ef best), so the graph completes what the lists miss. Needs the graph (kci_vec_build). From 0.2.13, when the
+ * index also has a quantized graph (kci_vec_build_qg and its forms) and the searcher uses it, the walk goes over
+ * that graph; such an index answers differently from 0.2.12 (kci_vec_searcher_set_qg(s, 0) gives the earlier
+ * walk). ef < 0 : needs
  * kci_vec_learn_pack. The lists' own int8 copies are scanned in order and only the -ef best (150 - 500) are scored
  * exactly. The fastest form when a query reads thousands of list entries; like ef = 0 it has no fallback for a
  * query unlike the sample. kci_vec_learn_pack (after kci_vec_learn): gives every list an int8 copy of its vectors
