@@ -167,32 +167,32 @@ finally:
     shutil.rmtree(dtmp, ignore_errors=True)
 
 from kci_vec.text import CharBM25
-jt = ["アムロジピン錠5mgを1日1回朝食後に内服する。", "ロキソプロフェン錠60mgは疼痛時に頓用とする。", "HbA1cは7.2%で前回より改善した。",
-      "胸部X線で右下肺野に浸潤影を認める。", "ワルファリン内服中のためPT-INRを確認する。", "次回の外来は4週間後とする。"]
+jt = ["ボルトM8を締め付けトルク25Nmで固定する。", "ベアリング6204ZZは異音時に交換とする。", "稼働率は92.5%で前月より改善した。",
+      "外観検査で右下の溶接部に割れを認める。", "インバータ運転中のためRS-485を確認する。", "次回の点検は4週間後とする。"]
 jtexts = [jt[i % 6] + f" 記録番号{i}。" for i in range(300)]
 bx = TextIndex(dense=dense, sparse="bm25", lang="toy", verbose=False)
 bx.add(jtexts)
 # the word side alone first (the toy dense model knows no Japanese words: merged with it, its noise would decide between
 # the 50 texts that match equally)
 bs = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False); bs.add(jtexts)
-h = bs.search("ロキソプロフェン 頓用", k=5)
-check(isinstance(bs._sparse_fn, CharBM25) and len(h) == 5 and all(x.id % 6 == 1 for x in h) and h[0].sparse_rank == 1, "bm25: a drug name is found as written")
-h = bs.search("PT-INR", k=3)
+h = bs.search("ベアリング 異音", k=5)
+check(isinstance(bs._sparse_fn, CharBM25) and len(h) == 5 and all(x.id % 6 == 1 for x in h) and h[0].sparse_rank == 1, "bm25: a part name is found as written")
+h = bs.search("RS-485", k=3)
 check(len(h) == 3 and all(x.id % 6 == 4 for x in h), "bm25: an abbreviation with a hyphen")
 h = bs.search("記録番号137", k=1)
 check(h[0].id == 137, "bm25: a number")
-h = bx.search("ロキソプロフェン 頓用", k=5)
+h = bx.search("ベアリング 異音", k=5)
 check(h[0].id % 6 == 1 and h[0].sparse_rank == 1, "bm25 merged with a dense side: the best word match comes first")
 btmp = tempfile.mkdtemp(prefix="kci_text_b_")
 try:
-    before = [(x.id, round(x.score, 5)) for x in bx.search("ワルファリン PT-INR", k=6)]
+    before = [(x.id, round(x.score, 5)) for x in bx.search("インバータ RS-485", k=6)]
     bx.save(os.path.join(btmp, "b"), key="k")
     files = os.listdir(os.path.join(btmp, "b")); raw = b"".join(open(os.path.join(btmp, "b", f), "rb").read() for f in files)
-    check("sparse_state.bin" in files and "ワルファリン".encode("utf-8") not in raw, "bm25: its counts are saved (encrypted with the key), no text in the files")
+    check("sparse_state.bin" in files and "インバータ".encode("utf-8") not in raw, "bm25: its counts are saved (encrypted with the key), no text in the files")
     b2 = TextIndex.load(os.path.join(btmp, "b"), key="k", dense=dense, verbose=False)            # no sparse= given: the saved kind is made again
-    check(isinstance(b2._sparse_fn, CharBM25) and [(x.id, round(x.score, 5)) for x in b2.search("ワルファリン PT-INR", k=6)] == before and b2._sparse_fn.n == 300,
+    check(isinstance(b2._sparse_fn, CharBM25) and [(x.id, round(x.score, 5)) for x in b2.search("インバータ RS-485", k=6)] == before and b2._sparse_fn.n == 300,
           "bm25: load gives the same answers and the counts")
-    check(b2.add("エドキサバン錠30mgを開始する。") == [300] and b2.search("エドキサバン", k=1)[0].id == 300, "bm25: a loaded index takes a new term")
+    check(b2.add("サーボモータ30Wを取り付ける。") == [300] and b2.search("サーボモータ", k=1)[0].id == 300, "bm25: a loaded index takes a new term")
     try:
         TextIndex.load(os.path.join(btmp, "b"), key="wrong", dense=dense, verbose=False); check(False, "bm25: a wrong key is refused")
     except RuntimeError:
@@ -213,18 +213,18 @@ finally:
     shutil.rmtree(btmp, ignore_errors=True)
 
 from kci_vec.text import Cand
-# 200 texts made of the same character pairs in other orders ("内服" + "確認" pairs everywhere), one that holds the word itself
-pool = ["内確服認を行う。", "服内認確の予定。", "確内認服とした。", "認服確内である。"]
-ptexts = [pool[i % 4] * 3 + f" 番号{i}。" for i in range(200)] + ["本日より内服確認を開始する。経過は良好。"]
+# 200 texts made of the same character pairs in other orders ("点検" + "確認" pairs everywhere), one that holds the word itself
+pool = ["点確検認を行う。", "検点認確の予定。", "確点認検とした。", "認検確点である。"]
+ptexts = [pool[i % 4] * 3 + f" 番号{i}。" for i in range(200)] + ["本日より点検確認を開始する。経過は良好。"]
 pn = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False); pn.add(ptexts)
 pp = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False, phrase=True, phrase_depth=300); pp.add(ptexts)
-rn = [x.id for x in pn.search("内服確認", k=5)]; rp = [x.id for x in pp.search("内服確認", k=5)]
-check(rp[0] == 200 and pp.search("内服確認", k=1)[0].sparse_rank == 1, f"phrase: the text that holds the word as written comes first (without: place {rn.index(200) + 1 if 200 in rn else 'below 5'})")
+rn = [x.id for x in pn.search("点検確認", k=5)]; rp = [x.id for x in pp.search("点検確認", k=5)]
+check(rp[0] == 200 and pp.search("点検確認", k=1)[0].sparse_rank == 1, f"phrase: the text that holds the word as written comes first (without: place {rn.index(200) + 1 if 200 in rn else 'below 5'})")
 check([x.id for x in pp.search("番号37", k=1)] == [37] and pp.search("存在しない語句", k=3) is not None, "phrase: other questions still answer")
 ptmp = tempfile.mkdtemp(prefix="kci_text_p_")
 try:
     pp.save(os.path.join(ptmp, "p")); p2 = TextIndex.load(os.path.join(ptmp, "p"), verbose=False)
-    check(p2.phrase and p2.phrase_depth == 300 and [x.id for x in p2.search("内服確認", k=5)] == rp, "phrase: kept by save / load")
+    check(p2.phrase and p2.phrase_depth == 300 and [x.id for x in p2.search("点検確認", k=5)] == rp, "phrase: kept by save / load")
 finally:
     shutil.rmtree(ptmp, ignore_errors=True)
 # words the phrase match must not count: a list of the caller's, or the words that are common in the index
@@ -267,6 +267,22 @@ try:
     ix.search("password", k=3, rerank=lambda q, txs: [1.0]); check(False, "rerank=: a wrong number of scores is refused")
 except ValueError:
     check(True, "rerank=: a wrong number of scores is refused")
+
+for kind, kw in (("two toy models", dict(dense=dense, sparse=sparse, sparse_dim=VOC)), ("bm25", dict(dense=dense, sparse="bm25")),
+                 ("dense only", dict(dense=dense, mode="dense")), ("words only", dict(sparse="bm25", mode="sparse")),
+                 ("parts", dict(dense=dense, sparse=sparse, sparse_dim=VOC, chunk=120, dense_chunk=400)), ("dedup", dict(dense=dense, sparse="bm25", dedup=True))):
+    e = TextIndex(lang="toy", verbose=False, **kw)
+    e.add(["paid leave is ten days", "expenses close at the end of the month", "meeting rooms for two hours", "the extension is 1234", long_a])
+    ok = e.delete(3) and e.delete(4) and not e.delete(3)
+    try:
+        got = [x.id for x in e.search("paid leave", k=5)]; got2 = [x.id for x in e.search("the extension is 1234 quokka", k=5, filter=lambda i: True)]
+        check(ok and 3 not in got and 4 not in got and 3 not in got2 and 4 not in got2 and len(e) == 3 and got[0] == 0, f"delete before the first search ({kind})")
+    except Exception as ex:
+        check(False, f"delete before the first search ({kind}): {type(ex).__name__} {ex}")
+    check(e.add("the extension is 5678") == [5] and e.search("extension 5678", k=1)[0].id == 5 and e.delete(5) and all(x.id != 5 for x in e.search("extension 5678", k=3)),
+          f"add / delete after it still work ({kind})")
+e = TextIndex(dense=dense, sparse="bm25", lang="toy", verbose=False); e.add(["only one text"])
+check(e.delete(0) and len(e) == 0 and e.search("one text", k=3) == [], "delete the only text before any search: an empty index answers nothing")
 
 # one side only
 d = TextIndex(dense=dense, mode="dense", lang="toy", verbose=False); d.add(texts[:100])

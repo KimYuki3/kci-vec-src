@@ -4,7 +4,7 @@
 
 *[English](README.md)* · **紹介ページ:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A#ja>
 
-このリポジトリは KCI-Vec の **ソース** です (版 0.2.11。cosine・ユークリッド (L2) 距離・内積、実験的なスパースの索引)。評価用の wheel (pip で入る実行ファイル) は
+このリポジトリは KCI-Vec の **ソース** です (版 0.2.12。cosine・ユークリッド (L2) 距離・内積、実験的なスパースの索引)。評価用の wheel (pip で入る実行ファイル) は
 **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)** にあります。
 
 ---
@@ -91,6 +91,8 @@
 ---
 
 ## 文章を渡すだけで探す (`kci_vec.text`、実験的)
+
+はじめての方向けの手順は [docs/quickstart_text_ja.md](docs/quickstart_text_ja.md) にあります (入れる所から、保存して開き直す所まで)。
 
 ベクトルを自分で用意しなくても、文章を渡せば探せます。
 

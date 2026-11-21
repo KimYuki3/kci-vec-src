@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.11: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.12: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -92,6 +92,8 @@ queries, `choose_weight` picks the weight (with 20 it sometimes picked a poor on
 ---
 
 ## Search by handing over texts (`kci_vec.text`, experimental)
+
+Step by step for a first try: [docs/quickstart_text.md](docs/quickstart_text.md), from installing to saving and opening again.
 
 No vectors of your own needed: hand over the texts and search them.
 

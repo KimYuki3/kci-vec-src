@@ -358,10 +358,15 @@ class TextIndex:
         """Remove one text. Returns True when it was there."""
         id = int(id)
         if id not in self._ids: return False
+        if not self._built: self.build()
         for r in self._doc_rows.pop(id, []):
             side = self._side.pop(r, "b")
-            if self.vec is not None and side != "s": self.vec.delete(r); self._nside["d"] -= 1
-            if self.sps is not None and side != "d": self.sps.delete(r); self._nside["s"] -= 1
+            if self.vec is not None and side != "s":
+                if not self.vec.delete(r): raise RuntimeError(f"delete: the dense index did not take row {r} of text {id}")
+                self._nside["d"] -= 1
+            if self.sps is not None and side != "d":
+                self.sps.delete(r)                              # False for a part that had no words to index: nothing to remove
+                self._nside["s"] -= 1
             self._rows.pop(r, None)
         self._ids.discard(id); self.texts.pop(id, None)
         return True
