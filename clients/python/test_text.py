@@ -227,6 +227,20 @@ try:
     check(p2.phrase and p2.phrase_depth == 300 and [x.id for x in p2.search("内服確認", k=5)] == rp, "phrase: kept by save / load")
 finally:
     shutil.rmtree(ptmp, ignore_errors=True)
+# words the phrase match must not count: a list of the caller's, or the words that are common in the index
+ctexts = [f"顧客の対応について記載する。項目{i}。" for i in range(150)] + ["対応は不要。故障の修理を行う。", "顧客の対応。特記なし。故障なし。"] + [f"経過観察とする。番号{i}。" for i in range(150)]
+c0 = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False, phrase=True, phrase_depth=400); c0.add(ctexts)
+c1 = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False, phrase=True, phrase_depth=400, phrase_stop=["顧客", "対応"]); c1.add(ctexts)
+c2 = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False, phrase=True, phrase_depth=400, phrase_common=0.3); c2.add(ctexts)
+qq = "顧客の故障の修理の対応"
+t0 = [x.id for x in c0.search(qq, k=2)]; t1 = [x.id for x in c1.search(qq, k=2)]; t2 = [x.id for x in c2.search(qq, k=2)]
+check(t1[0] == 150 and t2[0] == 150, f"phrase_stop / phrase_common: the text with the rare words comes first once the everyday words are not counted (without: {t0}, stop list: {t1}, common: {t2})")
+ptmp2 = tempfile.mkdtemp(prefix="kci_text_p2_")
+try:
+    c1.save(os.path.join(ptmp2, "c")); c3 = TextIndex.load(os.path.join(ptmp2, "c"), verbose=False)
+    check(c3.phrase_stop == {"顧客", "対応"} and [x.id for x in c3.search(qq, k=2)] == t1, "phrase_stop is kept by save / load")
+finally:
+    shutil.rmtree(ptmp2, ignore_errors=True)
 cs = ix.candidates("how do I reset my password", depth_dense=20, depth_sparse=30)
 both = [c for c in cs if c.dense_rank and c.sparse_rank]; only_d = [c for c in cs if c.sparse_rank is None]; only_s = [c for c in cs if c.dense_rank is None]
 check(isinstance(cs[0], Cand) and len({c.id for c in cs}) == len(cs) and 30 <= len(cs) <= 50 and [c.sparse_rank for c in cs[:30]] == list(range(1, 31))
@@ -237,6 +251,18 @@ def by_number(q, txs):                              # a re-ranker of the caller:
 h = ix.search("password reset login account", k=3, rerank=by_number, depth_dense=20, depth_sparse=30)
 want = sorted((by_number("", [c.text])[0] for c in ix.candidates("password reset login account", 20, 30)), reverse=True)[:3]
 check([x.score for x in h] == want and h[0].text == ix.texts[h[0].id], "rerank=: the caller's function orders the candidates of both sides")
+# select=: a judge that chooses instead of scoring (a generating model shown a numbered list)
+base = ix.search("password reset login account", k=8)
+def pick(q, txs):                                   # names the 3rd and the 1st, then nonsense: out of range, twice, not a number
+    return [2, 0, 99, 2, "x", -1]
+h = ix.search("password reset login account", k=8, select=pick, select_from=5)
+check([x.id for x in h] == [base[2].id, base[0].id, base[1].id, base[3].id, base[4].id, base[5].id, base[6].id, base[7].id],
+      "select=: the texts it names go first in its order, the rest follow as they were, nonsense is ignored")
+shown = []
+h = ix.search("password reset login account", k=3, rerank=by_number, depth_dense=20, depth_sparse=30, select=lambda q, txs: (shown.append(len(txs)), [4])[1], select_from=6)
+r6 = ix.search("password reset login account", k=6, rerank=by_number, depth_dense=20, depth_sparse=30)
+check(shown == [6] and [x.id for x in h] == [r6[4].id, r6[0].id, r6[1].id], "select= after rerank=: it sees the re-ranker's best select_from, and k are returned")
+check([x.id for x in ix.search("password reset login account", k=4, select=lambda q, txs: [])] == [x.id for x in base[:4]], "select= that names nothing changes nothing")
 try:
     ix.search("password", k=3, rerank=lambda q, txs: [1.0]); check(False, "rerank=: a wrong number of scores is refused")
 except ValueError:

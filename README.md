@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.10: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.11: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -122,7 +122,10 @@ No vectors of your own needed: hand over the texts and search them.
   merging (with the place each side gave it); `ix.search(question, rerank=f)` orders them by `f(question, [texts]) ->
   scores`. No re-ranking model is included. With `sparse="bm25"`, `phrase=True` puts the parts in which the question's
   words stand as written first: for short records searched in the records' own words (on the author's data of Japanese
-  journal papers it did not improve the results; off by default).
+  journal papers and of quiz questions it did not improve the results; off by default). Words not to be counted:
+  `phrase_stop=[...]` or `phrase_common=share` (from 0.2.11). `ix.search(question, rerank=f, select=g)` shows the best after
+  re-ranking to `g(question, [texts]) -> positions, most useful first` and puts the chosen ones first (from 0.2.11; for a
+  judge that picks instead of scoring, such as a generating model shown a numbered list).
 - **Adding texts is slow**: about 4 to 8 texts a second on a CPU (20 to 40 minutes for 10,000). A question takes
   about 0.07 s (Ryzen 7 8845HS).
 - **Experimental**: names, arguments and the saved form may change.

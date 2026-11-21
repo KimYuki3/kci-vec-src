@@ -234,7 +234,8 @@ class TextIndex:
     characters two neighbouring parts may share (None = chunk // 8)."""
 
     def __init__(self, lang="ja", mode="hybrid", dense=None, sparse=None, sparse_dim=None, w_dense=None, keep_text=True, verbose=True,
-                 chunk=None, overlap=None, dense_chunk=None, dedup=False, device=None, phrase=False, phrase_depth=1000):
+                 chunk=None, overlap=None, dense_chunk=None, dedup=False, device=None, phrase=False, phrase_depth=1000,
+                 phrase_stop=None, phrase_common=None):
         if mode not in ("hybrid", "dense", "sparse"):
             raise ValueError("mode must be 'hybrid', 'dense' or 'sparse'")
         # dedup=True: texts that repeat (boilerplate, empty fields) are kept once on the dense side (kci_vec_set_dedup).
@@ -245,6 +246,10 @@ class TextIndex:
         self.dedup, self.device = bool(dedup), device
         # in which the question's own words stand as written come first (_phrase_order). Needs the texts (keep_text).
         self.phrase, self.phrase_depth = bool(phrase), int(phrase_depth)
+        # phrase_common = a share 0..1: a word whose character pairs all occur in more than this share of the texts is
+        # left out (counted from CharBM25's own counts, so only with sparse="bm25").
+        self.phrase_stop = set(unicodedata.normalize("NFKC", w).lower() for w in (phrase_stop or []))
+        self.phrase_common = None if phrase_common is None else float(phrase_common)
         if lang not in PRESETS and (dense is None or sparse is None) and not (mode == "dense" and dense) and not (mode == "sparse" and sparse):
             raise ValueError(f"lang must be one of {sorted(PRESETS)} (or pass your own dense= and sparse= functions)")
         self.lang, self.mode, self.keep_text, self.verbose = lang, mode, keep_text, verbose
@@ -414,18 +419,22 @@ class TextIndex:
     def _phrase_order(self, query, lst):
         """the word side's parts, those first in which the question's words stand as written. A word = a run of kanji, of
         katakana, or of Latin letters / digits, 2 characters or longer. A part's phrase score = the sum, over the
-        question's words it contains verbatim, of log(1 + parts looked at / parts that contain the word): a word few
-        parts contain counts more. Order: phrase score, then the BM25 score. The scores given on are phrase score +
-        BM25 / (largest BM25 + 1), so that the merge with the dense side keeps this order. Why: character-pair BM25
-        ranks by pairs, and a part can collect many of a question's pairs without holding any of its words."""
-        terms = sorted(set(m.group(0).lower() for m in _TERMS.finditer(unicodedata.normalize("NFKC", query))))
+        question's words it contains verbatim, of log(1 + parts looked at / (1 + parts that contain the word)): a word
+        few parts contain counts more. Words in phrase_stop, and with phrase_common the words that are common in the
+        whole index, are not counted at all. Order: phrase score, then the BM25 score. The scores given on are phrase
+        score + BM25 / (largest BM25 + 1), so that the merge with the dense side keeps this order. Why: character-pair
+        BM25 ranks by pairs, and a part can collect many of a question's pairs without holding any of its words."""
+        terms = sorted(set(m.group(0).lower() for m in _TERMS.finditer(unicodedata.normalize("NFKC", query))) - self.phrase_stop)
+        fn = self._sparse_fn
+        if self.phrase_common is not None and isinstance(fn, CharBM25) and fn.n:
+            terms = [tm for tm in terms if min((int(fn.df[s]) for s in fn._slots(tm)), default=0) <= self.phrase_common * fn.n]
         if not terms: return lst
         parts = []
         for r, s in lst:
             d, a, e = self._rows[r]; tx = self.texts.get(d)
             parts.append(unicodedata.normalize("NFKC", tx[a:e]).lower() if tx is not None else "")
         has = [[tm in px for px in parts] for tm in terms]
-        n = len(lst); w = [math.log(1.0 + n / c) if c else 0.0 for c in (sum(h) for h in has)]
+        n = len(lst); w = [math.log(1.0 + n / (1.0 + c)) if c else 0.0 for c in (sum(h) for h in has)]
         top = max(s for _, s in lst) + 1.0
         scored = [(sum(w[j] for j in range(len(terms)) if has[j][i]) + lst[i][1] / top, lst[i][0]) for i in range(n)]
         scored.sort(key=lambda x: -x[0])
@@ -458,9 +467,12 @@ class TextIndex:
         if e is None: e = len(tx) if tx is not None else None
         return Hit(d, score, None if tx is None else tx[a:e], dr, sr, (a, e))
 
-    def search(self, query, k=5, depth=100, filter=None, rerank=None, depth_dense=50, depth_sparse=100):
+    def search(self, query, k=5, depth=100, filter=None, rerank=None, depth_dense=50, depth_sparse=100, select=None, select_from=18):
         """The k best texts for a question: [Hit(id, score, text, dense_rank, sparse_rank, span)], best first. rerank: a
-        function (question, [texts]) -> one score per text, larger = better (a cross-encoder of your own)."""
+        function (question, [texts]) -> one score per text, larger = better (a cross-encoder of your own). select: a
+        function (question, [texts]) -> positions; it is shown
+        the best select_from texts (after rerank, or of the merged order), the ones it names go first in its order,
+        the rest follow as they were. Positions out of range or named twice are ignored."""
         if not isinstance(query, str): raise TypeError("search: the question must be a string")
         if not self._ids: return []
         if not self._built: self.build()
@@ -470,8 +482,13 @@ class TextIndex:
             if not cs: return []
             sc = [float(x) for x in rerank(query, [c.text for c in cs])]
             if len(sc) != len(cs): raise ValueError("the rerank function must return one score per text")
-            order = sorted(range(len(cs)), key=lambda j: -sc[j])[:k]
-            return [Hit(cs[j].id, sc[j], cs[j].text, cs[j].dense_rank, cs[j].sparse_rank, cs[j].span) for j in order]
+            order = sorted(range(len(cs)), key=lambda j: -sc[j])
+            hits = [Hit(cs[j].id, sc[j], cs[j].text, cs[j].dense_rank, cs[j].sparse_rank, cs[j].span) for j in order[:max(int(k), int(select_from)) if select else int(k)]]
+            return self._select(query, hits, select, select_from)[:k] if select else hits
+        if select is not None:
+            if not self.keep_text: raise RuntimeError("search: select= needs the texts (keep_text=True)")
+            hits = self.search(query, k=max(int(k), int(select_from)), depth=depth, filter=filter)
+            return self._select(query, hits, select, select_from)[:k]
         depth = max(int(depth), int(k))
         dl, sl, dp, sp = self._lists(query, depth, filter)
         if dl is None or sl is None:
@@ -481,6 +498,17 @@ class TextIndex:
         elif self.w_dense <= 0.0: merged = [(i, s, [None, r + 1]) for r, (i, s) in enumerate(sl[:k])]
         else:                     merged = mix([dl, sl], k=k, weights=[self.w_dense, 1.0 - self.w_dense])
         return [self._hit(i, s, r[0], r[1], dp, sp) for i, s, r in merged]
+
+    @staticmethod
+    def _select(query, hits, select, select_from):
+        shown = hits[:max(int(select_from), 0)]
+        if not shown: return hits
+        picked, seen = [], set()
+        for pos in select(query, [h.text for h in shown]):
+            try: pos = int(pos)
+            except (TypeError, ValueError): continue
+            if 0 <= pos < len(shown) and pos not in seen: seen.add(pos); picked.append(pos)
+        return [shown[j] for j in picked] + [h for j, h in enumerate(hits) if j not in seen]
 
     def tune(self, questions, answers, k=10, depth=100):
         """Check the dense side's weight against questions whose right answers you know, and move it when another weight
@@ -530,6 +558,7 @@ class TextIndex:
                     sparse=getattr(self._sparse_fn, "name", None) or self._preset.get("sparse"), sparse_dim=self._sparse_dim,
                     chunk=self.chunk, dense_chunk=self.dense_chunk, overlap=self.overlap, row_next=self._row_next,
                     sparse_state=has_state, dedup=self.dedup, phrase=self.phrase, phrase_depth=self.phrase_depth,
+                    phrase_stop=sorted(self.phrase_stop), phrase_common=self.phrase_common,
                     rows=[[r, d, a, e, self._side.get(r, "b")] for r, (d, a, e) in sorted(self._rows.items())])
         with open(os.path.join(path, "meta.json"), "w", encoding="utf-8") as f: json.dump(meta, f)
         return with_text
@@ -550,7 +579,8 @@ class TextIndex:
         ix = cls(meta["lang"], mode=meta["mode"], dense=dense, sparse=sparse, sparse_dim=meta.get("sparse_dim"),
                  w_dense=meta["w_dense"], verbose=verbose, chunk=meta.get("chunk", 0), overlap=meta.get("overlap"),
                  dense_chunk=meta.get("dense_chunk", meta.get("chunk", 0)), dedup=bool(meta.get("dedup", False)), device=device,
-                 phrase=bool(meta.get("phrase", False)), phrase_depth=int(meta.get("phrase_depth", 1000)))
+                 phrase=bool(meta.get("phrase", False)), phrase_depth=int(meta.get("phrase_depth", 1000)),
+                 phrase_stop=meta.get("phrase_stop"), phrase_common=meta.get("phrase_common"))
         if meta.get("sparse_state"):
             if not hasattr(ix._sparse_fn, "load_state"): raise RuntimeError("load: this index needs the sparse function it was made with (its counts were saved)")
             try:
