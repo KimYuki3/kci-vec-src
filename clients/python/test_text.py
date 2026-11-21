@@ -166,6 +166,82 @@ try:
 finally:
     shutil.rmtree(dtmp, ignore_errors=True)
 
+from kci_vec.text import CharBM25
+jt = ["アムロジピン錠5mgを1日1回朝食後に内服する。", "ロキソプロフェン錠60mgは疼痛時に頓用とする。", "HbA1cは7.2%で前回より改善した。",
+      "胸部X線で右下肺野に浸潤影を認める。", "ワルファリン内服中のためPT-INRを確認する。", "次回の外来は4週間後とする。"]
+jtexts = [jt[i % 6] + f" 記録番号{i}。" for i in range(300)]
+bx = TextIndex(dense=dense, sparse="bm25", lang="toy", verbose=False)
+bx.add(jtexts)
+# the word side alone first (the toy dense model knows no Japanese words: merged with it, its noise would decide between
+# the 50 texts that match equally)
+bs = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False); bs.add(jtexts)
+h = bs.search("ロキソプロフェン 頓用", k=5)
+check(isinstance(bs._sparse_fn, CharBM25) and len(h) == 5 and all(x.id % 6 == 1 for x in h) and h[0].sparse_rank == 1, "bm25: a drug name is found as written")
+h = bs.search("PT-INR", k=3)
+check(len(h) == 3 and all(x.id % 6 == 4 for x in h), "bm25: an abbreviation with a hyphen")
+h = bs.search("記録番号137", k=1)
+check(h[0].id == 137, "bm25: a number")
+h = bx.search("ロキソプロフェン 頓用", k=5)
+check(h[0].id % 6 == 1 and h[0].sparse_rank == 1, "bm25 merged with a dense side: the best word match comes first")
+btmp = tempfile.mkdtemp(prefix="kci_text_b_")
+try:
+    before = [(x.id, round(x.score, 5)) for x in bx.search("ワルファリン PT-INR", k=6)]
+    bx.save(os.path.join(btmp, "b"), key="k")
+    files = os.listdir(os.path.join(btmp, "b")); raw = b"".join(open(os.path.join(btmp, "b", f), "rb").read() for f in files)
+    check("sparse_state.bin" in files and "ワルファリン".encode("utf-8") not in raw, "bm25: its counts are saved (encrypted with the key), no text in the files")
+    b2 = TextIndex.load(os.path.join(btmp, "b"), key="k", dense=dense, verbose=False)            # no sparse= given: the saved kind is made again
+    check(isinstance(b2._sparse_fn, CharBM25) and [(x.id, round(x.score, 5)) for x in b2.search("ワルファリン PT-INR", k=6)] == before and b2._sparse_fn.n == 300,
+          "bm25: load gives the same answers and the counts")
+    check(b2.add("エドキサバン錠30mgを開始する。") == [300] and b2.search("エドキサバン", k=1)[0].id == 300, "bm25: a loaded index takes a new term")
+    try:
+        TextIndex.load(os.path.join(btmp, "b"), key="wrong", dense=dense, verbose=False); check(False, "bm25: a wrong key is refused")
+    except RuntimeError:
+        check(True, "bm25: a wrong key is refused")
+    # dedup: the same text many times is one row on the dense side, and every id still answers
+    dd = TextIndex(dense=dense, sparse="bm25", lang="toy", verbose=False, dedup=True)
+    rep = ["特記事項なし。"] * 120 + [jtexts[i] for i in range(180)]
+    dd.add(rep)
+    hits = dd.search("特記事項なし", k=10)
+    st = dd.vec.dup_stats()
+    check(st["ids_beside_rows"] == 119 and st["rows"] == 181 and len(dd) == 300 and len(hits) == 10 and all(x.id < 120 for x in hits) and len({x.id for x in hits}) == 10,
+          f"dedup: 120 copies are one dense row, and 10 different ids of them answer ({st['rows']} rows)")
+    check(dd.delete(hits[0].id) and all(x.id != hits[0].id for x in dd.search("特記事項なし", k=10)) and len(dd) == 299, "dedup: delete one of the copies")
+    dd.save(os.path.join(btmp, "d"), key="k")
+    d2 = TextIndex.load(os.path.join(btmp, "d"), key="k", dense=dense, verbose=False)
+    check(d2.dedup and d2.vec.dup_stats()["ids_beside_rows"] == 118 and len(d2.search("特記事項なし", k=10)) == 10, "dedup: save / load keeps the copies' ids")
+finally:
+    shutil.rmtree(btmp, ignore_errors=True)
+
+from kci_vec.text import Cand
+# 200 texts made of the same character pairs in other orders ("内服" + "確認" pairs everywhere), one that holds the word itself
+pool = ["内確服認を行う。", "服内認確の予定。", "確内認服とした。", "認服確内である。"]
+ptexts = [pool[i % 4] * 3 + f" 番号{i}。" for i in range(200)] + ["本日より内服確認を開始する。経過は良好。"]
+pn = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False); pn.add(ptexts)
+pp = TextIndex(sparse="bm25", mode="sparse", lang="toy", verbose=False, phrase=True, phrase_depth=300); pp.add(ptexts)
+rn = [x.id for x in pn.search("内服確認", k=5)]; rp = [x.id for x in pp.search("内服確認", k=5)]
+check(rp[0] == 200 and pp.search("内服確認", k=1)[0].sparse_rank == 1, f"phrase: the text that holds the word as written comes first (without: place {rn.index(200) + 1 if 200 in rn else 'below 5'})")
+check([x.id for x in pp.search("番号37", k=1)] == [37] and pp.search("存在しない語句", k=3) is not None, "phrase: other questions still answer")
+ptmp = tempfile.mkdtemp(prefix="kci_text_p_")
+try:
+    pp.save(os.path.join(ptmp, "p")); p2 = TextIndex.load(os.path.join(ptmp, "p"), verbose=False)
+    check(p2.phrase and p2.phrase_depth == 300 and [x.id for x in p2.search("内服確認", k=5)] == rp, "phrase: kept by save / load")
+finally:
+    shutil.rmtree(ptmp, ignore_errors=True)
+cs = ix.candidates("how do I reset my password", depth_dense=20, depth_sparse=30)
+both = [c for c in cs if c.dense_rank and c.sparse_rank]; only_d = [c for c in cs if c.sparse_rank is None]; only_s = [c for c in cs if c.dense_rank is None]
+check(isinstance(cs[0], Cand) and len({c.id for c in cs}) == len(cs) and 30 <= len(cs) <= 50 and [c.sparse_rank for c in cs[:30]] == list(range(1, 31))
+      and all(c.dense_rank is not None and c.dense_score is not None for c in only_d) and all(c.text == texts[c.id] if c.id < 600 else True for c in cs),
+      f"candidates: the union, the word side first, each with its side's rank and score ({len(both)} both, {len(only_s)} words only, {len(only_d)} dense only)")
+def by_number(q, txs):                              # a re-ranker of the caller: here, the text with the largest "note <n>" wins
+    return [float(tx.split("note ")[1].split()[0]) if "note " in tx else -1.0 for tx in txs]
+h = ix.search("password reset login account", k=3, rerank=by_number, depth_dense=20, depth_sparse=30)
+want = sorted((by_number("", [c.text])[0] for c in ix.candidates("password reset login account", 20, 30)), reverse=True)[:3]
+check([x.score for x in h] == want and h[0].text == ix.texts[h[0].id], "rerank=: the caller's function orders the candidates of both sides")
+try:
+    ix.search("password", k=3, rerank=lambda q, txs: [1.0]); check(False, "rerank=: a wrong number of scores is refused")
+except ValueError:
+    check(True, "rerank=: a wrong number of scores is refused")
+
 # one side only
 d = TextIndex(dense=dense, mode="dense", lang="toy", verbose=False); d.add(texts[:100])
 s = TextIndex(sparse=sparse, sparse_dim=VOC, mode="sparse", lang="toy", verbose=False); s.add(texts[:100])

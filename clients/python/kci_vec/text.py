@@ -15,14 +15,18 @@ and KciSparse) and the two result lists are merged by score (hybrid.mix).
 
 Needs, besides kci_vec: torch and transformers (pip install torch transformers); for "ja" also fugashi and
 unidic-lite (the sparse model's word splitter). The first use downloads the models (a few hundred MB). Turning
-texts into vectors is the slow part: on a laptop CPU around 4 to 8 texts a second, so 10,000 texts take 20 to 40
-minutes; searching takes milliseconds. add() can be called again later; it prints its progress.
+texts into vectors is the slow part: on a laptop CPU 4 to 8 texts a second, so 10,000 texts take 20 to 40
+minutes; a question takes about 0.07 s. add() can be called again later; it prints its progress.
 
 Long texts: a text longer than the models read at once is cut into overlapping parts at sentence ends
 (TextIndex(chunk=) characters; "ja" 350, "en" 1000; 0 = never cut) and every part is indexed. The dense model
 reads further, so its parts are longer (dense_chunk=; "ja" 900, "en" 2000). A search still answers with texts:
 each text once, with the part that matched best as hit.text and its place in the text as hit.span; the whole
 text is ix.texts[hit.id]. With your own models nothing is cut unless you give chunk=.
+
+Without a second model: TextIndex("ja", sparse="bm25") uses character-pair BM25 for the word side (CharBM25)
+instead of the sparse language model: nothing to download for that side, and names, codes and terms no model
+has seen are matched as written. dedup=True keeps texts that repeat once on the dense side.
 
 Your own models: TextIndex(dense=f, sparse=g, sparse_dim=n) with f(texts, is_query) -> array [len(texts), dim]
 and g(texts, is_query) -> [(indices, values), ...]; mode="dense" or mode="sparse" uses one side only.
@@ -35,17 +39,20 @@ is refused. meta.json stays readable either way: it holds the ids, the model nam
 Licences of the built-in models (as their model pages on the Hugging Face hub state; check again before you
 rely on it): "ja": cl-nagoya/ruri-v3-30m Apache-2.0, hotchpotch/japanese-splade-v2 MIT.
 "en": intfloat/multilingual-e5-small MIT, opensearch-project/opensearch-neural-sparse-encoding-v2-distill
-Apache-2.0.
-"""
-import json, os, sys, time
-from collections import namedtuple
+Apache-2.0."""
+import io, json, math, os, re, sys, time, unicodedata, zlib
+from collections import namedtuple, Counter
 import numpy as np
 
 from . import KciVec
 from .sparse import KciSparse, seal, unseal
-from .hybrid import mix, choose_weight
+from .hybrid import mix, choose_weight, tokenize
 
 Hit = namedtuple("Hit", "id score text dense_rank sparse_rank span")
+Cand = namedtuple("Cand", "id text span dense_rank dense_score sparse_rank sparse_score")
+# the words of a question that count for the phrase match: runs of kanji, of katakana, or of Latin letters / digits, 2 or longer
+_TERMS = re.compile("[\u4e00-\u9fff\u3005]{2,}|[\u30a1-\u30fa\u30fc]{2,}|[0-9A-Za-z][0-9A-Za-z_.\\-]+")
+
 
 PRESETS = {
     "ja": dict(dense="cl-nagoya/ruri-v3-30m", q_prefix="検索クエリ: ", d_prefix="検索文書: ",
@@ -97,6 +104,63 @@ def _torch():
     return torch
 
 
+def _device(torch, device):
+    """"cuda" / "mps" / "auto" (a GPU when torch sees one): NOT tried by the author, who has no such machine at hand;
+    the code path is the usual .to(device)."""
+    if device in (None, "cpu"): return "cpu"
+    if device == "auto":
+        if torch.cuda.is_available(): return "cuda"
+        mps = getattr(torch.backends, "mps", None)
+        return "mps" if mps is not None and mps.is_available() else "cpu"
+    return device
+
+
+class CharBM25:
+    """The sparse side without a model: BM25 over words (Latin, digits) and character pairs (Japanese, Chinese,
+    Korean), the tokens of kci_vec.hybrid.tokenize, hashed into `dim` slots. For names, codes and terms a language
+    model has never seen (drug names, abbreviations, part numbers), and for when no second model should run. A
+    text becomes (slot, tf part of BM25); a question becomes (slot, idf), so their inner product is the BM25 score
+    and the same KciSparse index (and its encryption) serves. The counts it keeps (how many texts hold each slot,
+    the mean length) are saved with the index. Deleting a text does not take its counts back; they follow the
+    texts added. TextIndex(lang, sparse="bm25") uses it."""
+    name = "char-bm25"
+
+    def __init__(self, dim=1 << 18, k1=1.5, b=0.75):
+        self.dim, self.k1, self.b = int(dim), float(k1), float(b)
+        self.df = np.zeros(self.dim, dtype=np.uint32); self.n = 0; self.sum_len = 0
+
+    def _slots(self, text):
+        return [zlib.crc32(tok.encode("utf-8")) % self.dim for tok in tokenize(text)]
+
+    def __call__(self, texts, is_query):
+        rows = []
+        for tx in texts:
+            sl = self._slots(tx)
+            if is_query:
+                u = sorted(set(sl)); n = max(self.n, 1)
+                rows.append((np.array(u, dtype=np.uint32),
+                             np.array([math.log(1.0 + (n - float(self.df[s]) + 0.5) / (float(self.df[s]) + 0.5)) for s in u], dtype=np.float32)))
+                continue
+            c = Counter(sl); L = len(sl)
+            self.n += 1; self.sum_len += L
+            u = sorted(c); avg = self.sum_len / self.n if self.n else 1.0
+            for s in u: self.df[s] += 1
+            norm = self.k1 * (1.0 - self.b + self.b * (L / avg if avg > 0 else 1.0))
+            rows.append((np.array(u, dtype=np.uint32), np.array([c[s] * (self.k1 + 1.0) / (c[s] + norm) for s in u], dtype=np.float32)))
+        return rows
+
+    def state(self):
+        buf = io.BytesIO(); nz = np.nonzero(self.df)[0].astype(np.uint32)
+        np.savez(buf, slots=nz, df=self.df[nz], head=np.array([self.dim, self.n, self.sum_len], dtype=np.int64), kb=np.array([self.k1, self.b]))
+        return buf.getvalue()
+
+    def load_state(self, raw):
+        z = np.load(io.BytesIO(raw)); head = z["head"]
+        if int(head[0]) != self.dim: raise RuntimeError("CharBM25: the saved counts are for another number of slots")
+        self.df[:] = 0; self.df[z["slots"]] = z["df"]; self.n = int(head[1]); self.sum_len = int(head[2])
+        self.k1, self.b = float(z["kb"][0]), float(z["kb"][1])
+
+
 def _batches(texts, batch):
     order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))     # similar lengths share a batch
     for b in range(0, len(order), batch):
@@ -105,29 +169,30 @@ def _batches(texts, batch):
 
 class HFDense:
     """A sentence-embedding model from the Hugging Face hub: mean of the token vectors, length 1."""
-    def __init__(self, name, q_prefix="", d_prefix="", max_tokens=512, batch=16):
+    def __init__(self, name, q_prefix="", d_prefix="", max_tokens=512, batch=16, device=None):
         torch = _torch()
         from transformers import AutoModel, AutoTokenizer
         self.name, self.qp, self.dp, self.max_tokens, self.batch = name, q_prefix, d_prefix, max_tokens, batch
         self.tok = AutoTokenizer.from_pretrained(name); self.model = AutoModel.from_pretrained(name).eval()
         self.dim = int(self.model.config.hidden_size); self.torch = torch
+        self.device = _device(torch, device); self.model.to(self.device)
 
     def __call__(self, texts, is_query):
         torch = self.torch; out = np.zeros((len(texts), self.dim), dtype=np.float32)
         pre = self.qp if is_query else self.dp
         with torch.inference_mode():
             for ids in _batches(texts, self.batch):
-                enc = self.tok([pre + texts[i] for i in ids], padding=True, truncation=True, max_length=self.max_tokens, return_tensors="pt")
+                enc = self.tok([pre + texts[i] for i in ids], padding=True, truncation=True, max_length=self.max_tokens, return_tensors="pt").to(self.device)
                 h = self.model(**enc).last_hidden_state
                 m = enc["attention_mask"].unsqueeze(-1).to(h.dtype)
                 v = (h * m).sum(1) / m.sum(1).clamp(min=1)
-                out[ids] = torch.nn.functional.normalize(v, dim=1).numpy()
+                out[ids] = torch.nn.functional.normalize(v, dim=1).cpu().numpy()
         return out
 
 
 class HFSplade:
     """A SPLADE-type model: per text, log(1 + relu(.)) of the word scores, the largest over the tokens."""
-    def __init__(self, name, max_tokens=256, max_query_tokens=64, batch=16, zero_special=False):
+    def __init__(self, name, max_tokens=256, max_query_tokens=64, batch=16, zero_special=False, device=None):
         torch = _torch()
         from transformers import AutoModelForMaskedLM, AutoTokenizer
         self.name, self.max_tokens, self.max_query_tokens, self.batch = name, max_tokens, max_query_tokens, batch
@@ -139,17 +204,19 @@ class HFSplade:
         self.dim = int(self.model.config.vocab_size); self.torch = torch
         # zero_special: the weights of [CLS], [SEP], ... are set to 0 (what the opensearch models' cards ask for)
         self.special = list(self.tok.all_special_ids) if zero_special else []
+        self.device = _device(torch, device); self.model.to(self.device)
 
     def __call__(self, texts, is_query):
         torch = self.torch; rows = [None] * len(texts)
         with torch.inference_mode():
             for ids in _batches(texts, self.batch):
                 enc = self.tok([texts[i] for i in ids], padding=True, truncation=True,
-                               max_length=self.max_query_tokens if is_query else self.max_tokens, return_tensors="pt")
+                               max_length=self.max_query_tokens if is_query else self.max_tokens, return_tensors="pt").to(self.device)
                 logits = self.model(**enc).logits
                 logits.masked_fill_(enc["attention_mask"].unsqueeze(-1) == 0, float("-inf"))
                 w = torch.log1p(torch.relu(logits.max(dim=1).values))
                 if self.special: w[:, self.special] = 0
+                w = w.cpu()
                 for j, i in enumerate(ids):
                     nz = torch.nonzero(w[j]).squeeze(1)
                     rows[i] = (nz.numpy().astype(np.uint32), w[j, nz].numpy().astype(np.float32))
@@ -167,9 +234,17 @@ class TextIndex:
     characters two neighbouring parts may share (None = chunk // 8)."""
 
     def __init__(self, lang="ja", mode="hybrid", dense=None, sparse=None, sparse_dim=None, w_dense=None, keep_text=True, verbose=True,
-                 chunk=None, overlap=None, dense_chunk=None):
+                 chunk=None, overlap=None, dense_chunk=None, dedup=False, device=None, phrase=False, phrase_depth=1000):
         if mode not in ("hybrid", "dense", "sparse"):
             raise ValueError("mode must be 'hybrid', 'dense' or 'sparse'")
+        # dedup=True: texts that repeat (boilerplate, empty fields) are kept once on the dense side (kci_vec_set_dedup).
+        # device: where the built-in models run (None = CPU; "auto" / "cuda" / "mps": see _device, not tried by the author).
+        if isinstance(sparse, str):
+            if sparse != "bm25": raise ValueError("sparse= as a word can only be 'bm25'")
+            sparse = CharBM25()
+        self.dedup, self.device = bool(dedup), device
+        # in which the question's own words stand as written come first (_phrase_order). Needs the texts (keep_text).
+        self.phrase, self.phrase_depth = bool(phrase), int(phrase_depth)
         if lang not in PRESETS and (dense is None or sparse is None) and not (mode == "dense" and dense) and not (mode == "sparse" and sparse):
             raise ValueError(f"lang must be one of {sorted(PRESETS)} (or pass your own dense= and sparse= functions)")
         self.lang, self.mode, self.keep_text, self.verbose = lang, mode, keep_text, verbose
@@ -194,13 +269,13 @@ class TextIndex:
     def _dense(self):
         if self._dense_fn is None:
             p = self._preset; self._say(f"loading the dense model {p['dense']} ...")
-            self._dense_fn = HFDense(p["dense"], p["q_prefix"], p["d_prefix"])
+            self._dense_fn = HFDense(p["dense"], p["q_prefix"], p["d_prefix"], device=self.device)
         return self._dense_fn
 
     def _sparse(self):
         if self._sparse_fn is None:
             p = self._preset; self._say(f"loading the sparse model {p['sparse']} ...")
-            self._sparse_fn = HFSplade(p["sparse"], zero_special=p.get("zero_special", False))
+            self._sparse_fn = HFSplade(p["sparse"], zero_special=p.get("zero_special", False), device=self.device)
         if self._sparse_dim is None:
             self._sparse_dim = int(self._sparse_fn.dim)
         return self._sparse_fn
@@ -246,7 +321,7 @@ class TextIndex:
                 tb = [f[4] for f in fd]; ib = [f[0] for f in fd]
                 dv = np.ascontiguousarray(self._dense()(tb, False), dtype=np.float32)
                 if dv.ndim != 2 or len(dv) != len(tb): raise ValueError("the dense function must return one row per text")
-                if self.vec is None: self.vec = KciVec(dv.shape[1], M=16, efc=200, rerank=200)
+                if self.vec is None: self.vec = KciVec(dv.shape[1], M=16, efc=200, rerank=200, dedup=self.dedup)
                 if self._built:
                     for i, v in zip(ib, dv): self.vec.insert(i, v)
                 else:
@@ -327,11 +402,55 @@ class TextIndex:
             dl, dp = self._texts_of(self.vec.search(qv, k=getd, ef=max(200, getd), filter=filter), depth)
         if self.mode != "dense" and self.sps is not None:
             ix, val = self._sparse()([query], True)[0]
+            use_phrase = self.phrase and self.keep_text and bool(self.texts)
+            if use_phrase: gets = max(gets, self.phrase_depth)
             if len(ix) == 0: sl = []
             elif self._blocks: sl = self.sps.search_blocks(ix, val, k=gets, query_terms=8, heap_factor=1.15, neighbours=20, filter=filter)
             else: sl = self.sps.search(ix, val, k=gets, filter=filter)
+            if use_phrase and sl: sl = self._phrase_order(query, sl)
             sl, sp = self._texts_of(sl, depth)
         return dl, sl, dp, sp
+
+    def _phrase_order(self, query, lst):
+        """the word side's parts, those first in which the question's words stand as written. A word = a run of kanji, of
+        katakana, or of Latin letters / digits, 2 characters or longer. A part's phrase score = the sum, over the
+        question's words it contains verbatim, of log(1 + parts looked at / parts that contain the word): a word few
+        parts contain counts more. Order: phrase score, then the BM25 score. The scores given on are phrase score +
+        BM25 / (largest BM25 + 1), so that the merge with the dense side keeps this order. Why: character-pair BM25
+        ranks by pairs, and a part can collect many of a question's pairs without holding any of its words."""
+        terms = sorted(set(m.group(0).lower() for m in _TERMS.finditer(unicodedata.normalize("NFKC", query))))
+        if not terms: return lst
+        parts = []
+        for r, s in lst:
+            d, a, e = self._rows[r]; tx = self.texts.get(d)
+            parts.append(unicodedata.normalize("NFKC", tx[a:e]).lower() if tx is not None else "")
+        has = [[tm in px for px in parts] for tm in terms]
+        n = len(lst); w = [math.log(1.0 + n / c) if c else 0.0 for c in (sum(h) for h in has)]
+        top = max(s for _, s in lst) + 1.0
+        scored = [(sum(w[j] for j in range(len(terms)) if has[j][i]) + lst[i][1] / top, lst[i][0]) for i in range(n)]
+        scored.sort(key=lambda x: -x[0])
+        return [(r, s) for s, r in scored]
+
+    def candidates(self, query, depth_dense=50, depth_sparse=100, filter=None):
+        """Everything either side found, unmerged, for a re-ranker of your own: [Cand(id, text, span, dense_rank,
+        dense_score, sparse_rank, sparse_score)], the word side's texts first (in its order), then those only the
+        dense side found. A side that did not find a text gives None for its rank and score. text / span: the part
+        that side matched (the word side's when both did). Nothing is cut off and no weight is applied: which
+        candidates are worth keeping is for the re-ranker to say."""
+        if not isinstance(query, str): raise TypeError("candidates: the question must be a string")
+        if not self._ids: return []
+        if not self._built: self.build()
+        dl, sl, dp, sp = self._lists(query, max(int(depth_dense), int(depth_sparse), 1), filter)
+        dl = (dl or [])[:max(int(depth_dense), 0)]; sl = (sl or [])[:max(int(depth_sparse), 0)]
+        dpos = {i: (r + 1, s) for r, (i, s) in enumerate(dl)}; spos = {i: (r + 1, s) for r, (i, s) in enumerate(sl)}
+        out = []
+        for i in [i for i, _ in sl] + [i for i, _ in dl if i not in spos]:
+            row = sp[i] if i in spos else dp[i]
+            _, a, e = self._rows[row]; tx = self.texts.get(i)
+            if e is None: e = len(tx) if tx is not None else None
+            dr, ds = dpos.get(i, (None, None)); sr, ss = spos.get(i, (None, None))
+            out.append(Cand(i, None if tx is None else tx[a:e], (a, e), dr, ds, sr, ss))
+        return out
 
     def _hit(self, d, score, dr, sr, dp, sp):
         r = dp[d] if dr is not None and (sr is None or dr <= sr) else sp[d]     # the part from the side that ranks it higher
@@ -339,11 +458,20 @@ class TextIndex:
         if e is None: e = len(tx) if tx is not None else None
         return Hit(d, score, None if tx is None else tx[a:e], dr, sr, (a, e))
 
-    def search(self, query, k=5, depth=100, filter=None):
-        """(see the header for this function)"""
+    def search(self, query, k=5, depth=100, filter=None, rerank=None, depth_dense=50, depth_sparse=100):
+        """The k best texts for a question: [Hit(id, score, text, dense_rank, sparse_rank, span)], best first. rerank: a
+        function (question, [texts]) -> one score per text, larger = better (a cross-encoder of your own)."""
         if not isinstance(query, str): raise TypeError("search: the question must be a string")
         if not self._ids: return []
         if not self._built: self.build()
+        if rerank is not None:
+            if not self.keep_text: raise RuntimeError("search: rerank= needs the texts (keep_text=True)")
+            cs = self.candidates(query, depth_dense, depth_sparse, filter)
+            if not cs: return []
+            sc = [float(x) for x in rerank(query, [c.text for c in cs])]
+            if len(sc) != len(cs): raise ValueError("the rerank function must return one score per text")
+            order = sorted(range(len(cs)), key=lambda j: -sc[j])[:k]
+            return [Hit(cs[j].id, sc[j], cs[j].text, cs[j].dense_rank, cs[j].sparse_rank, cs[j].span) for j in order]
         depth = max(int(depth), int(k))
         dl, sl, dp, sp = self._lists(query, depth, filter)
         if dl is None or sl is None:
@@ -380,6 +508,12 @@ class TextIndex:
         os.makedirs(path, exist_ok=True)
         if self.vec is not None and not self.vec.save(os.path.join(path, "dense.kvec"), kb): raise RuntimeError("save: writing dense.kvec failed")
         if self.sps is not None: self.sps.save(os.path.join(path, "sparse.kcs"), kb)       # raises when it fails
+        sp_state = os.path.join(path, "sparse_state.bin")           # what the sparse function has counted (CharBM25): with the key, encrypted
+        if os.path.exists(sp_state): os.remove(sp_state)
+        has_state = self._sparse_fn is not None and hasattr(self._sparse_fn, "state")
+        if has_state:
+            raw_state = self._sparse_fn.state()
+            with open(sp_state, "wb") as f: f.write(raw_state if kb is None else seal(raw_state, kb))
         tp, cp = os.path.join(path, "texts.json"), os.path.join(path, "texts.kct")
         with_text = bool(self.keep_text)
         for old in (tp, cp):                                    # never leave an older copy (a plain one least of all)
@@ -395,12 +529,13 @@ class TextIndex:
                     dense=getattr(self._dense_fn, "name", None) or self._preset.get("dense"),
                     sparse=getattr(self._sparse_fn, "name", None) or self._preset.get("sparse"), sparse_dim=self._sparse_dim,
                     chunk=self.chunk, dense_chunk=self.dense_chunk, overlap=self.overlap, row_next=self._row_next,
+                    sparse_state=has_state, dedup=self.dedup, phrase=self.phrase, phrase_depth=self.phrase_depth,
                     rows=[[r, d, a, e, self._side.get(r, "b")] for r, (d, a, e) in sorted(self._rows.items())])
         with open(os.path.join(path, "meta.json"), "w", encoding="utf-8") as f: json.dump(meta, f)
         return with_text
 
     @classmethod
-    def load(cls, path, key=None, texts=None, dense=None, sparse=None, verbose=True):
+    def load(cls, path, key=None, texts=None, dense=None, sparse=None, verbose=True, device=None):
         """Open a saved index. key: the passphrase it was saved with (a wrong one is refused). texts: {id: text} to use
         instead of the saved ones (or when none were saved). dense / sparse: your own functions, when the index was
         made with them."""
@@ -411,9 +546,18 @@ class TextIndex:
         if meta.get("format") not in (1, 2, 3): raise RuntimeError("load: made by a newer version")
         kb = key.encode("utf-8") if isinstance(key, str) else key
         if meta.get("encrypted") and kb is None: raise RuntimeError("load: this index was saved with a key; pass key=")
+        if sparse is None and meta.get("sparse") == CharBM25.name: sparse = CharBM25(dim=int(meta.get("sparse_dim") or (1 << 18)))
         ix = cls(meta["lang"], mode=meta["mode"], dense=dense, sparse=sparse, sparse_dim=meta.get("sparse_dim"),
                  w_dense=meta["w_dense"], verbose=verbose, chunk=meta.get("chunk", 0), overlap=meta.get("overlap"),
-                 dense_chunk=meta.get("dense_chunk", meta.get("chunk", 0)))
+                 dense_chunk=meta.get("dense_chunk", meta.get("chunk", 0)), dedup=bool(meta.get("dedup", False)), device=device,
+                 phrase=bool(meta.get("phrase", False)), phrase_depth=int(meta.get("phrase_depth", 1000)))
+        if meta.get("sparse_state"):
+            if not hasattr(ix._sparse_fn, "load_state"): raise RuntimeError("load: this index needs the sparse function it was made with (its counts were saved)")
+            try:
+                with open(os.path.join(path, "sparse_state.bin"), "rb") as f: raw_state = f.read()
+            except OSError as e:
+                raise RuntimeError(f"load: sparse_state.bin is missing ({e})") from e
+            ix._sparse_fn.load_state(raw_state if kb is None else unseal(raw_state, kb))
         if meta["mode"] != "sparse": ix.vec = KciVec.load(os.path.join(path, "dense.kvec"), key=kb, rerank=200)
         if meta["mode"] != "dense":  ix.sps = KciSparse.load(os.path.join(path, "sparse.kcs"), key=kb)
         ix._ids = set(int(i) for i in meta["ids"]); ix._next = int(meta["next"]); ix._blocks = bool(meta["blocks"]); ix._built = True

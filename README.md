@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.9: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.10: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -114,6 +114,15 @@ No vectors of your own needed: hand over the texts and search them.
   Japanese `cl-nagoya/ruri-v3-30m` (Apache-2.0) and `hotchpotch/japanese-splade-v2` (MIT); English
   `intfloat/multilingual-e5-small` (MIT) and `opensearch-project/opensearch-neural-sparse-encoding-v2-distill`
   (Apache-2.0). Your own models can be passed instead (`TextIndex(dense=..., sparse=..., sparse_dim=...)`).
+- **The word side without a model** (from 0.2.10): `TextIndex("ja", sparse="bm25")` uses character-pair BM25 for the
+  word side instead of the second model. Names, abbreviations and numbers no model has seen are matched as written, and
+  adding texts and asking are faster (one model runs instead of two). `dedup=True` is for data in which the same text
+  comes many times. `device="auto"` selects a GPU; the author has not tried it on a machine with one.
+- **A re-ranker of your own** (from 0.2.10): `ix.candidates(question)` gives what the two searches found before any
+  merging (with the place each side gave it); `ix.search(question, rerank=f)` orders them by `f(question, [texts]) ->
+  scores`. No re-ranking model is included. With `sparse="bm25"`, `phrase=True` puts the parts in which the question's
+  words stand as written first: for short records searched in the records' own words (on the author's data of Japanese
+  journal papers it did not improve the results; off by default).
 - **Adding texts is slow**: about 4 to 8 texts a second on a CPU (20 to 40 minutes for 10,000). A question takes
   about 0.07 s (Ryzen 7 8845HS).
 - **Experimental**: names, arguments and the saved form may change.
@@ -122,7 +131,8 @@ Measured (nDCG@10, the author's own measurement, against each data set's judgeme
 documents, 300 questions): meaning alone 0.673, words alone 0.729, merged 0.736. Japanese: 637 introductions of journal
 papers (JMTEB NLP Journal, median 1,990 characters) searched by the papers' titles, 510 questions: 0.956 / 0.942 / 0.970.
 It depends on the data and the models (the same texts searched by the papers' abstracts: 0.990 / 0.959 / 0.983, the
-meaning alone slightly ahead).
+meaning alone slightly ahead). With `sparse="bm25"`: merged 0.959 by titles and 0.991 by abstracts, and adding the
+texts took about a tenth of the time (same data, same machine).
 
 ## From PostgreSQL (the extension in `pg/`, a prototype)
 
@@ -311,9 +321,7 @@ kci_vec_save(v, "index.kv", key, keylen);                /* encrypted when a key
 ```
 
 **How to use it (Python and C), which settings to start from, and the rules to keep: [docs/API.md](docs/API.md).**
-The full API, with what each option does and the measurements behind the defaults, is commented in `kci_vec.h`.
-Comments in `kci_vec.c` refer to measurement records (`bench/results_*.txt`) that are not part of this release; the
-figures that matter are in the kci-vec-dist README.
+The full API, with what each option does, is commented in `kci_vec.h`. The main figures are in the kci-vec-dist README.
 
 ## License
 
