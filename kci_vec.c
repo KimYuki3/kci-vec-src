@@ -520,6 +520,8 @@ static inline float vdist(const KciVec *v, const int8_t *a, const int8_t *b){ re
 static inline uint32_t* g_l0(KciVec *v, uint32_t i){ return v->l0 + (size_t)i*(v->M0+1); }
 static inline uint32_t* g_lu(KciVec *v, uint32_t i, int l){ return v->lu[i] + (size_t)(l-1)*(v->M+1); }
 static inline uint32_t* g_links(KciVec *v, uint32_t i, int l){ return l==0? g_l0(v,i): g_lu(v,i,l); }
+#define KV_LK_GET(p)    __atomic_load_n((p), __ATOMIC_RELAXED)
+#define KV_LK_SET(p, x) __atomic_store_n((p), (x), __ATOMIC_RELAXED)
 
 static inline void nlock(KciVec *v, uint32_t i){ while(__atomic_test_and_set(&v->lock[i], __ATOMIC_ACQUIRE)){} }
 static inline void nunlock(KciVec *v, uint32_t i){ __atomic_clear(&v->lock[i], __ATOMIC_RELEASE); }
@@ -581,7 +583,7 @@ static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int la
         uint32_t cnt=__atomic_load_n(&lk[0], __ATOMIC_ACQUIRE);
         uint32_t cand[256]; int nc=0;
         for(uint32_t e=1;e<=cnt && nc<256;e++){
-            uint32_t nb=lk[e];
+            uint32_t nb=KV_LK_GET(&lk[e]);
             if(nb>=v->gN) continue;                  /* guard a torn read */
             if(visited(s,nb)) continue;
             const int8_t *r=vrow(v,nb);
@@ -616,10 +618,8 @@ static int select_neighbors(KciVec *v, const int8_t *q, Heap *W, int M, uint32_t
     free(cand); return no;
 }
 
-/* publish a neighbour list: entries first, then release-store the count, so a
- * concurrent lock-free reader never sees a count larger than valid entries. */
 static inline void publish(uint32_t *lk, const uint32_t *nbs, int n){
-    for(int i=0;i<n;i++) lk[i+1]=nbs[i];
+    for(int i=0;i<n;i++) KV_LK_SET(&lk[i+1], nbs[i]);
     __atomic_store_n(&lk[0], (uint32_t)n, __ATOMIC_RELEASE);
 }
 
@@ -647,7 +647,7 @@ static void connect(KciVec *v, uint32_t cur, uint32_t *nbs, int n, int layer){
         uint32_t *nl=g_links(v,nb,layer); uint32_t cc=nl[0];
         int has=0; for(uint32_t e=1;e<=cc;e++) if(nl[e]==cur){has=1;break;}
         if(!has){
-            if(cc<(uint32_t)Mx){ nl[cc+1]=cur; __atomic_store_n(&nl[0], cc+1, __ATOMIC_RELEASE); }
+            if(cc<(uint32_t)Mx){ KV_LK_SET(&nl[cc+1], cur); __atomic_store_n(&nl[0], cc+1, __ATOMIC_RELEASE); }
             else {
                 Heap W; hp_init(&W,cc+2,1);
                 for(uint32_t e=1;e<=cc;e++) hp_push(&W, vdist(v,vrow(v,nb),vrow(v,nl[e])), nl[e]);
@@ -1601,7 +1601,7 @@ static int search_collect_filtered(KciVec *v, const int8_t *q, int ef, Scr *s,
         uint32_t cnt=__atomic_load_n(&lk[0], __ATOMIC_ACQUIRE);
         float bound=sl_bound(W,ef,k1,gs2);
         for(uint32_t e=1;e<=cnt;e++){
-            uint32_t nb=lk[e]; if(nb>=v->gN) continue;
+            uint32_t nb=KV_LK_GET(&lk[e]); if(nb>=v->gN) continue;
             if(visited(s,nb)) continue;
             float d=vdist(v,q,vrow(v,nb)); vis++;
             if(d<bound){

@@ -5,7 +5,7 @@ dependencies, no server.
 
 *[日本語](README_ja.md)* · **Overview page:** <https://claude.ai/artifact/CCvYMLaDGKzNeFKUBGR69A>
 
-This repository holds the **source** of KCI-Vec (version 0.2.13: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
+This repository holds the **source** of KCI-Vec (version 0.2.14: cosine, Euclidean (L2) distance and inner product, and an experimental sparse index). The evaluation wheel (a pip-installable binary) is in **[KimYuki3/kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist)**.
 
 ---
 
@@ -164,6 +164,12 @@ three alternating rounds):
 The author's own measurement: one data set, one machine, one connection. L2 and inner-product indexes, several
 connections and filtered searches were not measured with this version. This compares the two inside PostgreSQL; do not
 combine it with the numbers under "Speed" above. Conditions: `pg/README.md`.
+
+## Changed in 0.2.14
+
+- Building an index with several threads now reads and writes the graph's links as atomics, as the language rules
+  ask. Answers and speed are unchanged.
+- The test `tests/test_learn_qg.c` could fail now and then; fixed (a flaw of the test, not of the library).
 
 ## Changed in 0.2.13
 
