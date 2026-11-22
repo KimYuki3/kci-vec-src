@@ -20,13 +20,13 @@
 ```sh
 python3 -m venv venv
 source venv/bin/activate
-pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.15/kci_vec-0.2.15-py3-none-manylinux_2_35_x86_64.whl
+pip install kci-vec
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install transformers
 ```
 
 - 2 行めの `source venv/bin/activate` は、端末を開き直すたびに打ちます。
-- 版の番号 (`0.2.15`) は、[配布のページ](https://github.com/KimYuki3/kci-vec-dist/releases) の新しいものに読み替えてください。
+- `pip install kci-vec` は [PyPI](https://pypi.org/project/kci-vec/) から最新の版を入れます (Linux x86-64 用。0.2.15 から)。
 - `torch` は大きいです (CPU 用で 200 MB ほど)。上の書き方だと GPU 用の部品を取ってこないので、小さく済みます。
 
 ## 2. 最初の検索

@@ -20,13 +20,13 @@ Python 3.12). `kci_vec.text` is experimental: names and arguments may change in 
 ```sh
 python3 -m venv venv
 source venv/bin/activate
-pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.15/kci_vec-0.2.15-py3-none-manylinux_2_35_x86_64.whl
+pip install kci-vec
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install transformers
 ```
 
 - `source venv/bin/activate` is typed again in every new terminal.
-- Replace the version (`0.2.15`) by the newest on the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases).
+- `pip install kci-vec` installs the newest version from [PyPI](https://pypi.org/project/kci-vec/) (Linux x86-64; from 0.2.15).
 - `torch` is large (about 200 MB for the CPU build). The line above does not fetch the GPU parts, which keeps it small.
 
 ## 2. The first search
