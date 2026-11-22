@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kci-vec"
-version = "0.2.14"
+version = "0.2.15"
 description = "Embedded vector search — in-process, int8, optional AES-256 encryption at rest, no server"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "PolyForm-Noncommercial-1.0.0" }
+license = { text = "MIT" }
 authors = [{ name = "Yukihiro Kimura" }]
 keywords = ["vector-search", "ann", "hnsw", "int8", "embedded", "rag", "encrypted", "on-device"]
 dependencies = ["numpy>=1.20"]

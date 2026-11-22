@@ -20,13 +20,13 @@
 ```sh
 python3 -m venv venv
 source venv/bin/activate
-pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.12/kci_vec-0.2.12-py3-none-manylinux_2_35_x86_64.whl
+pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.15/kci_vec-0.2.15-py3-none-manylinux_2_35_x86_64.whl
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install transformers
 ```
 
 - 2 行めの `source venv/bin/activate` は、端末を開き直すたびに打ちます。
-- 版の番号 (`0.2.12`) は、[配布のページ](https://github.com/KimYuki3/kci-vec-dist/releases) の新しいものに読み替えてください。
+- 版の番号 (`0.2.15`) は、[配布のページ](https://github.com/KimYuki3/kci-vec-dist/releases) の新しいものに読み替えてください。
 - `torch` は大きいです (CPU 用で 200 MB ほど)。上の書き方だと GPU 用の部品を取ってこないので、小さく済みます。
 
 ## 2. 最初の検索
@@ -158,5 +158,5 @@ ix = TextIndex("ja")          # 言葉の側もモデル。追加で pip install
 - **言語モデルは別の人たちのものです。** 既定で使うのは `cl-nagoya/ruri-v3-30m` (Apache-2.0)、`hotchpotch/japanese-splade-v2` (MIT)、
   英語は `intfloat/multilingual-e5-small` (MIT)、`opensearch-project/opensearch-neural-sparse-encoding-v2-distill` (Apache-2.0) です
   (各モデルのページの表示。使う前に自分でも確かめてください)。
-- **KCI-Vec 自体のライセンス**は、リポジトリの `LICENSE` を見てください (非商用のソース公開。商用は別の契約です)。
+- **KCI-Vec 自体のライセンス**は、リポジトリの `LICENSE` を見てください (0.2.15 から MIT です)。
 - 質問に文章で答える機能 (生成) は入っていません。返るのは、合う文章と、その中の一番合った部分です。

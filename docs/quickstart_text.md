@@ -20,13 +20,13 @@ Python 3.12). `kci_vec.text` is experimental: names and arguments may change in 
 ```sh
 python3 -m venv venv
 source venv/bin/activate
-pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.12/kci_vec-0.2.12-py3-none-manylinux_2_35_x86_64.whl
+pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.15/kci_vec-0.2.15-py3-none-manylinux_2_35_x86_64.whl
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install transformers
 ```
 
 - `source venv/bin/activate` is typed again in every new terminal.
-- Replace the version (`0.2.12`) by the newest on the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases).
+- Replace the version (`0.2.15`) by the newest on the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases).
 - `torch` is large (about 200 MB for the CPU build). The line above does not fetch the GPU parts, which keeps it small.
 
 ## 2. The first search
@@ -153,6 +153,5 @@ doubt, start with the quick one.
 - **The language models belong to others.** Built in: `intfloat/multilingual-e5-small` (MIT) and
   `opensearch-project/opensearch-neural-sparse-encoding-v2-distill` (Apache-2.0) for English; `cl-nagoya/ruri-v3-30m`
   (Apache-2.0) and `hotchpotch/japanese-splade-v2` (MIT) for Japanese (as their model pages state; check for yourself).
-- **KCI-Vec's own licence**: see `LICENSE` in the repository (source-available for non-commercial use; commercial use
-  under a separate agreement).
+- **KCI-Vec's own licence**: see `LICENSE` in the repository (MIT from version 0.2.15).
 - It does not write answers (no generation). You get the texts that fit, and the best part of each.

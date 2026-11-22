@@ -10,7 +10,7 @@
 | 形 | C のファイル 1 つ (`kci_vec.c` + `kci_vec.h`)。ほかのライブラリに依存しません。Python からも呼べます |
 | 向く場面 | 社内のシステム、手元の端末、製品に組み込む検索。データを外のサービスに預けられない所 |
 | 大きさの目安 | 数万〜数百万件。ベクトルは 1 次元 1 バイトで持つので、メモリは float の約 4 分の 1 です |
-| いまの版 | 0.2.14 (2026-11-22)。版ごとの変更は [配布のページ](https://github.com/KimYuki3/kci-vec-dist/releases)。評価用の配布物 (wheel) は [kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist) |
+| いまの版 | 0.2.15 (2026-11-22)。版ごとの変更は [配布のページ](https://github.com/KimYuki3/kci-vec-dist/releases)。評価用の配布物 (wheel) は [kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist) |
 | 段階 | 研究段階です。数字はすべて開発者自身の計測で、第三者の確認はまだ受けていません |
 
 ## 最初の 10 分: 文章を入れて、質問する
@@ -108,7 +108,7 @@ VIBE (いまの埋め込みモデルのデータでのベンチマーク) の流
 
 ```sh
 # Python (Linux x86-64): 配っている部品
-pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.14/kci_vec-0.2.14-py3-none-manylinux_2_35_x86_64.whl
+pip install https://github.com/KimYuki3/kci-vec-dist/releases/download/v0.2.15/kci_vec-0.2.15-py3-none-manylinux_2_35_x86_64.whl
 
 # ソースから
 sh build_kci_vec.sh          # libkci_vec.{so|dylib} と example_kci_vec   (Linux / macOS)
@@ -193,7 +193,7 @@ SELECT id, score FROM kci_vec_search('docs', '[0.1, ...]'::vector, 10);
 
 ## ライセンス
 
-[PolyForm Noncommercial 1.0.0](LICENSE): 研究・教育・個人・その他の非商用の利用は無償です。商用の利用には別の契約が必要です。
-[kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist/issues) の Issue に一言書いていただければ、非公開の連絡方法をご案内します。
+[MIT](LICENSE) (版 0.2.15 から): 商用の製品への組み込みを含めて、無償で使う・変える・配ることができます。
+0.2.14 までの版は PolyForm Noncommercial 1.0.0 で公開したもので、そのライセンスのままです。
 
-Required Notice: Copyright 2026 Yukihiro Kimura (https://github.com/KimYuki3)
+Copyright (c) 2026 Yukihiro Kimura (https://github.com/KimYuki3)
