@@ -103,6 +103,11 @@ int kci_vec_search(KciVec *v, const float *query, int k, int ef,
 typedef struct KciVecSearcher KciVecSearcher;
 KciVecSearcher *kci_vec_searcher_new(KciVec *v);
 void            kci_vec_searcher_free(KciVecSearcher *s);
+/* The graph search of kci_vec_search on a searcher (no allocation per call): the int8 rows only, no float pass (for
+ * that: kci_vec_search_rerank). ef >= k: the width of the search (larger = higher recall, slower); with
+ * kci_vec_searcher_set_eps a small ef (k..3k). out_ids needs room for k ids; out_scores (k floats) may be NULL.
+ * Scores as kci_vec_search (cosine, |q-x|^2 for L2, q.x for inner product), best first. Returns the number of
+ * results (<= k), or -1 (no graph built, or a search-only index: it has no int8 rows, use kci_vec_search_rerank). */
 int             kci_vec_search_r(KciVecSearcher *s, const float *query,
                                  int k, int ef, uint64_t *out_ids, float *out_scores);
 
@@ -156,6 +161,11 @@ typedef int (*KciVecFilter)(uint64_t id, void *ctx);
  * given, runs when the index is freed or the source replaced. Returns 0, -1 (no lists, a graph, or mmap'd floats). */
 typedef int (*KciVecFloatFn)(uint64_t id, float *out, void *ctx);
 int kci_vec_set_float_source(KciVec *v, KciVecFloatFn fn, void *ctx, void (*ctx_free)(void *));
+/* Filtered search: described under "Filtered search" above (KciVecFilter). filt(id, ctx) != 0 keeps the id eligible;
+ * ctx is handed to filt unchanged. k, ef, out_ids, out_scores as kci_vec_search_r; rerank_n > 0 adds the exact pass
+ * over the best rerank_n when the floats (or the halves) are kept, otherwise the scores are the int8 ones. Returns
+ * the number of results (<= k, fewer when fewer ids pass within the visit budget), or -1 (no graph built; a
+ * search-only index without the quantized graph and an exact pass). */
 int kci_vec_search_filtered(KciVecSearcher *s, const float *query, int k, int ef,
                             int rerank_n, KciVecFilter filt, void *ctx,
                             uint64_t *out_ids, float *out_scores);
@@ -169,7 +179,7 @@ int kci_vec_build_ivf(KciVec *v, int nlist, int threads);
  * centroid chosen so that its error is unlike the first one's (weight soar_lambda; 1.5 is ScaNN's value; 0 = one
  * list only, which is what kci_vec_build_ivf does). Saved with the index. */
 int kci_vec_build_ivf_ex(KciVec *v, int nlist, int threads, float soar_lambda);
-/* All build options . code_dims > 0: the 4-bit codes describe the residual projected onto its top code_dims
+/* All build options. code_dims > 0: the 4-bit codes describe the residual projected onto its top code_dims
  * principal directions (PCA of a sample of residuals) instead of all dims, so the scan reads code_dims/2 bytes per
  * vector instead of dim/2; the re-rank (float, or int8 with kci_vec_searcher_set_rerank_int8) restores the
  * precision. Even, at least 8, below dim; 0 = all dims. Zero the struct for the defaults. */
@@ -194,7 +204,7 @@ int kci_vec_searcher_set_rerank_int8(KciVecSearcher *s, int on);
  * within `gap` of the nearest one's, but at least `min_probe`. nprobe stays the upper bound. The best gap depends
  * on the data: try 0.15-0.35. Returns 0, or -1 (no searcher, gap NaN). */
 int kci_vec_searcher_set_probe_gap(KciVecSearcher *s, float gap, int min_probe);
-/* Exploration radius for the graph search , the stop rule NGT-qg uses. eps > 0: the result set is kept at `ef`
+/* Exploration radius for the graph search, the stop rule NGT-qg uses. eps > 0: the result set is kept at `ef`
  * entries (pass a small ef, k..3k) and the search goes on while the next candidate's cosine distance is within
  * (1+eps) x the ef-th best; eps <= 0 (the default) is plain HNSW (stop when the next candidate is worse than the
  * ef-th best). Sweep per data set. Applies to kci_vec_search_r / _rerank / _filtered. Returns 0, or -1 (no
@@ -269,7 +279,7 @@ KciVec *kci_vec_load(const char *path, const uint8_t *key, int keylen);
 #define KCI_VEC_SAVE_RAW_KEY 2
 #define KCI_VEC_LOAD_RAW_KEY 2
 /* KCI_VEC_LOAD_AUTH_ONLY: kci_vec_load_ex accepts only a file that is encrypted with the authentication tag
- * (AES-256-CTR + CMAC: saved with a key by this library since . A plaintext file and an old ChaCha20 file (no tag)
+ * (AES-256-CTR + CMAC: saved with a key by this library). A plaintext file and an old ChaCha20 file (no tag)
  * return NULL, whatever key is given. For indexes that arrive from outside: a file without a tag can be altered
  * without the load noticing. Combine with KCI_VEC_LOAD_RAW_KEY by |. */
 #define KCI_VEC_LOAD_AUTH_ONLY 4
@@ -302,6 +312,8 @@ int     kci_vec_set_float(KciVec *v, uint64_t id, const float *vec);
 int kci_vec_learn(KciVec *v, const float *queries, uint32_t nq, const uint64_t *answers, int per_query,
                   int nclusters, int list_cap, int threads, float *out_top5);
 int kci_vec_has_learned(const KciVec *v);   /* 1 = kci_vec_search_learned can be used */
+/* Described above with kci_vec_search_learned (ef < 0). Call after kci_vec_learn. Returns 0, or -1 (nothing learned
+ * or it was dropped, no floats kept, an attached image, out of memory). */
 int kci_vec_learn_pack(KciVec *v);
 /* For ef > 0 on packed lists: start the graph from the `best` rows of the int8 scan of the list prefixes instead
  * of from all of them (0 = all, the default). Fewer, better starting points. 0 / -1. */

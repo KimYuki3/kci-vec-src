@@ -435,7 +435,7 @@ kci_vec_free(v);
 | メモリ | `kci_vec_protect` (ベクトルの置き場をコアダンプとスワップに出さないよう OS に頼む。できる範囲で)、`kci_vec_plain_bytes` |
 | 情報 | `kci_vec_count`、`kci_vec_dim`、`kci_vec_is_built`、`kci_vec_metric`、`kci_vec_is_l2`、`kci_vec_dup_stats` |
 
-それぞれの引数、戻り値、条件のくわしい説明は、`kci_vec.h` の各宣言の上のコメントにあります。
+引数、戻り値、条件の説明は、`kci_vec.h` の宣言の上のコメントにあります (並んだいくつかの関数は、まとめて 1 つの説明になっています)。
 単語の側の索引 (`kci_sparse.c` / `kci_sparse.h`) も、同じ形で C から使えます。例は `example_hybrid.c` です。
 
 ---

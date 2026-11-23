@@ -435,7 +435,7 @@ Return values:
 | Memory | `kci_vec_protect` (asks the OS to keep the vectors out of core dumps and swap, as far as it can), `kci_vec_plain_bytes` |
 | Information | `kci_vec_count`, `kci_vec_dim`, `kci_vec_is_built`, `kci_vec_metric`, `kci_vec_is_l2`, `kci_vec_dup_stats` |
 
-The arguments, return values and conditions of each function are described in the comment above its declaration in `kci_vec.h`.
+The arguments, return values and conditions are described in the comments above the declarations in `kci_vec.h` (some neighbouring functions share one description).
 The word-side index (`kci_sparse.c` / `kci_sparse.h`) is used from C in the same way; see `example_hybrid.c`.
 
 ---
