@@ -106,6 +106,8 @@ The VIBE flow (a benchmark on data from current embedding models), k = 100, one 
 
 ## Usage
 
+The functions, the settings to start from and the rules to keep are in the [API guide](docs/API.md).
+
 ### Install
 
 ```sh
