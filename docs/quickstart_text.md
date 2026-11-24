@@ -10,7 +10,7 @@ Python 3.12). `kci_vec.text` is experimental: names and arguments may change in 
 
 | | |
 |---|---|
-| Machine | Linux (x86-64, Ubuntu 22.04 or later). On Windows: inside WSL2. macOS is not supported yet |
+| Machine | Linux (x86-64, Ubuntu 22.04 or later): this is where these steps were run. Packages for Windows and macOS exist from 0.2.16, but these steps (they use a language model) have not been run there; on Windows, WSL2 is the tested way |
 | Python | 3.10 or later (tried with 3.12) |
 | Disk | about 2 GB (the tools 1.5 GB, the language models 0.15 to 0.7 GB) |
 | Network | once, for the tools and the language models. After that it works offline (to be sure, run with `export HF_HUB_OFFLINE=1`: nothing is looked up on the network then) |
@@ -26,7 +26,7 @@ pip install transformers
 ```
 
 - `source venv/bin/activate` is typed again in every new terminal.
-- `pip install kci-vec` installs the newest version from [PyPI](https://pypi.org/project/kci-vec/) (Linux x86-64; from 0.2.15).
+- `pip install kci-vec` installs the newest version from [PyPI](https://pypi.org/project/kci-vec/) (Linux x86-64 from 0.2.15; Windows and macOS from 0.2.16).
 - `torch` is large (about 200 MB for the CPU build). The line above does not fetch the GPU parts, which keeps it small.
 
 ## 2. The first search
@@ -121,7 +121,7 @@ ix.texts[hit.id]                                          # the whole text
 
 | What happens | Why, and what to do |
 |---|---|
-| `pip install` says no matching distribution | The wheel is for Linux (x86-64) only. On Windows, do the same steps inside WSL2 |
+| `pip install` says no matching distribution | Packages exist for Linux x86-64, Windows x86-64 and macOS (0.2.16 and later). Update pip, or check that the machine is one of these |
 | The very first run is slow | It downloads the language model. Later runs are quick |
 | Adding texts is slow | A model reads every text. About 6 texts a second on the author's laptop CPU, so half an hour for 10,000. It is done once: save, and open next time |
 | Many texts, much memory | Meant for up to some tens of thousands of texts (to about 100,000). The texts are all held in memory |

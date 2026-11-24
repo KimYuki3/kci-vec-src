@@ -6,7 +6,7 @@ How to use KCI-Vec from Python and from C: what each function does, which settin
 If you are new, read [the first ten minutes](quickstart_text.md) first.
 
 ```sh
-pip install kci-vec          # Linux x86-64 (on Windows: inside WSL2). Python 3.10 or later
+pip install kci-vec          # Linux x86-64, Windows x86-64, macOS (from 0.2.16). Python 3.10 or later
 ```
 
 To build from source, run `pip install .` in `clients/python` of this repository (needs gcc or clang).
@@ -389,8 +389,8 @@ Taking the top 100 (`k=100`) needs a larger `ef` than taking the top 10.
 - **One-way operations.** After `half_floats()`, `search_only()` or `float_mmap()` some rebuilds and saves no longer work. Build and save what you need first.
 - **The key of a saved file.** Without the key the file cannot be opened. There is no way to recover a key.
 - **Where it runs.**
-  - The distributed wheel runs on Linux x86-64 with AVX2, and uses AVX-512 where present.
-  - From source it also builds on macOS, Windows (MinGW) and ARM64.
+  - The distributed wheels: Linux x86-64 with AVX2 (AVX-512 where present), Windows x86-64 with AVX2, macOS (Apple silicon; Intel Macs with AVX2).
+  - From source it also builds on other ARM64 machines.
 
 ---
 

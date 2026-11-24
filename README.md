@@ -10,7 +10,7 @@ or images. There is no search server to run, the data does not leave your machin
 | Form | One C file (`kci_vec.c` + `kci_vec.h`), no dependencies. Callable from Python |
 | Where it fits | In-house systems, on-device software, search shipped inside a product: places where the data cannot go to an outside service |
 | Size it is meant for | Tens of thousands to a few million items. Vectors are kept at one byte per dimension, about a quarter of the memory of float |
-| Current version | 0.2.15 (2026-11-22). Changes per version: the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases). The evaluation package (wheel) is in [kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist) |
+| Current version | 0.2.16 (2026-11-24). Changes per version: the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases). The evaluation package (wheel) is in [kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist) |
 | Stage | Research stage. Every figure was measured by the developer; none has been confirmed by a third party yet |
 
 ## The first ten minutes: put texts in, ask a question
@@ -36,7 +36,7 @@ ix.save("my_index", key="your passphrase")   # the index and the texts, encrypte
 
 The steps from installing to indexing your own files, saving, opening again and asking are in
 **[docs/quickstart_text.md](docs/quickstart_text.md)** (typed top to bottom in a fresh environment).
-This layer (`kci_vec.text`) is experimental and currently runs on Linux (on Windows: inside WSL2).
+This layer (`kci_vec.text`) is experimental. With the language models it has been run on Linux only; on Windows and macOS only its model-free setting (`mode="sparse", sparse="bm25"`) has been run.
 
 Bringing your own vectors: see "Usage" below.
 
@@ -70,7 +70,7 @@ Stated first. If one of these is you, another tool will suit better.
 - Data with many identical vectors lowers the graph's recall as it is. Use `kci_vec_set_dedup` (since 0.2.8).
 - Files saved from an index with `kci_vec_set_dedup`, or with the memory-first quantized graph (`kci_vec_build_qg_res`), cannot be read by versions up to 0.2.7 (they refuse them).
 - ARM runs mostly the portable C path and is slower than x86.
-- The distributed Python package (wheel) is for Linux x86-64 only. The source is built and tested on Linux and Windows (MinGW-w64).
+- The distributed Python packages (wheels, from 0.2.16): Linux x86-64 (AVX2, AVX-512 where present), Windows x86-64 (AVX2) and macOS (Apple silicon; Intel Macs with AVX2, 2013 and later). The Windows and Intel-Mac packages carry the AVX2 build only. An Intel Mac without AVX2 is not checked for and will crash. The macOS packages were built and tested on hosted build machines, not on a Mac of the author's.
 
 ## Measured results
 
@@ -111,7 +111,7 @@ The functions, the settings to start from and the rules to keep are in the [API 
 ### Install
 
 ```sh
-# Python (Linux x86-64): the distributed package
+# Python (Linux x86-64, Windows x86-64, macOS): the distributed package
 pip install kci-vec
 
 # From source

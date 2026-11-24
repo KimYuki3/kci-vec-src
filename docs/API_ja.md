@@ -6,7 +6,7 @@ KCI-Vec を Python と C から使う方法をまとめます。それぞれの�
 初めての方は、先に [最初の 10 分](quickstart_text_ja.md) をどうぞ。
 
 ```sh
-pip install kci-vec          # Linux x86-64 (Windows は WSL2 の中で)。Python 3.10 以上
+pip install kci-vec          # Linux x86-64、Windows x86-64、macOS (0.2.16 から)。Python 3.10 以上
 ```
 
 ソースから組み立てる場合は、このリポジトリの `clients/python` で `pip install .` です (gcc か clang が要ります)。
@@ -389,8 +389,8 @@ bm.save("index.bm25.json"); bm = BM25Index.load("index.bm25.json")
 - **元に戻せない操作。** `half_floats()`、`search_only()`、`float_mmap()` のあとは、作り直しや保存ができなくなるものがあります。要るものは先に作って、先に保存してください。
 - **保存したファイルの鍵。** 鍵をなくすと、ファイルは開けません。鍵を取り戻す方法はありません。
 - **動く環境。**
-  - 配っている部品 (wheel) は、AVX2 のある Linux x86-64 で動きます。AVX-512 があれば使います。
-  - ソースからなら、macOS、Windows (MinGW)、ARM64 でも組み立てられます。
+  - 配っている部品 (wheel): AVX2 のある Linux x86-64 (AVX-512 があれば使う)、AVX2 のある Windows x86-64、macOS (Apple シリコン、AVX2 のある Intel の Mac)。
+  - ソースからなら、ほかの ARM64 の機械でも組み立てられます。
 
 ---
 
