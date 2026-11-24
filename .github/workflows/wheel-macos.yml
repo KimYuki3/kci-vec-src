@@ -1,0 +1,47 @@
+# macOS: build the engine and the wheel, run the tests against the installed wheel.
+# Started by hand only (Actions tab, or: gh workflow run wheel-macos.yml). Nothing is published from here;
+# the wheels are kept as artifacts of the run.
+name: wheel-macos
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]        # arm64, x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: machine
+        run: uname -a; sysctl -n machdep.cpu.brand_string; cc --version
+      - name: C tests (the engine, built for this machine)
+        run: |
+          set -e
+          ISA="-mcpu=apple-m1"; [ "$(uname -m)" = "arm64" ] || ISA="-march=haswell -maes"
+          for t in test_filter test_incremental test_qg test_eps; do
+            [ -f tests/$t.c ] || continue
+            cc -O2 $ISA -I. tests/$t.c kci_vec.c -lpthread -lm -o $t
+            ./$t | tail -2
+          done
+      - name: wheel
+        run: sh tools/build_wheel_mac.sh "$RUNNER_TEMP/whl"
+      - name: tests against the installed wheel
+        run: |
+          set -e
+          python -m venv "$RUNNER_TEMP/t" && . "$RUNNER_TEMP/t/bin/activate"
+          pip -q install "$RUNNER_TEMP"/whl/dist/*.whl
+          mkdir "$RUNNER_TEMP/run" && cp clients/python/test_smoke.py clients/python/test_sparse.py clients/python/test_hybrid.py tools/run_doc_code.py docs/API.md "$RUNNER_TEMP/run/"
+          cd "$RUNNER_TEMP/run"
+          for t in test_smoke.py test_sparse.py test_hybrid.py; do python $t | tail -3; done
+          python run_doc_code.py API.md notext | tail -6
+          python -c "from kci_vec.text import TextIndex; ix = TextIndex('en', mode='sparse', sparse='bm25', verbose=False); ix.add(['paid leave is ten days', 'expenses close at month end']); print(ix.search('how many days of leave', k=1)[0].text)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: ${{ runner.temp }}/whl/dist/*.whl
+          retention-days: 14

@@ -54,6 +54,23 @@ def _find_lib():
             p = os.path.join(here, n)
             if os.path.exists(p) and all(f in flags for f in need):
                 return p
+    # The Windows wheel carries one library, libkci_vec_avx2.dll (AVX2 + FMA + AES, no other DLLs needed). A CPU
+    # without AVX2 would stop inside the DLL with an illegal instruction and no message, so the OS is asked first; a
+    # libkci_vec.dll next to this file (built for this machine: pip install . from the source) still wins.
+    # KCI_VEC_SKIP_CPU_CHECK=1 skips the question (an old Windows that does not know it answers no).
+    if sys.platform == "win32" and not os.path.exists(os.path.join(here, "libkci_vec.dll")):
+        p = os.path.join(here, "libkci_vec_avx2.dll")
+        if os.path.exists(p):
+            if not os.environ.get("KCI_VEC_SKIP_CPU_CHECK"):
+                try:
+                    has = bool(C.windll.kernel32.IsProcessorFeaturePresent(40))     # PF_AVX2_INSTRUCTIONS_AVAILABLE
+                except Exception:
+                    has = True
+                if not has:
+                    raise RuntimeError("kci_vec: this CPU (or this Windows) does not report AVX2, which the distributed "
+                                       "library needs. Build from the source for this machine (pip install . in "
+                                       "clients/python), or set KCI_VEC_SKIP_CPU_CHECK=1 if the CPU does have AVX2.")
+            return p
     # package dir first (pip-installed bundled lib), then repo root(s), then cwd
     roots = [here, os.path.join(here, "..", ".."),
              os.path.join(here, "..", "..", "..", ".."), os.getcwd()]
