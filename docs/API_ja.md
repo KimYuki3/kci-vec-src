@@ -247,13 +247,15 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # 点数は内積。大きい�
 
 ## 3. KciVec の関数一覧
 
-### `KciVec(dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, centre=False, dedup=False)`
+### `KciVec(dim, M=16, efc=200, rerank=200, metric="cosine", max_norm=0.0, centre=False, dedup=False)`
 
 | 引数 | 意味 |
 |---|---|
 | `dim` | ベクトルの長さ |
 | `M`、`efc` | グラフを作るときの設定。1 点あたりのつながりの数と、作るときの探す幅。16 / 200 が無難な既定です |
-| `rerank` | 0 より大きいと float のベクトルを持ち、正確に並べ直す候補の数の既定値になる。`build_lists`、`insert`、`compact` に必要 |
+| `rerank` | 既定は 200。float のベクトルを持ち、検索のたびに上位 200 件の候補を正確に比べ直す。`build_lists`、`insert`、`compact` に必要。`rerank=0` にすると 1 バイトの行だけを持つ (メモリは 1 次元あたり 5 バイト → 1 バイト、取りこぼしは増える)。0.2.16 までの既定は 0 でした |
+
+小さな索引は総当たりで答えます。「件数 × 次元」が `exact_cells` (既定 1,000 万。1,024 次元で 1 万件、384 次元で 2.6 万件) 以下で、float のベクトルを持っている索引では、`search` は質問を全部のベクトルと比べ、答えは正確です (`ef`・`nprobe`・`rerank_n` は使われません)。`filter` をつけたとき、`method="graph"` / `"lists"` を指定したとき、内積 (`metric="ip"`) のときは索引の探し方のままです。`v.exact_cells = 0` で切れます。
 | `metric` | `"cosine"`、`"l2"`、`"ip"` (内積) |
 | `max_norm` | `l2` と `ip` で、ベクトルの長さの上限。0 = 自動 |
 | `centre` | `ip` だけ。ベクトルの平均を引いてから索引に入れる。順位は変わらない |

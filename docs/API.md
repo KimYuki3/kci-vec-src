@@ -247,13 +247,15 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # scores are inner products, la
 
 ## 3. KciVec reference
 
-### `KciVec(dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, centre=False, dedup=False)`
+### `KciVec(dim, M=16, efc=200, rerank=200, metric="cosine", max_norm=0.0, centre=False, dedup=False)`
 
 | Argument | Meaning |
 |---|---|
 | `dim` | the length of the vectors |
 | `M`, `efc` | graph build settings: links per point and the search width while building. 16 / 200 is a safe default |
-| `rerank` | > 0 keeps the float vectors and is the default number of candidates scored exactly. Needed for `build_lists`, `insert`, `compact` |
+| `rerank` | 200 by default: the float vectors are kept and every search scores its best 200 candidates exactly. Needed for `build_lists`, `insert`, `compact`. `rerank=0` keeps the one-byte rows only (5 bytes a dimension → 1, and a lower recall). Up to 0.2.16 the default was 0 |
+
+A small index is answered by brute force. While count × dim is at most `exact_cells` (10,000,000 by default: 10,000 vectors of 1,024 dimensions, or 26,000 of 384) and the index holds the float vectors, `search` compares the query with every vector and the answer is exact (`ef`, `nprobe` and `rerank_n` are not used). With a `filter`, with `method="graph"` / `"lists"`, and for inner product (`metric="ip"`) the index's own search is used. `v.exact_cells = 0` turns it off.
 | `metric` | `"cosine"`, `"l2"`, `"ip"` (inner product) |
 | `max_norm` | for `l2` and `ip`: the longest vector accepted. 0 = automatic |
 | `centre` | `ip` only: subtract the mean of the vectors before indexing. The ranking does not change |

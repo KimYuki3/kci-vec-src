@@ -169,6 +169,8 @@ def _bind(lib):
     if hasattr(s, "kci_vec_metric"):
         s.kci_vec_metric.restype = C.c_int;        s.kci_vec_metric.argtypes = [C.c_void_p]
     s.kci_vec_is_built.restype = C.c_int;          s.kci_vec_is_built.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_has_floats"):
+        s.kci_vec_has_floats.restype = C.c_int;    s.kci_vec_has_floats.argtypes = [C.c_void_p]
     return s
 
 
@@ -198,7 +200,7 @@ def _make_filter(filt):
 class KciVec:
     """One index."""
 
-    def __init__(self, dim, M=16, efc=200, rerank=0, metric="cosine", max_norm=0.0, centre=False, _handle=None, dedup=False):
+    def __init__(self, dim, M=16, efc=200, rerank=200, metric="cosine", max_norm=0.0, centre=False, _handle=None, dedup=False):
         self.lib = _lib()
         self._unique = False
         self.dim = dim
@@ -245,6 +247,7 @@ class KciVec:
         self.qg_exact = False
         self.qg = False
         self.attached = False
+        self.exact_cells = 10_000_000  # search(): brute force on the floats while count x dim <= this
         self._ob = (C.c_uint64 * 4096)()
         self._os = (C.c_float * 4096)()
 
@@ -415,8 +418,15 @@ class KciVec:
         return self.lib.kci_vec_search_r(s, q, k, ef, self._ob, self._os)
 
     def search(self, query, k=10, ef=None, nprobe=None, rerank_n=None, filter=None, method="auto"):
-        """A selective filter needs a larger nprobe / rerank_n to find k matches."""
-        k = int(k); ef = ef or max(k, 100); nprobe = int(nprobe or self.nprobe)
+        """A selective filter needs a larger nprobe / rerank_n to find k matches.
+        Small indexes: while count x dim <= exact_cells and the floats are kept (rerank > 0), a search with method
+        'auto' and no filter compares the query with every vector (one thread) and the answer is exact; ef / nprobe /
+        rerank_n are not used then. method='graph' / 'lists' or exact_cells = 0 gives the index's own search. Not for
+        metric 'ip'."""
+        k = int(k)
+        if method == "auto" and filter is None and self._small_exact():
+            return self.search_exact(query, k=k, threads=1)
+        ef = ef or max(k, 100); nprobe = int(nprobe or self.nprobe)
         rn = self.rerank if rerank_n is None else rerank_n
         if method == "lists" or (method == "auto" and self._lists):
             rn = max(int(rn or 0), 2 * k)
@@ -424,6 +434,12 @@ class KciVec:
         cb = _make_filter(filter)
         n = self._query(q, k, ef, nprobe, int(rn or 0), cb, method)
         return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]
+
+    def _small_exact(self):
+        if not self.exact_cells or self.metric == "ip" or not hasattr(self.lib, "kci_vec_has_floats"):
+            return False
+        return (self.lib.kci_vec_count(self._v) * self.dim <= self.exact_cells and self.lib.kci_vec_has_floats(self._v) == 1
+                and (self.lib.kci_vec_is_built(self._v) != 0 or self._lists))
 
     def search_many(self, queries, k=10, **kw):
         """Many queries at once. Returns (ids, scores): int64 / float32 arrays [nq, k], -1 / -inf (l2: +inf) where fewer than k."""

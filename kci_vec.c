@@ -4590,6 +4590,7 @@ int kci_vec_dup_stats(const KciVec *v, uint64_t out[8]){
 }
 int kci_vec_dim(const KciVec *v){ return v ? (v->l2 ? v->udim : v->dim) : 0; }
 int kci_vec_is_built(const KciVec *v){ return v?v->built:0; }
+int kci_vec_has_floats(const KciVec *v){ return v && v->keepf && v->vf ? 1 : 0; }
 
 #define KV_TW_S(s) ((s) ? (s)->v : NULL), ((s) ? (s)->uniq : 0)
 int kci_vec_searcher_set_unique(KciVecSearcher *s, int on){ if(!s) return -1; s->uniq = on?1:0; return 0; }

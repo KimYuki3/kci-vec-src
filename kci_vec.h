@@ -424,6 +424,9 @@ int      kci_vec_set_dedup(KciVec *v, int on);
 int      kci_vec_searcher_set_unique(KciVecSearcher *s, int on);
 int      kci_vec_dim(const KciVec *v);
 int      kci_vec_is_built(const KciVec *v);
+/* 1 when the index holds the full float vectors (kci_vec_keep_float, and neither kci_vec_half_floats nor
+ * kci_vec_search_only since): kci_vec_search_exact then ranks by the floats. 0 otherwise (it would rank by the int8 rows). */
+int      kci_vec_has_floats(const KciVec *v);
 
 #ifdef __cplusplus
 }

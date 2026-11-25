@@ -35,9 +35,11 @@ jobs:
           set -e
           python -m venv "$RUNNER_TEMP/t" && . "$RUNNER_TEMP/t/bin/activate"
           pip -q install "$RUNNER_TEMP"/whl/dist/*.whl
-          mkdir "$RUNNER_TEMP/run" && cp clients/python/test_smoke.py clients/python/test_sparse.py clients/python/test_hybrid.py tools/run_doc_code.py docs/API.md "$RUNNER_TEMP/run/"
+          mkdir "$RUNNER_TEMP/run" && cp clients/python/test_smoke.py clients/python/test_sparse.py clients/python/test_hybrid.py clients/python/test_defaults.py tools/run_doc_code.py docs/API.md "$RUNNER_TEMP/run/"
           cd "$RUNNER_TEMP/run"
           for t in test_smoke.py test_sparse.py test_hybrid.py; do python $t | tail -3; done
+          python test_defaults.py > defaults.out || { cat defaults.out; exit 1; }
+          tail -1 defaults.out
           python run_doc_code.py API.md notext | tail -6
           python -c "from kci_vec.text import TextIndex; ix = TextIndex('en', mode='sparse', sparse='bm25', verbose=False); ix.add(['paid leave is ten days', 'expenses close at month end']); print(ix.search('how many days of leave', k=1)[0].text)"
       - uses: actions/upload-artifact@v4
