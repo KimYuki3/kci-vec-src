@@ -29,9 +29,8 @@ extern "C" {
 
 typedef struct KciVec KciVec;
 
-/* Create an empty index. `dim` is the vector dimension (must be a multiple of
- * 4). M / efc are HNSW build parameters (M=16, efc=200 are good defaults;
- * pass 0 to use them). Returns NULL on bad args / OOM. */
+/* Create an empty index. `dim` is the vector dimension: any number above 0. M / efc are HNSW build parameters
+ * (M=16, efc=200 are good defaults; pass 0 to use them). Returns NULL on bad args / OOM. */
 KciVec *kci_vec_new(int dim, int M, int efc);
 /* An index by L2 (Euclidean) distance instead of cosine. Vectors keep their length (not normalized); every search
  * returns the nearest by |q - x| and out_scores holds the squared distance |q - x|^2, smallest first. Inside it is
@@ -99,7 +98,11 @@ int kci_vec_search(KciVec *v, const float *query, int k, int ef,
 
 /* Reusable per-thread search context. Create one per worker thread; the
  * visited-set and heaps are allocated once and reused across queries. Multiple
- * searchers may run concurrently on one (already-built, read-only) KciVec. */
+ * searchers may run concurrently on one (already-built, read-only) KciVec.
+ * A searcher stays valid across kci_vec_insert and kci_vec_delete, so it can be kept for the life of the index. Make
+ * new ones after kci_vec_build, kci_vec_build_fast, kci_vec_compact, kci_vec_forget and kci_vec_build_ivf*.
+ * Searchers do not make the index safe to write while it is read: insert / delete / compact must not run at the same
+ * time as any search on that KciVec (use a reader-writer lock in the caller). */
 typedef struct KciVecSearcher KciVecSearcher;
 KciVecSearcher *kci_vec_searcher_new(KciVec *v);
 void            kci_vec_searcher_free(KciVecSearcher *s);
@@ -121,6 +124,17 @@ int             kci_vec_search_rerank(KciVecSearcher *s, const float *query,
  * Does not require a built graph. threads <= 0 = default. */
 int kci_vec_search_exact(KciVec *v, const float *query, int k, int threads,
                          uint64_t *out_ids, float *out_scores);
+/* Brute force over the ids that pass filt (filt(id, ctx) != 0 keeps id; the filtered searches below take the same kind
+ * of function): the exact top-k under a condition, and the fast way when the condition leaves few rows. Scores and
+ * return value as kci_vec_search_exact; fewer than k when fewer ids pass. With threads != 1 filt is called from several
+ * threads at once, so it must only read. filt == NULL: the same as kci_vec_search_exact. */
+typedef int (*KciVecFilter)(uint64_t id, void *ctx);
+int kci_vec_search_exact_filtered(KciVec *v, const float *query, int k, int threads, KciVecFilter filt, void *ctx,
+                                  uint64_t *out_ids, float *out_scores);
+/* A ready-made KciVecFilter for ids that are small numbers (row numbers): ctx points to a KciVecIdBits; id passes when
+ * id < nbits and bit (id & 63) of bits[id >> 6] is set. Usable with every filtered search. */
+typedef struct { const uint64_t *bits; uint64_t nbits; } KciVecIdBits;
+int kci_vec_filter_id_bits(uint64_t id, void *ctx);
 
 /* ── Incremental update (single-writer: do NOT call concurrently with searches;
  * pause serving, batch updates, resume). All require a built graph; insert also
@@ -151,7 +165,6 @@ uint32_t kci_vec_compact(KciVec *v);
  * the whole graph; for tiny matching sets prefer brute force + your own filter.
  * rerank_n>0 adds the float re-rank (needs kci_vec_keep_float). filt==NULL behaves
  * like kci_vec_search_rerank. */
-typedef int (*KciVecFilter)(uint64_t id, void *ctx);
 /* Float source. A list index (no graph) can drop its resident floats and fetch a candidate's float from the caller
  * during the re-rank instead: fn(id, out, ctx) fills out[dim] (any length, it is normalized) and returns 0, or
  * nonzero if the id is gone (it then ranks last). An application that keeps every vector in its own store (for

@@ -157,7 +157,7 @@ hits = v.search(query, k=10, filter=lambda i: i % 2 == 0) # id -> bool の関数
 絞り込みは、探した後ではなく、探している最中にかかります。そのため、条件に合うものが少なくても、その中でいちばん近いものが返ります。
 
 - 条件に合うものが全体のわずかなとき: 区分け方式なら `nprobe` と `rerank_n` を、グラフ方式なら `ef` を大きくします。
-- ほんの数件しかないとき: `search_exact` (総当たり) で探して、自分で絞り込みます。
+- ほんの数件しかないとき: `search_exact(query, k, filter=...)` で、通るものだけを総当たりします (小さな索引では、何も指定しなくてもそうなります)。
 
 ### 追加・削除・詰め直し
 
@@ -255,7 +255,7 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # 点数は内積。大きい�
 | `M`、`efc` | グラフを作るときの設定。1 点あたりのつながりの数と、作るときの探す幅。16 / 200 が無難な既定です |
 | `rerank` | 既定は 200。float のベクトルを持ち、検索のたびに上位 200 件の候補を正確に比べ直す。`build_lists`、`insert`、`compact` に必要。`rerank=0` にすると 1 バイトの行だけを持つ (メモリは 1 次元あたり 5 バイト → 1 バイト、取りこぼしは増える)。0.2.16 までの既定は 0 でした |
 
-小さな索引は総当たりで答えます。「件数 × 次元」が `exact_cells` (既定 1,000 万。1,024 次元で 1 万件、384 次元で 2.6 万件) 以下で、float のベクトルを持っている索引では、`search` は質問を全部のベクトルと比べ、答えは正確です (`ef`・`nprobe`・`rerank_n` は使われません)。`filter` をつけたとき、`method="graph"` / `"lists"` を指定したとき、内積 (`metric="ip"`) のときは索引の探し方のままです。`v.exact_cells = 0` で切れます。
+小さな索引は総当たりで答えます。「件数 × 次元」が `exact_cells` (既定 1,000 万。1,024 次元で 1 万件、384 次元で 2.6 万件) 以下で、float のベクトルを持っている索引では、`search` は質問を全部のベクトルと比べ、答えは正確です (`ef`・`nprobe`・`rerank_n` は使われません)。`filter` をつけたときは、通る番号のベクトルだけと比べます (0.2.17 では、`filter` つきは索引の探し方のままでした)。`method="graph"` / `"lists"` を指定したとき、内積 (`metric="ip"`) のときは索引の探し方のままです。`v.exact_cells = 0` で切れます。
 | `metric` | `"cosine"`、`"l2"`、`"ip"` (内積) |
 | `max_norm` | `l2` と `ip` で、ベクトルの長さの上限。0 = 自動 |
 | `centre` | `ip` だけ。ベクトルの平均を引いてから索引に入れる。順位は変わらない |
@@ -301,7 +301,7 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # 点数は内積。大きい�
 |---|---|
 | `search(query, k=10, ef=None, nprobe=None, rerank_n=None, filter=None, method="auto")` | 上位 `k` 件を `[(id, score)]` で返す。`method` は `"auto"` (区分け方式があればそれ、なければグラフ)、`"lists"`、`"graph"`。既定は `ef` = max(k, 100)、`nprobe` = 32、`rerank_n` = `rerank`。`k` は 4,096 まで |
 | `search_many(queries, k=10, **kw)` | 多くの質問を順に探す。`(ids, scores)` の配列を返す |
-| `search_exact(query, k=10, threads=0)` | 総当たりで正確な答えを出す。recall の確かめや、ごく小さい索引に |
+| `search_exact(query, k=10, threads=0, filter=None)` | 総当たりで正確な答えを出す。recall の確かめや、ごく小さい索引に |
 
 ### 変える・保存する・そのほか
 

@@ -29,6 +29,12 @@
 #endif
 #if defined(__AVX2__)
 #include <immintrin.h>
+/* a*b + c on 8 floats: fused with FMA, multiply then add without (AVX2 does not imply FMA for the compiler) */
+#if defined(__FMA__)
+#define KV_FMADD256(a,b,c) _mm256_fmadd_ps((a),(b),(c))
+#else
+#define KV_FMADD256(a,b,c) _mm256_add_ps(_mm256_mul_ps((a),(b)),(c))
+#endif
 #endif
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #include <cpuid.h>
@@ -1401,10 +1407,10 @@ static inline float fdot(int dim, const float *a, const float *b){
 #if defined(__AVX2__) && defined(__FMA__)
     __m256 s0=_mm256_setzero_ps(), s1=_mm256_setzero_ps();
     for(; i+16<=dim; i+=16){
-        s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),   _mm256_loadu_ps(b+i),   s0);
-        s1=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+8), _mm256_loadu_ps(b+i+8), s1);
+        s0=KV_FMADD256(_mm256_loadu_ps(a+i),   _mm256_loadu_ps(b+i),   s0);
+        s1=KV_FMADD256(_mm256_loadu_ps(a+i+8), _mm256_loadu_ps(b+i+8), s1);
     }
-    if(i+8<=dim){ s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i), s0); i+=8; }
+    if(i+8<=dim){ s0=KV_FMADD256(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i), s0); i+=8; }
     s0=_mm256_add_ps(s0,s1);
     __m128 h=_mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0,1));
     h=_mm_add_ps(h,_mm_movehl_ps(h,h)); h=_mm_add_ss(h,_mm_shuffle_ps(h,h,1));
@@ -1451,10 +1457,10 @@ static inline float hdot(int dim, const float *a, const uint16_t *b){
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
     __m256 s0=_mm256_setzero_ps(), s1=_mm256_setzero_ps();
     for(; i+16<=dim; i+=16){
-        s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),   _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))),   s0);
-        s1=_mm256_fmadd_ps(_mm256_loadu_ps(a+i+8), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i+8))), s1);
+        s0=KV_FMADD256(_mm256_loadu_ps(a+i),   _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))),   s0);
+        s1=KV_FMADD256(_mm256_loadu_ps(a+i+8), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i+8))), s1);
     }
-    if(i+8<=dim){ s0=_mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))), s0); i+=8; }
+    if(i+8<=dim){ s0=KV_FMADD256(_mm256_loadu_ps(a+i), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(b+i))), s0); i+=8; }
     s0=_mm256_add_ps(s0,s1);
     __m128 h=_mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0,1));
     h=_mm_add_ps(h,_mm_movehl_ps(h,h)); h=_mm_add_ss(h,_mm_shuffle_ps(h,h,1));
@@ -1755,14 +1761,14 @@ static void kv_proj(const struct KvIvf *f, int D, const float *x, float *restric
 #if defined(__AVX2__) && defined(__FMA__)
     for(; j0+64<=d1; j0+=64){ __m256 a0=_mm256_setzero_ps(), a1=a0, a2=a0, a3=a0, a4=a0, a5=a0, a6=a0, a7=a0;
         for(int d=0;d<D;d++){ __m256 xd=_mm256_set1_ps(x[d]); const float *r=R+(size_t)d*d1+j0;
-            a0=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r),a0);    a1=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+8),a1);
-            a2=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+16),a2); a3=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+24),a3);
-            a4=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+32),a4); a5=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+40),a5);
-            a6=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+48),a6); a7=_mm256_fmadd_ps(xd,_mm256_loadu_ps(r+56),a7); }
+            a0=KV_FMADD256(xd,_mm256_loadu_ps(r),a0);    a1=KV_FMADD256(xd,_mm256_loadu_ps(r+8),a1);
+            a2=KV_FMADD256(xd,_mm256_loadu_ps(r+16),a2); a3=KV_FMADD256(xd,_mm256_loadu_ps(r+24),a3);
+            a4=KV_FMADD256(xd,_mm256_loadu_ps(r+32),a4); a5=KV_FMADD256(xd,_mm256_loadu_ps(r+40),a5);
+            a6=KV_FMADD256(xd,_mm256_loadu_ps(r+48),a6); a7=KV_FMADD256(xd,_mm256_loadu_ps(r+56),a7); }
         _mm256_storeu_ps(y+j0,a0); _mm256_storeu_ps(y+j0+8,a1); _mm256_storeu_ps(y+j0+16,a2); _mm256_storeu_ps(y+j0+24,a3);
         _mm256_storeu_ps(y+j0+32,a4); _mm256_storeu_ps(y+j0+40,a5); _mm256_storeu_ps(y+j0+48,a6); _mm256_storeu_ps(y+j0+56,a7); }
     for(; j0+8<=d1; j0+=8){ __m256 a=_mm256_setzero_ps();
-        for(int d=0;d<D;d++) a=_mm256_fmadd_ps(_mm256_set1_ps(x[d]),_mm256_loadu_ps(R+(size_t)d*d1+j0),a);
+        for(int d=0;d<D;d++) a=KV_FMADD256(_mm256_set1_ps(x[d]),_mm256_loadu_ps(R+(size_t)d*d1+j0),a);
         _mm256_storeu_ps(y+j0,a); }
 #endif
     for(int j=j0;j<d1;j++) y[j]=0;
@@ -2264,7 +2270,7 @@ static void kv_scan_list(const struct KvIvf *f, const KvList *Lst, const uint8_t
                 const __m256i pb0=_mm256_set1_epi32((int)(tag|(b*32))), j2=_mm256_setr_epi32(0,2,4,6,8,10,12,14);
                 const __m128i grp[4]={El,Ol,Eh,Oh};
                 for(int g=0;g<4;g++){ uint32_t m8=(cand>>(8*g))&0xFFu;
-                    __m256 dv=_mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(grp[g])),vi,vb);
+                    __m256 dv=KV_FMADD256(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(grp[g])),vi,vb);
                     __m256i pv=_mm256_add_epi32(pb0,_mm256_add_epi32(j2,_mm256_set1_epi32((g&1)+16*(g>>1))));
                     __m256i ix=_mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int)kv_cmp8[m8]),sh),s7);
                     dv=_mm256_permutevar8x32_ps(dv,ix); __m256 pf=_mm256_castsi256_ps(_mm256_permutevar8x32_epi32(pv,ix));
@@ -2366,7 +2372,7 @@ static void kv_scan_lr(const struct KvIvf *f, const KvList *L, const uint8_t *qu
             for(int t=0;t<4;t++) a[t]=_mm256_add_epi32(a[t],_mm256_madd_epi16(_mm256_maddubs_epi16(qv,_mm256_loadu_si256((const __m256i*)(p+32*t))),ones)); }
         cand=0;
         for(int t=0;t<4;t++){ __m256i r=_mm256_sub_epi32(a[t],_mm256_slli_epi32(_mm256_loadu_si256((const __m256i*)(csum+8*t)),6));   /* qoff = 64 */
-            __m256 s=_mm256_fmadd_ps(_mm256_cvtepi32_ps(r),_mm256_set1_ps(sc),_mm256_set1_ps(base)); _mm256_storeu_ps(sco+8*t,s);
+            __m256 s=KV_FMADD256(_mm256_cvtepi32_ps(r),_mm256_set1_ps(sc),_mm256_set1_ps(base)); _mm256_storeu_ps(sco+8*t,s);
             cand|=(uint32_t)_mm256_movemask_ps(_mm256_cmp_ps(s,_mm256_set1_ps(thr),_CMP_GT_OQ))<<(8*t); }
 #else
         cand=0;
@@ -3014,8 +3020,8 @@ static int kv_qg_collect(KciVec *v, Scr *s, const int8_t *q, int ef, int rescore
         { const __m256 vb=_mm256_set1_ps(-base), vi=_mm256_set1_ps(-invs), vbound=_mm256_set1_ps(bound);
           for(uint32_t k0=0;k0<cnt;k0+=32){ uint32_t mask=0, lim = cnt-k0<32 ? cnt-k0 : 32;
             for(uint32_t u=0;u<lim;u+=8){
-                __m256 dv=_mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(sums+k0+u)))),vi,vb);
-                if(Bf) dv=_mm256_fmadd_ps(_mm256_loadu_ps(Bf+k0+u),dv,_mm256_set1_ps(c.d));
+                __m256 dv=KV_FMADD256(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(sums+k0+u)))),vi,vb);
+                if(Bf) dv=KV_FMADD256(_mm256_loadu_ps(Bf+k0+u),dv,_mm256_set1_ps(c.d));
                 mask |= (uint32_t)_mm256_movemask_ps(_mm256_cmp_ps(dv,vbound,_CMP_LT_OQ))<<u; }
             if(lim<32) mask &= (1u<<lim)-1;
             if(qgx){ uint32_t cand[32]; int nc=0; const float gg=v->gs*v->gs;
@@ -3101,20 +3107,21 @@ int kci_vec_set_float_source(KciVec *v, KciVecFloatFn fn, void *ctx, void (*ctx_
 }
 
 /* ── public: exact brute-force (ground truth), multithreaded ─────────────── */
-typedef struct { KciVec *v; const int8_t *q; const float *qf; uint32_t lo, hi; int k; Heap h; } ExactJob;
+typedef struct { KciVec *v; const int8_t *q; const float *qf; uint32_t lo, hi; int k; Heap h; KciVecFilter filt; void *fctx; } ExactJob;
 static void* exact_worker(void *arg){
     ExactJob *j=arg; KciVec *v=j->v; int k=j->k;
     int usef = j->qf != NULL;
     hp_init(&j->h, k, 0);                       /* min-heap of top-k by score */
     for(uint32_t i=j->lo;i<j->hi;i++){
         if(v->dead && v->dead[i]) continue;
+        if(j->filt && !j->filt(v->vid[i], j->fctx)) continue;
         float sc = usef ? fdot(v->dim, j->qf, v->vf+(size_t)i*v->dim) : (float)sdot(v, j->q, vrow(v,i));
         if(j->h.n<k) hp_push(&j->h, sc, i);
         else if(sc>hp_top(&j->h).d){ hp_pop(&j->h); hp_push(&j->h, sc, i); }
     }
     return NULL;
 }
-static int kv_search_exact_(KciVec *v, const float *query, int k, int threads,
+static int kv_search_exact_(KciVec *v, const float *query, int k, int threads, KciVecFilter filt, void *fctx,
                             uint64_t *out_ids, float *out_scores){
     if(!v || v->count==0) return -1;
     int usef = v->keepf && v->vf;               /* floats are unit vectors: fdot = cosine */
@@ -3128,7 +3135,7 @@ static int kv_search_exact_(KciVec *v, const float *query, int k, int threads,
     pthread_t th[64]; ExactJob jobs[64];
     uint32_t per = v->count / T;
     for(int t=0;t<T;t++){
-        jobs[t].v=v; jobs[t].q=q; jobs[t].qf=usef?tmp:NULL; jobs[t].k=k;
+        jobs[t].v=v; jobs[t].q=q; jobs[t].qf=usef?tmp:NULL; jobs[t].k=k; jobs[t].filt=filt; jobs[t].fctx=fctx;
         jobs[t].lo = (uint32_t)t*per;
         jobs[t].hi = (t==T-1)? v->count : (uint32_t)(t+1)*per;
         if(t<T-1) pthread_create(&th[t],NULL,exact_worker,&jobs[t]);
@@ -4214,17 +4221,17 @@ static int kci_vec_search_ivf_0(KciVecSearcher *s, const float *query, int k, in
     if(t) kv_l2_scores(s->v, r, out_scores, qn2);
     return r;
 }
-static int kci_vec_search_exact_0(KciVec *v, const float *query, int k, int threads, uint64_t *out_ids, float *out_scores){
+static int kci_vec_search_exact_0(KciVec *v, const float *query, int k, int threads, KciVecFilter filt, void *fctx, uint64_t *out_ids, float *out_scores){
     if(v && v->so) return -1;
     if(v && v->l2){
         if(kv_l2_fin(v)!=0) return -1;
         float *b=malloc((size_t)v->dim*sizeof(float)); if(!b) return -1;
         double qn2=kv_l2_query(v, query, b);
-        int r=kv_search_exact_(v, b, k, threads, out_ids, out_scores);
+        int r=kv_search_exact_(v, b, k, threads, filt, fctx, out_ids, out_scores);
         kv_l2_scores(v, r, out_scores, qn2);
         kv_wipe(b, (size_t)v->dim*sizeof(float)); free(b);
         return r; }
-    return kv_search_exact_(v, query, k, threads, out_ids, out_scores);
+    return kv_search_exact_(v, query, k, threads, filt, fctx, out_ids, out_scores);
 }
 
 
@@ -4598,8 +4605,19 @@ int kci_vec_search(KciVec *v, const float *query, int k, int ef, uint64_t *out_i
     kv_tw_depth++; int r=kci_vec_search_0(v, query, k, ef, out_ids, out_scores);
     return kv_tw_out(v, 0, NULL, NULL, r, k, out_ids, out_scores); }
 int kci_vec_search_exact(KciVec *v, const float *query, int k, int threads, uint64_t *out_ids, float *out_scores){
-    kv_tw_depth++; int r=kci_vec_search_exact_0(v, query, k, threads, out_ids, out_scores);
+    kv_tw_depth++; int r=kci_vec_search_exact_0(v, query, k, threads, NULL, NULL, out_ids, out_scores);
     return kv_tw_out(v, 0, NULL, NULL, r, k, out_ids, out_scores); }
+int kci_vec_search_exact_filtered(KciVec *v, const float *query, int k, int threads, KciVecFilter filt, void *ctx,
+                                  uint64_t *out_ids, float *out_scores){
+    if(!filt) return kci_vec_search_exact(v, query, k, threads, out_ids, out_scores);
+    KvTwF w={ v, filt, ctx };
+    int wrap = v && v->tw && v->tw->ntw && kv_tw_depth==0;
+    kv_tw_depth++;
+    int r=kci_vec_search_exact_0(v, query, k, threads, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
+    return kv_tw_out(v, 0, wrap ? filt : NULL, ctx, r, k, out_ids, out_scores); }
+int kci_vec_filter_id_bits(uint64_t id, void *ctx){
+    const KciVecIdBits *b=(const KciVecIdBits*)ctx;
+    return b && id < b->nbits && ((b->bits[id>>6] >> (id&63)) & 1); }
 int kci_vec_search_r(KciVecSearcher *s, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
     kv_tw_depth++; int r=kci_vec_search_r_0(s, query, k, ef, out_ids, out_scores);
     return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }

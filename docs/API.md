@@ -157,7 +157,7 @@ hits = v.search(query, k=10, filter=lambda i: i % 2 == 0) # or a function id -> 
 The filter applies during the search, not after it, so even when few items pass, the nearest among them are returned.
 
 - When only a small share passes: raise `nprobe` and `rerank_n` (lists) or `ef` (graph).
-- When only a handful pass: use `search_exact` (brute force) and filter yourself.
+- When only a handful pass: use `search_exact(query, k, filter=...)`, brute force over the ones that pass (a small index does this by itself).
 
 ### Insert, delete, compact
 
@@ -255,7 +255,7 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # scores are inner products, la
 | `M`, `efc` | graph build settings: links per point and the search width while building. 16 / 200 is a safe default |
 | `rerank` | 200 by default: the float vectors are kept and every search scores its best 200 candidates exactly. Needed for `build_lists`, `insert`, `compact`. `rerank=0` keeps the one-byte rows only (5 bytes a dimension → 1, and a lower recall). Up to 0.2.16 the default was 0 |
 
-A small index is answered by brute force. While count × dim is at most `exact_cells` (10,000,000 by default: 10,000 vectors of 1,024 dimensions, or 26,000 of 384) and the index holds the float vectors, `search` compares the query with every vector and the answer is exact (`ef`, `nprobe` and `rerank_n` are not used). With a `filter`, with `method="graph"` / `"lists"`, and for inner product (`metric="ip"`) the index's own search is used. `v.exact_cells = 0` turns it off.
+A small index is answered by brute force. While count × dim is at most `exact_cells` (10,000,000 by default: 10,000 vectors of 1,024 dimensions, or 26,000 of 384) and the index holds the float vectors, `search` compares the query with every vector and the answer is exact (`ef`, `nprobe` and `rerank_n` are not used). With a `filter` it compares the vectors whose numbers pass (in 0.2.17 a filtered search still used the index). With `method="graph"` / `"lists"`, and for inner product (`metric="ip"`) the index's own search is used. `v.exact_cells = 0` turns it off.
 | `metric` | `"cosine"`, `"l2"`, `"ip"` (inner product) |
 | `max_norm` | for `l2` and `ip`: the longest vector accepted. 0 = automatic |
 | `centre` | `ip` only: subtract the mean of the vectors before indexing. The ranking does not change |
@@ -301,7 +301,7 @@ Which values suit depends on the data. Decide while measuring recall.
 |---|---|
 | `search(query, k=10, ef=None, nprobe=None, rerank_n=None, filter=None, method="auto")` | the top `k` as `[(id, score)]`. `method`: `"auto"` (the lists if built, else the graph), `"lists"`, `"graph"`. Defaults: `ef` = max(k, 100), `nprobe` = 32, `rerank_n` = `rerank`. `k` up to 4,096 |
 | `search_many(queries, k=10, **kw)` | many queries, one after another. Returns the arrays `(ids, scores)` |
-| `search_exact(query, k=10, threads=0)` | the exact answer by brute force. For checking recall, or for tiny indexes |
+| `search_exact(query, k=10, threads=0, filter=None)` | the exact answer by brute force. For checking recall, or for tiny indexes |
 
 ### Changing, saving and the rest
 

@@ -1,5 +1,5 @@
 """The defaults favour the right answer: KciVec(dim) keeps the floats and re-ranks on them, and a small index is
-answered by brute force.
+answered by brute force, with a filter too.
 Run: KCI_VEC_LIB=.../libkci_vec.so python test_defaults.py"""
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,9 +45,21 @@ for metric in ("cosine", "l2"):
     check(f"{metric}: above exact_cells the graph answers", [ids(v.search(q, k=K)) for q in Q] == g)
     v.exact_cells = N * D
     check(f"{metric}: at exact_cells, exact", [ids(v.search(q, k=K)) for q in Q] == gt)
-    # a filter keeps the filtered search (it honours the filter); a deleted id is not returned by the exact path
-    f = v.search(Q[1], k=K, filter=lambda i: i % 2 == 0)
-    check(f"{metric}: a filter is honoured", len(f) == K and all(i % 2 == 0 for i, _ in f))
+    # with a filter the small index is exact too: the true top-k among the ids that pass, also when the
+    # filter leaves few (1 id in 500: the graph's filtered search may not find all of them); a set works as a callable does
+    def truth_f(q, keep, k):
+        idx = np.array([i for i in range(N) if keep(i)]); Xd = X[idx].astype(np.float64)
+        if metric == "cosine": s = -((Xd / np.linalg.norm(Xd, axis=1, keepdims=True)) @ q.astype(np.float64))
+        else: s = ((Xd - q.astype(np.float64)) ** 2).sum(1)
+        return idx[np.argsort(s, kind="stable")[:k]].tolist()
+    even = [ids(v.search(q, k=K, filter=lambda i: i % 2 == 0)) for q in Q[:60]]
+    check(f"{metric}: with a filter the answer is exact", even == [truth_f(q, lambda i: i % 2 == 0, K) for q in Q[:60]])
+    rare = [ids(v.search(q, k=K, filter=lambda i: i % 500 == 7)) for q in Q[:60]]
+    check(f"{metric}: a filter that leaves 60 ids: exact", rare == [truth_f(q, lambda i: i % 500 == 7, K) for q in Q[:60]])
+    allowed = {5, 17, 4242}
+    check(f"{metric}: a set of 3 allowed ids gives those 3", sorted(ids(v.search(Q[1], k=K, filter=allowed))) == sorted(allowed))
+    check(f"{metric}: nothing passes -> []", v.search(Q[1], k=K, filter=lambda i: False) == [])
+    check(f"{metric}: method='graph' keeps the graph's filtered search", all(i % 2 == 0 for i, _ in v.search(Q[1], k=K, filter=lambda i: i % 2 == 0, method="graph")))
     dead = gt[2][0]; v.delete(dead)
     after = ids(v.search(Q[2], k=K))
     check(f"{metric}: a deleted id is gone, the rest is still exact", dead not in after and after[:K - 1] == gt[2][1:])
