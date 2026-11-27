@@ -270,10 +270,15 @@ int kci_vec_search_ivf(KciVecSearcher *s, const float *query, int k, int nprobe,
                        uint64_t *out_ids, float *out_scores);
 /* The same with a filter over the caller's ids (metadata / ACL; only vectors with filt(id, ctx) != 0 enter the
  * shortlist and the answer. The predicate is asked only for candidates that beat the shortlist's worst (a few
- * hundred per query), so a Python callback is fine. A selective filter needs a larger nprobe / rerank_n to find k
- * matches; for very small matching sets use kci_vec_search_exact + your own filter. */
+ * hundred per query), so a Python callback is fine. A selective filter needs a larger nprobe / rerank_n to find
+ * the best k matches. Fewer than k answers: when this search or kci_vec_search_filtered finds fewer than k, the
+ * index answers again by brute force over the ids that pass (kci_vec_search_exact_filtered, one thread), so every
+ * passing id is returned when fewer than k exist. This calls filt once per vector for such a query;
+ * kci_vec_searcher_set_filter_fill(s, 0) turns it off (the earlier behaviour). When you know that few ids pass,
+ * call kci_vec_search_exact_filtered directly. */
 int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
                                 KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores);
+int kci_vec_searcher_set_filter_fill(KciVecSearcher *s, int on);   /* default on; see above */
 
 /* On-disk snapshot. If key != NULL (keylen bytes), the serialized index is encrypted at rest (format KCIVEC05:
  * AES-256-CTR, key from PBKDF2-HMAC-SHA256 with a per-save salt, and an AES-256-CMAC tag over the whole file);
@@ -440,6 +445,29 @@ int      kci_vec_is_built(const KciVec *v);
 /* 1 when the index holds the full float vectors (kci_vec_keep_float, and neither kci_vec_half_floats nor
  * kci_vec_search_only since): kci_vec_search_exact then ranks by the floats. 0 otherwise (it would rank by the int8 rows). */
 int      kci_vec_has_floats(const KciVec *v);
+/* Choose the search width (ef) for this index from its own vectors, instead of one default for every kind of data.
+ * `samples` stored vectors (0 = 128) are used as questions: their true neighbours by brute force, then the graph
+ * search (kci_vec_search_rerank with rerank_n) at ef 200 / 400 / 800 / 1600. The smallest width that finds the share
+ * `target` (0 = 0.98) of the true k (0 = 10) nearest is returned and kept; when none does, the widest is kept.
+ * *out_recall (may be NULL) is the share found at the width kept. kci_vec_default_ef gives the width back (0 = never
+ * calibrated); kci_vec_save writes it and kci_vec_load restores it.
+ * When rerank_n rows are too few for the float pass at a width, the same width is tried with all its rows re-scored;
+ * kci_vec_default_rerank then returns that width (0 = your rerank_n is enough).
+ * kci_vec_search_rerank and kci_vec_search_filtered take ef <= 0 as "the calibrated width, with its float pass"; on an
+ * index that was never calibrated ef <= 0 is as wide as rerank_n.
+ * Needs the graph and the full float vectors; -1 otherwise. Call it after kci_vec_build, not while other threads
+ * search or write. It measures questions that look like the stored vectors; for questions of another kind use
+ * kci_vec_calibrate_queries. Cost: `samples` brute-force searches on `threads` threads. */
+int      kci_vec_calibrate(KciVec *v, int k, int rerank_n, float target, int samples, int threads, float *out_recall);
+int      kci_vec_default_ef(const KciVec *v);
+int      kci_vec_default_rerank(const KciVec *v);
+/* The same with the caller's own questions (nq rows of dim floats; 8 to 4,096 of them are used) instead of stored
+ * vectors. -1 with fewer than 8. */
+int      kci_vec_calibrate_queries(KciVec *v, const float *queries, int nq, int k, int rerank_n, float target, int threads, float *out_recall);
+/* Rows the last kci_vec_build could not make reachable from the entry point (0 = every row can be found; not
+ * saved, 0 after a load). */
+uint32_t kci_vec_unreached(const KciVec *v);
+int      kci_vec_set_default_ef(KciVec *v, int ef);          /* 0..32767, 0 = forget it (kci_vec_default_rerank becomes 0 too); 0 on success */
 
 #ifdef __cplusplus
 }

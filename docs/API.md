@@ -157,7 +157,7 @@ hits = v.search(query, k=10, filter=lambda i: i % 2 == 0) # or a function id -> 
 The filter applies during the search, not after it, so even when few items pass, the nearest among them are returned.
 
 - When only a small share passes: raise `nprobe` and `rerank_n` (lists) or `ef` (graph).
-- When only a handful pass: use `search_exact(query, k, filter=...)`, brute force over the ones that pass (a small index does this by itself).
+- When only a handful pass: nothing to set. Given a set, list or array of numbers that is small enough, `search` compares the query with the vectors that pass, whatever the size of the index. With any filter, a search that finds fewer than `k` answers is answered again by brute force over the ones that pass, so none of them is left out (since 0.2.19; a function is then called once per vector). `search_exact(query, k, filter=...)` does the same on request.
 
 ### Insert, delete, compact
 
@@ -255,7 +255,9 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # scores are inner products, la
 | `M`, `efc` | graph build settings: links per point and the search width while building. 16 / 200 is a safe default |
 | `rerank` | 200 by default: the float vectors are kept and every search scores its best 200 candidates exactly. Needed for `build_lists`, `insert`, `compact`. `rerank=0` keeps the one-byte rows only (5 bytes a dimension → 1, and a lower recall). Up to 0.2.16 the default was 0 |
 
-A small index is answered by brute force. While count × dim is at most `exact_cells` (10,000,000 by default: 10,000 vectors of 1,024 dimensions, or 26,000 of 384) and the index holds the float vectors, `search` compares the query with every vector and the answer is exact (`ef`, `nprobe` and `rerank_n` are not used). With a `filter` it compares the vectors whose numbers pass (in 0.2.17 a filtered search still used the index). With `method="graph"` / `"lists"`, and for inner product (`metric="ip"`) the index's own search is used. `v.exact_cells = 0` turns it off.
+A small index is answered by brute force. While count × dim is at most `exact_cells` (10,000,000 by default: 10,000 vectors of 1,024 dimensions, or 26,000 of 384) and the index holds the float vectors, `search` compares the query with every vector and the answer is exact (`ef`, `nprobe` and `rerank_n` are not used). With a `filter` it compares the vectors whose numbers pass (in 0.2.17 a filtered search still used the index). With `method="graph"` / `"lists"` the index's own search is used. `v.exact_cells = 0` turns it off. Since 0.2.19 this covers inner product (`metric="ip"`) too.
+
+A larger index measures the search width it needs (since 0.2.19). At the end of `build`, a sample of the stored vectors is used as questions and compared with brute force; the narrowest of `ef` 200 / 400 / 800 / 1600 that finds 98 % of the true 10 nearest becomes the default of `search` (the widest when none does), together with the number of candidates scored exactly when 200 are not enough. So a `search` with nothing given is wider, and slower, on data that needs it, and unchanged on data that does not. `save` / `load` keep the result. `build` warns when even the widest setting stays below 97 %, and when rows are left that the graph search cannot reach. The sample is made of stored vectors: when your questions are of another kind (text questions over image vectors, most inner-product data), pass some of them to `calibrate(queries=...)`. An `ef` or `rerank_n` you give is used as given. `v.auto_ef = False` before `build` turns the measurement off.
 | `metric` | `"cosine"`, `"l2"`, `"ip"` (inner product) |
 | `max_norm` | for `l2` and `ip`: the longest vector accepted. 0 = automatic |
 | `centre` | `ip` only: subtract the mean of the vectors before indexing. The ranking does not change |
@@ -276,6 +278,8 @@ A small index is answered by brute force. While count × dim is at most `exact_c
 | `build(threads=0, fast=False)` | build the graph. 0 = all cores. Returns the seconds taken. It drops the lists, so if you want both, build **the graph first**. `fast=True`: a build that favours build time |
 | `build_qg(dims_per_code=1, threads=0, code_dims=0, gate_dims=0, residual=False)` | build the quantized graph (after `build` or `load`). `dims_per_code`: 1 = fine, 2 = half the size. Returns the bytes it takes. The last three are for a smaller index on high-dimensional data (below) |
 | `build_lists(nlist=0, soar=0.0, threads=0, nprobe=None, ...)` | build the partitioned lists. `nlist` 0 = automatic. `soar` 1.5 puts every vector in a second partition too. `nprobe` is the default for searches. The remaining arguments: 0 = automatic |
+
+| `calibrate(k=10, target=0.98, samples=128, threads=0, queries=None)` | measure the search width this index needs and make it the default of `search` (see above; `build` calls it for an index above `exact_cells`). `queries`: 8 or more of your own questions instead of stored vectors. Returns `(ef, the share of the true k nearest found)`; `default_ef()`, `default_rerank()` and `calibrated_recall` give the result back |
 
 The `build_qg` settings for a smaller index (for data of 384 dimensions and up):
 
@@ -427,7 +431,8 @@ Return values:
 | Graph | `kci_vec_build`, `kci_vec_build_fast`, `kci_vec_search` (for the occasional search), `kci_vec_searcher_new` / `_free`, `kci_vec_search_r`, `kci_vec_search_rerank`, `kci_vec_search_filtered`, `kci_vec_searcher_set_eps`, `kci_vec_searcher_set_unique` |
 | Quantized graph | `kci_vec_build_qg`, `kci_vec_build_qg_ex`, `kci_vec_build_qg_gate`, `kci_vec_build_qg_res`, `kci_vec_qg_bytes`, `kci_vec_searcher_set_qg`, `kci_vec_searcher_set_qg_exact` |
 | Partitioned lists | `kci_vec_build_ivf`, `kci_vec_build_ivf_ex`, `kci_vec_build_ivf_p` (every setting), `kci_vec_set_ivf_codes`, `kci_vec_set_ivf_training`, `kci_vec_search_ivf`, `kci_vec_search_ivf_filtered`, `kci_vec_searcher_set_probe_gap`, `kci_vec_searcher_set_rerank_int8` |
-| Brute force | `kci_vec_search_exact` |
+| Brute force | `kci_vec_search_exact`, `kci_vec_search_exact_filtered`, `kci_vec_filter_id_bits` |
+| Search width | `kci_vec_calibrate`, `kci_vec_calibrate_queries`, `kci_vec_default_ef`, `kci_vec_default_rerank`, `kci_vec_set_default_ef` (`kci_vec_search_rerank` / `kci_vec_search_filtered` with `ef` 0 use the calibrated width), `kci_vec_unreached`, `kci_vec_searcher_set_filter_fill` |
 | Change | `kci_vec_insert`, `kci_vec_delete`, `kci_vec_forget` (removes every trace of that vector), `kci_vec_compact`, `kci_vec_squeeze` |
 | Floats | `kci_vec_half_floats`, `kci_vec_float_mmap`, `kci_vec_set_float_source` (fetch the floats from your own store for the exact pass), `kci_vec_set_float`, `kci_vec_get_float` |
 | Save, load | `kci_vec_save`, `kci_vec_load`, `kci_vec_save_ex` / `kci_vec_load_ex` (`KCI_VEC_SAVE_NO_FLOAT`, `KCI_VEC_SAVE_RAW_KEY`) |

@@ -72,7 +72,8 @@ check("rerank=0: no floats, the int8 search", v.lib.kci_vec_has_floats(v._v) == 
 
 # inner product keeps the index's search (and the default re-rank)
 v = KciVec(dim=D, metric="ip"); v.add_many(np.arange(N, dtype=np.int64), X); v.build()
-check("ip: not answered by brute force, searches work", not v._small_exact() and len(v.search(Q[0], k=K)) == K)
+gi = [np.argsort(-(X @ q), kind="stable")[:K].tolist() for q in Q]
+check("ip: a small index is answered by brute force, numpy's order", v._small_exact() and all(ids(v.search(q, k=K)) == g for q, g in zip(Q, gi)))
 
 # a saved small index: load() finds the floats in the file and answers exactly too
 import tempfile

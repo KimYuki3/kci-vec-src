@@ -26,6 +26,7 @@ Set KCI_VEC_LIB to the .dll/.so/.dylib, or place it next to this file / repo roo
 import ctypes as C
 import os
 import sys
+import warnings
 import numpy as np
 
 c_f32p = C.POINTER(C.c_float)
@@ -172,6 +173,19 @@ def _bind(lib):
     if hasattr(s, "kci_vec_metric"):
         s.kci_vec_metric.restype = C.c_int;        s.kci_vec_metric.argtypes = [C.c_void_p]
     s.kci_vec_is_built.restype = C.c_int;          s.kci_vec_is_built.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_calibrate"):
+        s.kci_vec_calibrate.restype = C.c_int
+        s.kci_vec_calibrate.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_float, C.c_int, C.c_int, C.POINTER(C.c_float)]
+        s.kci_vec_default_ef.restype = C.c_int;     s.kci_vec_default_ef.argtypes = [C.c_void_p]
+        s.kci_vec_set_default_ef.restype = C.c_int; s.kci_vec_set_default_ef.argtypes = [C.c_void_p, C.c_int]
+    if hasattr(s, "kci_vec_searcher_set_filter_fill"):
+        s.kci_vec_searcher_set_filter_fill.restype = C.c_int; s.kci_vec_searcher_set_filter_fill.argtypes = [C.c_void_p, C.c_int]
+    if hasattr(s, "kci_vec_default_rerank"):
+        s.kci_vec_default_rerank.restype = C.c_int; s.kci_vec_default_rerank.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_calibrate_queries"):
+        s.kci_vec_calibrate_queries.restype = C.c_int
+        s.kci_vec_calibrate_queries.argtypes = [C.c_void_p, c_f32p, C.c_int, C.c_int, C.c_int, C.c_float, C.c_int, C.POINTER(C.c_float)]
+        s.kci_vec_unreached.restype = C.c_uint32;   s.kci_vec_unreached.argtypes = [C.c_void_p]
     if hasattr(s, "kci_vec_has_floats"):
         s.kci_vec_has_floats.restype = C.c_int;    s.kci_vec_has_floats.argtypes = [C.c_void_p]
     return s
@@ -198,6 +212,36 @@ def _make_filter(filt):
         return _FILTER(lambda i, _ctx: 1 if filt(int(i)) else 0)
     allowed = filt if isinstance(filt, (set, frozenset)) else set(int(x) for x in np.asarray(filt).ravel())
     return _FILTER(lambda i, _ctx: 1 if int(i) in allowed else 0)
+
+
+class _IdBits(C.Structure):
+    _fields_ = [("bits", C.c_void_p), ("nbits", C.c_uint64)]
+
+
+_BITS_MAX = 1 << 27
+
+
+def _id_bits(filt):
+    """a set / list / array of allowed ids as (bitmap uint64[], nbits, count), or None when the ids do not fit a
+    bitmap (negative, not whole numbers, or >= _BITS_MAX)."""
+    if isinstance(filt, (set, frozenset)):
+        try:
+            a = np.fromiter(filt, dtype=np.int64, count=len(filt))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        a = np.asarray(filt).ravel()
+        if a.dtype.kind not in "iu":
+            return None
+    if a.size == 0:
+        return np.zeros(1, dtype=np.uint64), 0, 0
+    if int(a.min()) < 0 or int(a.max()) >= _BITS_MAX:
+        return None
+    nbits = int(a.max()) + 1
+    flags = np.zeros(((nbits + 63) // 64) * 64, dtype=np.uint8)
+    flags[a.astype(np.int64, copy=False)] = 1
+    bits = np.ascontiguousarray(np.packbits(flags, bitorder="little").view("<u8").astype(np.uint64, copy=False))
+    return bits, nbits, int(flags.sum())
 
 
 class KciVec:
@@ -251,6 +295,9 @@ class KciVec:
         self.qg = False
         self.attached = False
         self.exact_cells = 10_000_000  # search(): brute force on the floats while count x dim <= this
+        self.calibrated_recall = None  # what the last calibrate() measured
+        self.auto_ef = True            # build() measures the search width this data needs (see calibrate)
+        self.filter_fill = True        # a filtered search that finds fewer than k answers is answered again by brute force
         self._ob = (C.c_uint64 * 4096)()
         self._os = (C.c_float * 4096)()
 
@@ -280,7 +327,50 @@ class KciVec:
             raise RuntimeError("kci_vec_build_fast failed (out of memory, or no vectors)")
         self.qg = False              # a rebuild drops the quantized graph
         self._searcher(reset=True)
+        if rc == 0 and hasattr(self.lib, "kci_vec_unreached") and self.lib.kci_vec_unreached(self._v):
+            warnings.warn("kci_vec: %d rows cannot be reached by the graph search after this build (search_exact still "
+                          "finds them)" % self.lib.kci_vec_unreached(self._v), RuntimeWarning, stacklevel=2)
+        if (rc == 0 and self.auto_ef and hasattr(self.lib, "kci_vec_calibrate") and self._exact_ok() and not self._small_exact()):
+            ef, rec = self.calibrate(threads=threads)
+            if rec < 0.98 - 0.01:
+                warnings.warn("kci_vec: at the widest search tried (ef %d) the index finds %.1f %% of the true 10 nearest of "
+                              "its own vectors; search() will miss some. search_exact() is exact; a larger M at creation "
+                              "or ef / rerank_n at search raise it." % (ef, 100.0 * rec), RuntimeWarning, stacklevel=2)
         return secs.value
+
+    def calibrate(self, k=10, target=0.98, samples=128, threads=0, queries=None):
+        """Measure the search width (ef) this index needs and make it the default of search().
+        `samples` stored vectors are used as questions against brute force, and the smallest of ef 200 / 400 / 800 /
+        1600 that finds the share `target` of the true k nearest is kept (the widest when none does). build() calls
+        this for an index above exact_cells unless auto_ef is False; save() / load() keep the result. Returns
+        (ef, the share found at it); the share is also kept in calibrated_recall. Needs the floats (rerank > 0).
+        queries: your own questions (8 or more rows of dim floats; at most 4,096 are used) instead of stored vectors,
+        for questions of another kind than the stored vectors."""
+        if not hasattr(self.lib, "kci_vec_calibrate"):
+            raise RuntimeError("this libkci_vec has no kci_vec_calibrate (built before 2026-11-26); rebuild it")
+        r = C.c_float(0.0)
+        if queries is not None:
+            if not hasattr(self.lib, "kci_vec_calibrate_queries"):
+                raise RuntimeError("this libkci_vec has no kci_vec_calibrate_queries (built before 2026-11-28); rebuild it")
+            Qa = np.ascontiguousarray(queries, dtype=np.float32).reshape(-1, self.dim)
+            ef = self.lib.kci_vec_calibrate_queries(self._v, Qa.ctypes.data_as(c_f32p), len(Qa), int(k), int(self.rerank or 0), float(target), int(threads), C.byref(r))
+        else:
+            ef = self.lib.kci_vec_calibrate(self._v, int(k), int(self.rerank or 0), float(target), int(samples), int(threads), C.byref(r))
+        if ef < 0:
+            raise RuntimeError("calibrate needs a built graph with the float vectors kept (rerank > 0)" + (", and 8 or more queries" if queries is not None else ""))
+        self.calibrated_recall = float(r.value)
+        return ef, float(r.value)
+
+    def default_ef(self):
+        """The ef search() uses when none is given: the calibrated width, or 100 when the index was never calibrated."""
+        d = self.lib.kci_vec_default_ef(self._v) if hasattr(self.lib, "kci_vec_default_ef") else 0
+        return d if d > 0 else 100
+
+    def default_rerank(self):
+        """The shortlist calibrate() found necessary when it is larger than `rerank` (many nearly equal vectors need
+        the whole search width re-scored on the floats); 0 when `rerank` is enough. search() uses it when rerank_n is
+        not given and ef is not below the calibrated width."""
+        return self.lib.kci_vec_default_rerank(self._v) if hasattr(self.lib, "kci_vec_default_rerank") else 0
 
     def build_qg(self, dims_per_code=1, threads=0, code_dims=0, gate_dims=0, residual=False):
         """Quantized graph lay layer 0 out as blocks of the neighbours' 4-bit codes, so a hop reads one block and scores
@@ -395,6 +485,8 @@ class KciVec:
             self._s = self.lib.kci_vec_searcher_new(self._v)
             if self._unique and hasattr(self.lib, "kci_vec_searcher_set_unique"):
                 self.lib.kci_vec_searcher_set_unique(self._s, 1)
+            if not self.filter_fill and hasattr(self.lib, "kci_vec_searcher_set_filter_fill"):
+                self.lib.kci_vec_searcher_set_filter_fill(self._s, 0)
             if self.rerank_mode == "int8":
                 self.lib.kci_vec_searcher_set_rerank_int8(self._s, 1)
             if self.probe_gap[0] > 0:
@@ -407,42 +499,76 @@ class KciVec:
                 self.lib.kci_vec_searcher_set_qg_exact(self._s, int(self.qg_exact))
         return self._s
 
-    def _query(self, q, k, ef, nprobe, rn, cb, method):
+    def _filter(self, filt):
+        """A callable, or ids that do not fit a bitmap: a Python callback, count None."""
+        if filt is None:
+            return None, None, None, None
+        if not callable(filt) and hasattr(self.lib, "kci_vec_filter_id_bits"):
+            b = _id_bits(filt)
+            if b is not None:
+                bits, nbits, m = b
+                st = _IdBits(bits.ctypes.data, nbits)
+                return C.cast(self.lib.kci_vec_filter_id_bits, _FILTER), C.cast(C.pointer(st), C.c_void_p), m, (bits, st)
+        return _make_filter(filt), None, None, None
+
+    def _query(self, q, k, ef, nprobe, rn, cb, method, ctx=None):
         s = self._searcher()
         use_lists = self._lists if method == "auto" else (method == "lists")
         if use_lists:
             if cb is not None:
-                return self.lib.kci_vec_search_ivf_filtered(s, q, k, nprobe, rn, cb, None, self._ob, self._os)
+                return self.lib.kci_vec_search_ivf_filtered(s, q, k, nprobe, rn, cb, ctx, self._ob, self._os)
             return self.lib.kci_vec_search_ivf(s, q, k, nprobe, rn, self._ob, self._os)
         if cb is not None:
-            return self.lib.kci_vec_search_filtered(s, q, k, ef, rn, cb, None, self._ob, self._os)
+            return self.lib.kci_vec_search_filtered(s, q, k, ef, rn, cb, ctx, self._ob, self._os)
         if rn and rn > 0:
             return self.lib.kci_vec_search_rerank(s, q, k, ef, rn, self._ob, self._os)
         return self.lib.kci_vec_search_r(s, q, k, ef, self._ob, self._os)
 
     def search(self, query, k=10, ef=None, nprobe=None, rerank_n=None, filter=None, method="auto"):
-        """A selective filter needs a larger nprobe / rerank_n to find k matches.
+        """A selective filter needs a larger nprobe / rerank_n to find the best k matches.
+        Filters that allow few ids: given a set / array, when (allowed ids) x dim <= exact_cells the query is compared
+        with every allowed vector, whatever the size of the index, and the answer is exact. With any filter, a search
+        that finds fewer than k answers is answered again by brute force, so no allowed id is left out when fewer than
+        k exist (a callable is then called once per vector). Both need the floats (rerank > 0).
         Small indexes: while count x dim <= exact_cells and the floats are kept (rerank > 0), a search with method
-        'auto' compares the query with every vector (with a filter: every vector whose id passes) and the answer is exact; ef / nprobe /
-        rerank_n are not used then. method='graph' / 'lists' or exact_cells = 0 gives the index's own search. Not for
-        metric 'ip'."""
+        'auto' compares the query with every vector (with a filter: every vector whose id passes) and the answer is
+        exact; ef / nprobe / rerank_n are not used then. method='graph' / 'lists' or exact_cells = 0 gives the index's
+        own search.
+        Larger indexes: when neither ef nor rerank_n is given, the width and the shortlist that build() measured for
+        this data are used (see calibrate)."""
         k = int(k)
         if method == "auto" and self._small_exact() and (filter is None or hasattr(self.lib, "kci_vec_search_exact_filtered")):
             return self.search_exact(query, k=k, threads=1, filter=filter)
-        ef = ef or max(k, 100); nprobe = int(nprobe or self.nprobe)
+        cb, ctx, m, _keep = self._filter(filter)
+        if m == 0:
+            return []
+        if (method == "auto" and m is not None and m * self.dim <= (self.exact_cells or 0) and self._exact_ok()
+                and hasattr(self.lib, "kci_vec_search_exact_filtered")):
+            _, q = _f32(np.reshape(query, -1))
+            n = self.lib.kci_vec_search_exact_filtered(self._v, q, k, 1, cb, ctx, self._ob, self._os)
+            return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]
+        ef = ef or max(k, self.default_ef()); nprobe = int(nprobe or self.nprobe)
         rn = self.rerank if rerank_n is None else rerank_n
+        if rerank_n is None and rn:
+            wide = self.default_rerank()
+            if wide > rn and ef >= wide:
+                rn = wide
         if method == "lists" or (method == "auto" and self._lists):
             rn = max(int(rn or 0), 2 * k)
         _, q = _f32(np.reshape(query, -1))
-        cb = _make_filter(filter)
-        n = self._query(q, k, ef, nprobe, int(rn or 0), cb, method)
+        n = self._query(q, k, ef, nprobe, int(rn or 0), cb, method, ctx)
         return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]
 
     def _small_exact(self):
-        if not self.exact_cells or self.metric == "ip" or not hasattr(self.lib, "kci_vec_has_floats"):
+        """True when search() should answer by brute force: built, full floats in the index, and count x dim within
+        exact_cells."""
+        return self._exact_ok() and self.lib.kci_vec_count(self._v) * self.dim <= self.exact_cells
+
+    def _exact_ok(self):
+        """True when brute force gives this index's scores: exact_cells not 0, built, full floats kept."""
+        if not self.exact_cells or not hasattr(self.lib, "kci_vec_has_floats"):
             return False
-        return (self.lib.kci_vec_count(self._v) * self.dim <= self.exact_cells and self.lib.kci_vec_has_floats(self._v) == 1
-                and (self.lib.kci_vec_is_built(self._v) != 0 or self._lists))
+        return self.lib.kci_vec_has_floats(self._v) == 1 and (self.lib.kci_vec_is_built(self._v) != 0 or self._lists)
 
     def search_many(self, queries, k=10, **kw):
         """Many queries at once. Returns (ids, scores): int64 / float32 arrays [nq, k], -1 / -inf (l2: +inf) where fewer than k."""
@@ -556,11 +682,13 @@ class KciVec:
         """Brute force (ground truth / tiny indexes). filter: as in search(); only the ids that pass are compared, so
         the answer is the exact top-k under the filter (fewer than k when fewer ids pass)."""
         _, q = _f32(np.reshape(query, -1))
-        cb = _make_filter(filter)
+        cb, ctx, m, _keep = self._filter(filter)
+        if m == 0:
+            return []
         if cb is not None:
             if not hasattr(self.lib, "kci_vec_search_exact_filtered"):
                 raise RuntimeError("this libkci_vec has no kci_vec_search_exact_filtered (built before 2026-11-26); rebuild it")
-            n = self.lib.kci_vec_search_exact_filtered(self._v, q, int(k), 1, cb, None, self._ob, self._os)
+            n = self.lib.kci_vec_search_exact_filtered(self._v, q, int(k), 1, cb, ctx, self._ob, self._os)
             return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]
         n = self.lib.kci_vec_search_exact(self._v, q, int(k), int(threads), self._ob, self._os)
         return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]

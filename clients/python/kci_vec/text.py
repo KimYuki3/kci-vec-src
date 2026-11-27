@@ -409,7 +409,7 @@ class TextIndex:
             return ([] if self.mode != "sparse" and self.vec is not None else None), ([] if self.mode != "dense" and self.sps is not None else None), {}, {}
         if self.mode != "sparse" and self.vec is not None:
             qv = np.ascontiguousarray(self._dense()([query], True), dtype=np.float32)[0]
-            dl, dp = self._texts_of(self.vec.search(qv, k=getd, ef=max(200, getd), filter=filter), depth)
+            dl, dp = self._texts_of(self.vec.search(qv, k=getd, ef=max(200, getd, self.vec.default_ef() if hasattr(self.vec, 'default_ef') else 0), filter=filter), depth)
         if self.mode != "dense" and self.sps is not None:
             ix, val = self._sparse()([query], True)[0]
             use_phrase = self.phrase and self.keep_text and bool(self.texts)

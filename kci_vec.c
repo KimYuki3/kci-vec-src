@@ -70,6 +70,9 @@ static void hp_pop(Heap *h){ h->a[0]=h->a[--h->n]; int i=0;
 /* ── index ──────────────────────────────────────────────────────────────── */
 struct KciVec {
     int dim, M, M0, efc; double mL;
+    int def_ef;
+    uint32_t unreached;
+    int def_rr;
     int8_t   *vq;       /* [cap*dim] signed int8 codes (x*gs), row-major */
     float     gs;       /* global quantization scale: code = round(x*gs), x unit-norm */
     float    *vf;       /* [cap*dim] retained unit floats (re-rank); malloc'd or mmap'd */
@@ -610,13 +613,16 @@ static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int la
 }
 
 static int select_neighbors(KciVec *v, const int8_t *q, Heap *W, int M, uint32_t *out){
-    int m=W->n; He *cand=malloc(sizeof(He)*m);
-    for(int i=0;i<m;i++) cand[i]=W->a[i];
-    for(int i=0;i<m;i++){ int mi=i; for(int j=i+1;j<m;j++) if(cand[j].d<cand[mi].d) mi=j; He t=cand[i];cand[i]=cand[mi];cand[mi]=t; }
+    int m=W->n; He *cand=malloc(sizeof(He)*m); float *cn=malloc(sizeof(float)*(m+1)), on[512];
+    const float nq=(float)sdot(v,q,q);
+    for(int i=0;i<m;i++){ cand[i]=W->a[i]; const int8_t *re=vrow(v,cand[i].id); cn[i]=(float)sdot(v,re,re); cand[i].d=nq+cn[i]+2.0f*cand[i].d; }
+    for(int i=0;i<m;i++){ int mi=i; for(int j=i+1;j<m;j++) if(cand[j].d<cand[mi].d) mi=j;
+        He t=cand[i];cand[i]=cand[mi];cand[mi]=t; float tn=cn[i];cn[i]=cn[mi];cn[mi]=tn; }
     int no=0, same=0, cap=M/2; size_t rb=(size_t)v->dim;
     for(int i=0;i<m&&no<M;i++){ uint32_t e=cand[i].id; int good=1; const int8_t *re=vrow(v,e);
-        for(int j=0;j<no;j++){ const int8_t *ro=vrow(v,out[j]); if(memcmp(re,ro,rb)==0 || vdist(v,re,ro)<cand[i].d){ good=0; break; } }
-        if(good) out[no++]=e; }
+        for(int j=0;j<no;j++){ const int8_t *ro=vrow(v,out[j]); if(memcmp(re,ro,rb)==0 || cn[i]+on[j]+2.0f*vdist(v,re,ro)<cand[i].d){ good=0; break; } }
+        if(good){ on[no]=cn[i]; out[no++]=e; } }
+    free(cn);
     for(int i=0;i<m&&no<M;i++){ uint32_t e=cand[i].id; int dup=0, idn=0; const int8_t *re=vrow(v,e);
         for(int j=0;j<no;j++){ if(out[j]==e){dup=1;break;} if(!idn && memcmp(re,vrow(v,out[j]),rb)==0) idn=1; }
         if(dup || (idn && same>=cap)) continue;
@@ -1333,7 +1339,7 @@ static int kv_build(KciVec *v, int threads, double *out_secs, int fast){
         build_worker(&ba);
         for(int t=0;t<T-1;t++) pthread_join(th[t],NULL);
     }
-    repair_reach(v);
+    v->unreached=repair_reach(v);
     clock_gettime(CLOCK_MONOTONIC,&t1);
     v->built=1;
     uint32_t bits=1; while((1u<<bits) < N*2u) bits++;
@@ -1501,7 +1507,7 @@ static int kci_vec_search_0(KciVec *v, const float *query, int k, int ef,
 }
 
 /* reusable per-thread searcher: amortizes the visited-set allocation */
-struct KciVecSearcher { int uniq; KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
+struct KciVecSearcher { int uniq; int nofill; KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
 static int kv_l2_qs(KciVecSearcher *s, const float **q, double *qn2){
     if(!s || !s->v->l2 || !s->l2q || *q==s->l2q) return 0;
     *qn2 = kv_l2_query(s->v, *q, s->l2q); *q = s->l2q;
@@ -3487,7 +3493,7 @@ int kci_vec_save_ex(KciVec *v, const char *path, const uint8_t *key, int keylen,
     const int wtw = v->dedup || (v->tw && v->tw->ntw);
     uint32_t flags = (io.kind?KV_FLAG_ENC:0) | (v->built?KV_FLAG_GRAPH:0) | (v->vf && !nofloat?KV_FLAG_FLOAT:0) | (v->ivf?KV_FLAG_IVF:0)
                    | (nofloat?KV_FLAG_FLOAT_EXT:0) | (rawkey && io.kind?KV_FLAG_RAWKEY:0) | (wqg || wvh ? KV_FLAG_QG : 0);
-    uint32_t hdr[8] = { flags, (uint32_t)v->dim, (uint32_t)v->M, (uint32_t)v->efc,
+    uint32_t hdr[8] = { flags | ((uint32_t)(v->def_ef>0 && v->def_ef<32768 ? v->def_ef | (v->def_rr ? 0x8000 : 0) : 0) << 16), (uint32_t)v->dim, (uint32_t)v->M, (uint32_t)v->efc,
                         v->count, v->built?(uint32_t)v->maxlevel:0, v->ep, 0 };
     memcpy(&hdr[7], &v->gs, sizeof(float));            /* global SQ scale */
     int ok=1;
@@ -3632,7 +3638,7 @@ static KciVec *kv_load(FILE *f, const uint8_t *key, int keylen, KvIO *io, int lf
         if(!v->vf){ kci_vec_free(v); return NULL; }
         kv_zero_lazy(v->vf, (size_t)v->cap*dim*sizeof(float));
     }
-    v->count=count; v->gs=gs;
+    v->count=count; v->gs=gs; v->def_ef=(int)((flags>>16)&0x7fff); v->def_rr=(int)(flags>>31);
     if(flags & KV_FLAG_GRAPH){
         v->gN=count;
         v->level=calloc(count,1);
@@ -4601,6 +4607,15 @@ int kci_vec_has_floats(const KciVec *v){ return v && v->keepf && v->vf ? 1 : 0; 
 
 #define KV_TW_S(s) ((s) ? (s)->v : NULL), ((s) ? (s)->uniq : 0)
 int kci_vec_searcher_set_unique(KciVecSearcher *s, int on){ if(!s) return -1; s->uniq = on?1:0; return 0; }
+int kci_vec_searcher_set_filter_fill(KciVecSearcher *s, int on){ if(!s) return -1; s->nofill = on?0:1; return 0; }
+static int kv_filt_fill(KciVecSearcher *s, const float *query, int k, int r, KciVecFilter filt, void *ctx,
+                        uint64_t *out_ids, float *out_scores){
+    if(!s || !filt || r<0 || r>=(k<1?1:k) || s->nofill) return r;
+    KciVec *v=s->v;
+    if(v->so || !(v->keepf && v->vf)) return r;
+    int e=kci_vec_search_exact_0(v, query, k, 1, filt, ctx, out_ids, out_scores);
+    return e<0 ? r : e;
+}
 int kci_vec_search(KciVec *v, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
     kv_tw_depth++; int r=kci_vec_search_0(v, query, k, ef, out_ids, out_scores);
     return kv_tw_out(v, 0, NULL, NULL, r, k, out_ids, out_scores); }
@@ -4618,10 +4633,97 @@ int kci_vec_search_exact_filtered(KciVec *v, const float *query, int k, int thre
 int kci_vec_filter_id_bits(uint64_t id, void *ctx){
     const KciVecIdBits *b=(const KciVecIdBits*)ctx;
     return b && id < b->nbits && ((b->bits[id>>6] >> (id&63)) & 1); }
+
+int kci_vec_default_ef(const KciVec *v){ return v ? v->def_ef : 0; }
+int kci_vec_default_rerank(const KciVec *v){ return v && v->def_rr ? v->def_ef : 0; }
+int kci_vec_set_default_ef(KciVec *v, int ef){ if(!v || ef<0 || ef>32767) return -1; v->def_ef=ef; v->def_rr=0; return 0; }
+static float kv_cal_recall(KciVecSearcher *s, const float *q, int S, int ud, int k, int ef, int rr,
+                           const uint64_t *tr, const int *tn, const uint64_t *own, uint64_t *got){
+    long hit=0, tot=0; int k1=k+1;
+    for(int i=0;i<S;i++){
+        int n=kci_vec_search_rerank(s, q+(size_t)i*ud, k1, ef, rr>k1 ? rr : k1, got, NULL), m=0;
+        if(n>k1) n=k1;
+        for(int j=0;j<n && m<tn[i];j++){ if(got[j]==own[i]) continue;
+            m++;
+            for(int t=0;t<tn[i];t++) if(tr[(size_t)i*k+t]==got[j]){ hit++; break; } }
+        tot+=tn[i];
+    }
+    return tot ? (float)hit/(float)tot : 0;
+}
+static int kv_calibrate(KciVec *v, const float *queries, int nq, int k, int rerank_n, float target, int samples, int threads, float *out_recall){
+    static const int efs[4]={ 200, 400, 800, 1600 };
+    if(!v || !v->built || v->so || !(v->keepf && v->vf) || v->count<2) return -1;
+    if(queries){ if(nq<8) return -1;
+        samples = nq>4096 ? 4096 : nq; }
+    if(k<1) k=10;
+    if(k>100) k=100;
+    if(!(target>0) || target>1) target=0.98f;
+    if(samples<=0) samples=128;
+    if((uint32_t)samples>v->count) samples=(int)v->count;
+    int ud=kci_vec_dim(v), k1=k+1, cap=k1+64, S=0, pick=-1;
+    float *q=malloc((size_t)samples*(size_t)ud*sizeof(float));
+    uint64_t *tr=malloc((size_t)samples*(size_t)k*sizeof(uint64_t)), *own=malloc((size_t)samples*sizeof(uint64_t)), *got=malloc((size_t)cap*sizeof(uint64_t)*8);
+    int *tn=malloc((size_t)samples*sizeof(int));
+    KciVecSearcher *s=kci_vec_searcher_new(v);
+    if(!q || !tr || !own || !got || !tn || !s) goto done;
+    uint64_t x=0x9E3779B97F4A7C15ull;
+    if(queries){
+        memcpy(q, queries, (size_t)samples*(size_t)ud*sizeof(float));
+        for(int i=0;i<samples;i++){
+            int n=kci_vec_search_exact(v, q+(size_t)i*ud, k, threads, got, NULL);
+            if(n<0) n=0;
+            if(n>k) n=k;
+            for(int j=0;j<n;j++) tr[(size_t)i*k+j]=got[j];
+            own[i]=UINT64_MAX; tn[i]=n; }
+        S=samples;
+    }
+    else for(int tries=0; S<samples && tries<samples*8; tries++){
+        x = x*6364136223846793005ull + 1442695040888963407ull;
+        uint32_t row=(uint32_t)((x>>33) % v->count);
+        if(v->dead && v->dead[row]) continue;
+        float *qs=q+(size_t)S*ud;
+        if(kci_vec_get_float(v, row, qs)!=0) continue;
+        int n=kci_vec_search_exact(v, qs, k1, threads, got, NULL), m=0;   /* got has room for the ids that share rows */
+        if(n<2) continue;
+        if(n>k1) n=k1;
+        for(int i=0;i<n && m<k;i++) if(got[i]!=v->vid[row]) tr[(size_t)S*k + m++]=got[i];
+        own[S]=v->vid[row]; tn[S]=m; S++;
+    }
+    if(S<8) goto done;
+    float rec=0; int wide=0;
+    for(int e=0;e<4;e++){
+        rec=kv_cal_recall(s, q, S, ud, k, efs[e], rerank_n, tr, tn, own, got);
+        pick=efs[e]; wide=0;
+        if(rec>=target) break;
+        if(efs[e]>rerank_n && efs[e]>k1){                       /* the same width, every row of it to the floats */
+            float rw=kv_cal_recall(s, q, S, ud, k, efs[e], efs[e], tr, tn, own, got);
+            if(rw>=target || (e==3 && rw>rec+0.005f)){ rec=rw; wide=1; }
+            if(rw>=target) break;
+        }
+    }
+    v->def_ef=pick; v->def_rr=wide;
+    if(out_recall) *out_recall=rec;
+done:
+    if(s) kci_vec_searcher_free(s);
+    free(q); free(tr); free(own); free(got); free(tn);
+    return pick;
+}
+int kci_vec_calibrate(KciVec *v, int k, int rerank_n, float target, int samples, int threads, float *out_recall){
+    return kv_calibrate(v, NULL, 0, k, rerank_n, target, samples, threads, out_recall); }
+int kci_vec_calibrate_queries(KciVec *v, const float *queries, int nq, int k, int rerank_n, float target, int threads, float *out_recall){
+    if(!queries) return -1;
+    return kv_calibrate(v, queries, nq, k, rerank_n, target, 0, threads, out_recall); }
+uint32_t kci_vec_unreached(const KciVec *v){ return v ? v->unreached : 0; }
+static inline void kv_def_width(const KciVecSearcher *s, int *ef, int *rerank_n){
+    if(*ef>0 || !s || !s->v || s->v->def_ef<=0) return;
+    *ef=s->v->def_ef;
+    if(s->v->def_rr && *rerank_n<*ef) *rerank_n=*ef;
+}
 int kci_vec_search_r(KciVecSearcher *s, const float *query, int k, int ef, uint64_t *out_ids, float *out_scores){
     kv_tw_depth++; int r=kci_vec_search_r_0(s, query, k, ef, out_ids, out_scores);
     return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
 int kci_vec_search_rerank(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n, uint64_t *out_ids, float *out_scores){
+    kv_def_width(s, &ef, &rerank_n);
     kv_tw_depth++; int r=kci_vec_search_rerank_0(s, query, k, ef, rerank_n, out_ids, out_scores);
     return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
 int kci_vec_search_ivf(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n, uint64_t *out_ids, float *out_scores){
@@ -4642,8 +4744,10 @@ int kci_vec_search_filtered(KciVecSearcher *s, const float *query, int k, int ef
                             KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
     KvTwF w={ s ? s->v : NULL, filt, ctx };
     int wrap = s && filt && s->v->tw && s->v->tw->ntw && kv_tw_depth==0;
+    kv_def_width(s, &ef, &rerank_n);
     kv_tw_depth++;
     int r=kci_vec_search_filtered_0(s, query, k, ef, rerank_n, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
+    r=kv_filt_fill(s, query, k, r, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
     return kv_tw_out(KV_TW_S(s), wrap ? filt : NULL, ctx, r, k, out_ids, out_scores); }
 int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n,
                                 KciVecFilter filt, void *ctx, uint64_t *out_ids, float *out_scores){
@@ -4651,4 +4755,5 @@ int kci_vec_search_ivf_filtered(KciVecSearcher *s, const float *query, int k, in
     int wrap = s && filt && s->v->tw && s->v->tw->ntw && kv_tw_depth==0;
     kv_tw_depth++;
     int r=kci_vec_search_ivf_filtered_0(s, query, k, nprobe, rerank_n, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
+    r=kv_filt_fill(s, query, k, r, wrap ? kv_tw_filt : filt, wrap ? (void*)&w : ctx, out_ids, out_scores);
     return kv_tw_out(KV_TW_S(s), wrap ? filt : NULL, ctx, r, k, out_ids, out_scores); }

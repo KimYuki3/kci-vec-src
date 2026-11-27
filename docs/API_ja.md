@@ -157,7 +157,7 @@ hits = v.search(query, k=10, filter=lambda i: i % 2 == 0) # id -> bool の関数
 絞り込みは、探した後ではなく、探している最中にかかります。そのため、条件に合うものが少なくても、その中でいちばん近いものが返ります。
 
 - 条件に合うものが全体のわずかなとき: 区分け方式なら `nprobe` と `rerank_n` を、グラフ方式なら `ef` を大きくします。
-- ほんの数件しかないとき: `search_exact(query, k, filter=...)` で、通るものだけを総当たりします (小さな索引では、何も指定しなくてもそうなります)。
+- ほんの数件しかないとき: 何も指定しなくて構いません。番号の集合・リスト・配列を渡し、それが十分に少なければ、索引の大きさに関係なく、`search` は通るベクトルだけと比べます。どの形の絞り込みでも、見つかった答えが `k` 個に届かないときは、通るものだけを総当たりして答え直すので、通るものを取りこぼしません (0.2.19 から。関数を渡した場合、そのときは全部のベクトルについて 1 回ずつ呼ばれます)。`search_exact(query, k, filter=...)` は、同じことを指定して行います。
 
 ### 追加・削除・詰め直し
 
@@ -255,7 +255,9 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # 点数は内積。大きい�
 | `M`、`efc` | グラフを作るときの設定。1 点あたりのつながりの数と、作るときの探す幅。16 / 200 が無難な既定です |
 | `rerank` | 既定は 200。float のベクトルを持ち、検索のたびに上位 200 件の候補を正確に比べ直す。`build_lists`、`insert`、`compact` に必要。`rerank=0` にすると 1 バイトの行だけを持つ (メモリは 1 次元あたり 5 バイト → 1 バイト、取りこぼしは増える)。0.2.16 までの既定は 0 でした |
 
-小さな索引は総当たりで答えます。「件数 × 次元」が `exact_cells` (既定 1,000 万。1,024 次元で 1 万件、384 次元で 2.6 万件) 以下で、float のベクトルを持っている索引では、`search` は質問を全部のベクトルと比べ、答えは正確です (`ef`・`nprobe`・`rerank_n` は使われません)。`filter` をつけたときは、通る番号のベクトルだけと比べます (0.2.17 では、`filter` つきは索引の探し方のままでした)。`method="graph"` / `"lists"` を指定したとき、内積 (`metric="ip"`) のときは索引の探し方のままです。`v.exact_cells = 0` で切れます。
+小さな索引は総当たりで答えます。「件数 × 次元」が `exact_cells` (既定 1,000 万。1,024 次元で 1 万件、384 次元で 2.6 万件) 以下で、float のベクトルを持っている索引では、`search` は質問を全部のベクトルと比べ、答えは正確です (`ef`・`nprobe`・`rerank_n` は使われません)。`filter` をつけたときは、通る番号のベクトルだけと比べます (0.2.17 では、`filter` つきは索引の探し方のままでした)。`method="graph"` / `"lists"` を指定したときは索引の探し方のままです。`v.exact_cells = 0` で切れます。0.2.19 から、内積 (`metric="ip"`) の索引も対象です。
+
+それより大きな索引は、自分に要る探す幅を測ります (0.2.19 から)。`build` の最後に、入っているベクトルの一部を質問にして総当たりの答えと比べ、`ef` 200 / 400 / 800 / 1600 のうち、本当の上位 10 件の 98 % を見つけられる一番狭い幅を `search` の既定にします (どれも届かなければ一番広い幅)。正確に比べ直す候補の数も、200 件で足りないときは一緒に決めます。そのため、何も指定しない `search` は、幅が要るデータでは広く (遅く) なり、要らないデータでは変わりません。結果は `save` / `load` で保たれます。一番広い設定でも 97 % に届かないとき、グラフの検索でたどり着けない行が残ったときは、`build` が警告を出します。測るのに使うのは入っているベクトルです。質問がそれと違う種類のとき (画像のベクトルを文章で探す、内積のデータの多く) は、質問をいくつか `calibrate(queries=...)` に渡してください。自分で渡した `ef` や `rerank_n` は、そのまま使われます。`build` の前に `v.auto_ef = False` とすると、測りません。
 | `metric` | `"cosine"`、`"l2"`、`"ip"` (内積) |
 | `max_norm` | `l2` と `ip` で、ベクトルの長さの上限。0 = 自動 |
 | `centre` | `ip` だけ。ベクトルの平均を引いてから索引に入れる。順位は変わらない |
@@ -276,6 +278,8 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # 点数は内積。大きい�
 | `build(threads=0, fast=False)` | グラフを作る。0 = 全コア。かかった秒数を返す。区分け方式を作ってあると消えるので、両方使うなら**グラフを先に**作る。`fast=True` は、作る時間を優先した作り方 |
 | `build_qg(dims_per_code=1, threads=0, code_dims=0, gate_dims=0, residual=False)` | 量子化グラフを作る (`build` か `load` のあと)。`dims_per_code` は 1 = 細かい、2 = 大きさが半分。使うバイト数を返す。残りの 3 つは、次元の高いデータで索引を小さくするための設定 (下を参照) |
 | `build_lists(nlist=0, soar=0.0, threads=0, nprobe=None, ...)` | 区分け方式を作る。`nlist` 0 = 自動。`soar` 1.5 で、各ベクトルを 2 つ目のかたまりにも入れる。`nprobe` は探すときの既定値。残りの引数は 0 = 自動 |
+
+| `calibrate(k=10, target=0.98, samples=128, threads=0, queries=None)` | この索引に要る探す幅を測り、`search` の既定にする (上の説明。`exact_cells` を超える索引では `build` が呼ぶ)。`queries`: 入っているベクトルの代わりに使う、自分の質問 (8 個以上)。`(ef, 本当の上位 k 件のうち見つかった割合)` を返す。結果は `default_ef()`、`default_rerank()`、`calibrated_recall` で読める |
 
 `build_qg` の、索引を小さくする設定 (次元が 384 以上のデータ向け):
 
@@ -427,7 +431,8 @@ kci_vec_free(v);
 | グラフ | `kci_vec_build`、`kci_vec_build_fast`、`kci_vec_search` (たまに探すとき)、`kci_vec_searcher_new` / `_free`、`kci_vec_search_r`、`kci_vec_search_rerank`、`kci_vec_search_filtered`、`kci_vec_searcher_set_eps`、`kci_vec_searcher_set_unique` |
 | 量子化グラフ | `kci_vec_build_qg`、`kci_vec_build_qg_ex`、`kci_vec_build_qg_gate`、`kci_vec_build_qg_res`、`kci_vec_qg_bytes`、`kci_vec_searcher_set_qg`、`kci_vec_searcher_set_qg_exact` |
 | 区分け方式 | `kci_vec_build_ivf`、`kci_vec_build_ivf_ex`、`kci_vec_build_ivf_p` (すべての設定)、`kci_vec_set_ivf_codes`、`kci_vec_set_ivf_training`、`kci_vec_search_ivf`、`kci_vec_search_ivf_filtered`、`kci_vec_searcher_set_probe_gap`、`kci_vec_searcher_set_rerank_int8` |
-| 総当たり | `kci_vec_search_exact` |
+| 総当たり | `kci_vec_search_exact`、`kci_vec_search_exact_filtered`、`kci_vec_filter_id_bits` |
+| 探す幅 | `kci_vec_calibrate`、`kci_vec_calibrate_queries`、`kci_vec_default_ef`、`kci_vec_default_rerank`、`kci_vec_set_default_ef` (`kci_vec_search_rerank` / `kci_vec_search_filtered` は `ef` に 0 を渡すと測った幅を使う)、`kci_vec_unreached`、`kci_vec_searcher_set_filter_fill` |
 | 変える | `kci_vec_insert`、`kci_vec_delete`、`kci_vec_forget` (そのベクトルの跡をすべて消す)、`kci_vec_compact`、`kci_vec_squeeze` |
 | float | `kci_vec_half_floats`、`kci_vec_float_mmap`、`kci_vec_set_float_source` (並べ直しのときに、自分の保管先から float を取ってくる)、`kci_vec_set_float`、`kci_vec_get_float` |
 | 保存・読み込み | `kci_vec_save`、`kci_vec_load`、`kci_vec_save_ex` / `kci_vec_load_ex` (`KCI_VEC_SAVE_NO_FLOAT`、`KCI_VEC_SAVE_RAW_KEY`) |
