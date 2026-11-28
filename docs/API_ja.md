@@ -280,6 +280,8 @@ p = KciVec(dim=384, rerank=400, metric="ip")     # 点数は内積。大きい�
 | `build_lists(nlist=0, soar=0.0, threads=0, nprobe=None, ...)` | 区分け方式を作る。`nlist` 0 = 自動。`soar` 1.5 で、各ベクトルを 2 つ目のかたまりにも入れる。`nprobe` は探すときの既定値。残りの引数は 0 = 自動 |
 
 | `calibrate(k=10, target=0.98, samples=128, threads=0, queries=None)` | この索引に要る探す幅を測り、`search` の既定にする (上の説明。`exact_cells` を超える索引では `build` が呼ぶ)。`queries`: 入っているベクトルの代わりに使う、自分の質問 (8 個以上)。`(ef, 本当の上位 k 件のうち見つかった割合)` を返す。結果は `default_ef()`、`default_rerank()`、`calibrated_recall` で読める |
+| `judge(k=10, target=0.99, samples=4096, queries=None)` | (0.2.20 から) 質問ごとに探す幅を索引に決めさせる。呼んだあとは、`ef` を指定しない `search` が、少しで足りる質問には少ない手間で答える。`ef` を指定した検索は変わらない。`k`: 検索で求める件数 (2〜64)。`queries`: 入っているベクトルの代わりに使う、自分の質問 (200 個以上)。`(使うかどうか, 効き目)` を返す。使うかどうかが False のときは、この索引では効かないと測ったということで、`search` は元のまま。絞り込みなしのグラフの検索、`cosine` と `l2` が対象。保存されないので、`load` や `build` のあとは呼び直す。`judge(samples=0)` で止める |
+| `choose_method(k=10, target=0.98, queries=None, samples=1000, nlist=0, threads=0)` | (0.2.20 から) グラフと区分け方式のどちらがこのデータに合うかを測り、`method` を指定しない `search` がそれを使うようにする。区分け方式がまだ無ければ作り、見本を両方の方式で探して正確な答えと比べ、`target` (本当の上位 `k` 件のうち見つかる割合) に届く設定のうち速いほうを残す。`method` と、`graph`・`lists` それぞれの設定・見つかった割合・1 問あたりのミリ秒が入った dict を返す。時間はその機械・1 スレッドで測るので、ほかの仕事が動いていないときに呼ぶ。見本は、`queries` を渡さなければ入っているベクトル。自分の質問を渡したほうが、実際に近い結果になる。保存されないので、`load` のあとは呼び直す |
 
 `build_qg` の、索引を小さくする設定 (次元が 384 以上のデータ向け):
 
@@ -432,9 +434,9 @@ kci_vec_free(v);
 | 量子化グラフ | `kci_vec_build_qg`、`kci_vec_build_qg_ex`、`kci_vec_build_qg_gate`、`kci_vec_build_qg_res`、`kci_vec_qg_bytes`、`kci_vec_searcher_set_qg`、`kci_vec_searcher_set_qg_exact` |
 | 区分け方式 | `kci_vec_build_ivf`、`kci_vec_build_ivf_ex`、`kci_vec_build_ivf_p` (すべての設定)、`kci_vec_set_ivf_codes`、`kci_vec_set_ivf_training`、`kci_vec_search_ivf`、`kci_vec_search_ivf_filtered`、`kci_vec_searcher_set_probe_gap`、`kci_vec_searcher_set_rerank_int8` |
 | 総当たり | `kci_vec_search_exact`、`kci_vec_search_exact_filtered`、`kci_vec_filter_id_bits` |
-| 探す幅 | `kci_vec_calibrate`、`kci_vec_calibrate_queries`、`kci_vec_default_ef`、`kci_vec_default_rerank`、`kci_vec_set_default_ef` (`kci_vec_search_rerank` / `kci_vec_search_filtered` は `ef` に 0 を渡すと測った幅を使う)、`kci_vec_unreached`、`kci_vec_searcher_set_filter_fill` |
+| 探す幅 | `kci_vec_calibrate`、`kci_vec_calibrate_queries`、`kci_vec_default_ef`、`kci_vec_default_rerank`、`kci_vec_set_default_ef` (`kci_vec_search_rerank` / `kci_vec_search_filtered` は `ef` に 0 を渡すと測った幅を使う)、`kci_vec_judge`、`kci_vec_judge_queries`、`kci_vec_judged`、`kci_vec_judge_off`、`kci_vec_graph_recall`、`kci_vec_unreached`、`kci_vec_searcher_set_filter_fill` |
 | 変える | `kci_vec_insert`、`kci_vec_delete`、`kci_vec_forget` (そのベクトルの跡をすべて消す)、`kci_vec_compact`、`kci_vec_squeeze` |
-| float | `kci_vec_half_floats`、`kci_vec_float_mmap`、`kci_vec_set_float_source` (並べ直しのときに、自分の保管先から float を取ってくる)、`kci_vec_set_float`、`kci_vec_get_float` |
+| float | `kci_vec_half_floats`、`kci_vec_float_mmap`、`kci_vec_set_float_source` (並べ直しのときに、自分の保管先から float を取ってくる)、`kci_vec_set_float`、`kci_vec_get_float`、`kci_vec_row_id` (その行のベクトルの id) |
 | 保存・読み込み | `kci_vec_save`、`kci_vec_load`、`kci_vec_save_ex` / `kci_vec_load_ex` (`KCI_VEC_SAVE_NO_FLOAT`、`KCI_VEC_SAVE_RAW_KEY`) |
 | 読むだけの共有 | `kci_vec_image_save`、`kci_vec_attach`、`kci_vec_attach_mem`、`kci_vec_thaw` |
 | 探すだけの索引 | `kci_vec_search_only` |

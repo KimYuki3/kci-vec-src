@@ -420,6 +420,10 @@ int     kci_vec_plain_bytes(const KciVec *v, uint64_t out[6]);
 /* Reconstruct a float (unit-norm) view of stored vector i into out[dim]:
  * the exact float if keep_float was on, else the int8 row dequantized. */
 int      kci_vec_get_float(const KciVec *v, uint32_t i, float *out);
+/* The id of the vector in row i, rows counted as kci_vec_get_float counts them (the order of kci_vec_add until a
+ * build; a build may reorder rows). UINT64_MAX when i is not a row. With deduplication a row can stand for several
+ * ids: this is the first. */
+uint64_t kci_vec_row_id(const KciVec *v, uint32_t i);
 
 uint32_t kci_vec_count(const KciVec *v);
 /* How many rows are exact copies of another row? Counted on the int8 rows of a built index (graph or lists),
@@ -468,6 +472,26 @@ int      kci_vec_calibrate_queries(KciVec *v, const float *queries, int nq, int 
  * saved, 0 after a load). */
 uint32_t kci_vec_unreached(const KciVec *v);
 int      kci_vec_set_default_ef(KciVec *v, int ef);          /* 0..32767, 0 = forget it (kci_vec_default_rerank becomes 0 too); 0 on success */
+/* Let the index decide the search width for each query. After kci_vec_judge, a search that leaves the width to the
+ * index (kci_vec_search_rerank with ef <= 0) can answer the queries that need little with less work; searches with an
+ * explicit ef are unchanged. The rule is prepared from `samples` stored vectors (0 = 4,096), or from the caller's own
+ * queries (kci_vec_judge_queries: 200 or more, up to 8,192 are used). k: the number of results the searches will
+ * ask for, 2..64 (a search that asks for more is not judged). target: the share of a wide search's answer to keep,
+ * 0..1 (0 = 0.99). out_gain (may be NULL): the measured ratio of work against a fixed width.
+ * Returns 1 when the rule is in use, 0 when it was measured not to help on this index (searches stay as they
+ * were), -1 on error (not built, no float vectors kept, an inner-product index, too small an index, k out of range,
+ * too few queries). For graph searches without a filter. The rule is not saved, and a build drops it: call again.
+ * Not while other threads search. kci_vec_judged: 1 when a rule is in use. kci_vec_judge_off: forget it. */
+int      kci_vec_judge(KciVec *v, int k, float target, int samples, float *out_gain);
+int      kci_vec_judge_queries(KciVec *v, const float *queries, int nq, int k, float target, float *out_gain);
+int      kci_vec_judged(const KciVec *v);
+int      kci_vec_judge_off(KciVec *v);
+/* The graph search's recall@k at n search widths, estimated without queries of your own: `samples` stored vectors
+ * (0 = 1,000) are used as questions and compared with brute force. ef: n widths, ascending, each above k and at most
+ * the number of vectors; the shortlist is as long as the width. out_recall: n values.
+ * Returns the number of samples used, or -1 (not built, no float vectors kept, an inner-product index, k outside
+ * 1..64, widths not ascending, n above 64). */
+int      kci_vec_graph_recall(KciVec *v, int k, int samples, const int *ef, int n, int threads, float *out_recall);
 
 #ifdef __cplusplus
 }

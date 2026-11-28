@@ -82,4 +82,8 @@ r_wide, r_200 = rg(), rg(rerank_n=200)
 check("groups of 400: the calibration widens the float pass", v.default_rerank() == v.default_ef() > 200, f"(ef {v.default_ef()}, rerank {v.default_rerank()})")
 check("groups of 400: search() with nothing given uses it", r_wide >= 0.95 and r_wide > r_200 + 0.1, f"(rerank 200: {r_200:.4f}, default: {r_wide:.4f})")
 
+v0 = KciVec(dim=64); v0.exact_cells = 0; v0.add_many(np.arange(20000, dtype=np.int64), X[:20000, :64].copy()); v0.build()
+check("exact_cells = 0: build() still calibrates", v0.default_ef() in (200, 400, 800, 1600) and v0.calibrated_recall is not None, f"(ef {v0.default_ef()})")
+v1 = KciVec(dim=64); v1.exact_cells = 0; v1.auto_ef = False; v1.add_many(np.arange(20000, dtype=np.int64), X[:20000, :64].copy()); v1.build()
+check("auto_ef = False: not calibrated", v1.default_ef() == 100 and v1.calibrated_recall is None)
 print("ALL OK" if ok else "FAILED"); sys.exit(0 if ok else 1)

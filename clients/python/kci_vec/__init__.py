@@ -182,6 +182,13 @@ def _bind(lib):
         s.kci_vec_searcher_set_filter_fill.restype = C.c_int; s.kci_vec_searcher_set_filter_fill.argtypes = [C.c_void_p, C.c_int]
     if hasattr(s, "kci_vec_default_rerank"):
         s.kci_vec_default_rerank.restype = C.c_int; s.kci_vec_default_rerank.argtypes = [C.c_void_p]
+    if hasattr(s, "kci_vec_judge"):
+        s.kci_vec_judge.restype = C.c_int
+        s.kci_vec_judge.argtypes = [C.c_void_p, C.c_int, C.c_float, C.c_int, C.POINTER(C.c_float)]
+        s.kci_vec_judge_queries.restype = C.c_int
+        s.kci_vec_judge_queries.argtypes = [C.c_void_p, c_f32p, C.c_int, C.c_int, C.c_float, C.POINTER(C.c_float)]
+        s.kci_vec_judged.restype = C.c_int;         s.kci_vec_judged.argtypes = [C.c_void_p]
+        s.kci_vec_judge_off.restype = C.c_int;      s.kci_vec_judge_off.argtypes = [C.c_void_p]
     if hasattr(s, "kci_vec_calibrate_queries"):
         s.kci_vec_calibrate_queries.restype = C.c_int
         s.kci_vec_calibrate_queries.argtypes = [C.c_void_p, c_f32p, C.c_int, C.c_int, C.c_int, C.c_float, C.c_int, C.POINTER(C.c_float)]
@@ -330,7 +337,8 @@ class KciVec:
         if rc == 0 and hasattr(self.lib, "kci_vec_unreached") and self.lib.kci_vec_unreached(self._v):
             warnings.warn("kci_vec: %d rows cannot be reached by the graph search after this build (search_exact still "
                           "finds them)" % self.lib.kci_vec_unreached(self._v), RuntimeWarning, stacklevel=2)
-        if (rc == 0 and self.auto_ef and hasattr(self.lib, "kci_vec_calibrate") and self._exact_ok() and not self._small_exact()):
+        if (rc == 0 and self.auto_ef and hasattr(self.lib, "kci_vec_calibrate") and self.rerank
+                and hasattr(self.lib, "kci_vec_has_floats") and self.lib.kci_vec_has_floats(self._v) == 1 and not self._small_exact()):
             ef, rec = self.calibrate(threads=threads)
             if rec < 0.98 - 0.01:
                 warnings.warn("kci_vec: at the widest search tried (ef %d) the index finds %.1f %% of the true 10 nearest of "
@@ -360,6 +368,104 @@ class KciVec:
             raise RuntimeError("calibrate needs a built graph with the float vectors kept (rerank > 0)" + (", and 8 or more queries" if queries is not None else ""))
         self.calibrated_recall = float(r.value)
         return ef, float(r.value)
+
+    def judge(self, k=10, target=0.99, samples=4096, queries=None):
+        """Let the index decide the search width for each query. After judge(), search() without ef can answer the
+        queries that need little with less work; a search with an explicit ef is unchanged.
+        The rule is prepared from `samples` stored vectors, or from your own `queries` (200 or more rows; use them
+        when your questions do not look like the stored vectors). k: the number of results your searches ask for
+        (2..64). target: the share of a wide search's answer to keep.
+        Returns (in_use, gain): in_use False means the rule was measured not to help on this index and search()
+        stays as it was; gain is the measured ratio of work against a fixed width.
+        For graph searches of up to k results without a filter; not for metric "ip". Not saved: call it again after
+        load() or build(). judge(samples=0) forgets the rule."""
+        if not hasattr(self.lib, "kci_vec_judge"):
+            raise RuntimeError("this libkci_vec has no kci_vec_judge (built before 2026-11-28); rebuild it")
+        if queries is None and samples == 0:
+            self.lib.kci_vec_judge_off(self._v); return False, 0.0
+        g = C.c_float(0.0)
+        if queries is not None:
+            Qa = np.ascontiguousarray(queries, dtype=np.float32).reshape(-1, self.dim)
+            r = self.lib.kci_vec_judge_queries(self._v, Qa.ctypes.data_as(c_f32p), len(Qa), int(k), float(target), C.byref(g))
+        else:
+            r = self.lib.kci_vec_judge(self._v, int(k), float(target), int(samples), C.byref(g))
+        if r < 0:
+            raise RuntimeError("judge: needs a built graph with the floats kept (rerank > 0), cosine or l2, 400 vectors or more, k 2..64, 200 queries or more")
+        return bool(r), float(g.value)
+
+    def _use_lists(self, method):
+        """True when a search with this method goes through the lists."""
+        return method == "lists" or (method == "auto" and self._lists and getattr(self, "_prefer", "lists") != "graph")
+
+    def choose_method(self, k=10, target=0.98, queries=None, samples=1000, nlist=0, threads=0):
+        """Measure which way of searching suits this data, the graph or the lists, and make it what search() does when
+        no method is given. The lists are built if they are not there (build_lists(nlist, threads=threads)); then
+        `samples` stored vectors, or your own `queries`, are searched both ways at growing widths and compared with
+        the exact answer, and the faster of the two settings that reach `target` (recall@k) is kept: the method, and
+        its ef or nprobe. If neither reaches the target, the one with the higher recall is kept.
+        Returns a dict: 'method', and for 'graph' / 'lists' the setting, its recall and its milliseconds a query.
+        Times are taken here, on this machine, one thread: run it when the machine is quiet. Needs the floats
+        (rerank > 0) and a built graph. Stored vectors stand in for real questions only roughly: give `queries` when
+        you have them, or a target a little above what you need. Not saved: call it again after load(). build() and
+        calibrate() set the width again."""
+        import time
+        if (not self.rerank or self.lib.kci_vec_is_built(self._v) == 0
+                or (hasattr(self.lib, "kci_vec_has_floats") and self.lib.kci_vec_has_floats(self._v) != 1)):
+            raise RuntimeError("choose_method: needs a built graph with the floats kept (rerank > 0)")
+        k1 = int(k) + 1
+        if queries is not None:
+            Qa = np.ascontiguousarray(queries, dtype=np.float32).reshape(-1, self.dim)[:int(samples) if samples else None]
+        else:
+            if not hasattr(self.lib, "kci_vec_get_float"):
+                raise RuntimeError("choose_method: this libkci_vec cannot give stored vectors back; pass queries")
+            self.lib.kci_vec_get_float.restype = C.c_int; self.lib.kci_vec_get_float.argtypes = [C.c_void_p, C.c_uint32, c_f32p]
+            n = int(self.count); rows = np.unique(np.random.default_rng(12345).integers(0, n, size=int(samples)))
+            Qa = np.zeros((len(rows), self.dim), dtype=np.float32); got = 0
+            for r in rows:
+                if self.lib.kci_vec_get_float(self._v, int(r), Qa[got].ctypes.data_as(c_f32p)) == 0: got += 1
+            Qa = Qa[:got]
+        if len(Qa) < 8:
+            raise RuntimeError("choose_method: 8 or more questions are needed")
+        # the best exact hit of a stored vector is itself (or a copy of it): out of the truth, and never counted
+        truth = [self.search_exact(q, k=k1, threads=threads) for q in Qa]
+        own = [t[0][0] if queries is None and t else None for t in truth]
+        truth = [{i for i, _ in t[:int(k)]} if o is None else {i for i, _ in t} - {o} for t, o in zip(truth, own)]
+        if not self._lists:
+            self.build_lists(nlist=nlist, threads=threads)
+        def measure(**kw):
+            best = 1e9; hit = 0
+            for rep in range(2):
+                t0 = time.perf_counter(); res = [self.search(q, k=k1, **kw) for q in Qa]; best = min(best, time.perf_counter() - t0)
+            hit = sum(len(t & ({i for i, _ in r[:int(k)]} if o is None else {i for i, _ in r} - {o})) for t, r, o in zip(truth, res, own))
+            return hit / max(1, sum(len(t) for t in truth)), 1000.0 * best / len(Qa)
+        out = {}
+        need = {"graph": target, "lists": target + (min(0.005, (1.0 - target) / 2) if queries is None else 0.0)}
+        for name, key, ladder, kw in (("graph", "ef", (16, 24, 32, 50, 75, 100, 150, 200, 300, 400, 600, 800, 1200, 1600), dict(method="graph")),
+                                      ("lists", "nprobe", (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512), dict(method="lists"))):
+            pick = None
+            if name == "graph" and queries is None and self.metric != "ip" and hasattr(self.lib, "kci_vec_graph_recall"):
+                efs = [x for x in ladder if k1 <= x <= int(self.count) // 4]
+                ea = (C.c_int * max(1, len(efs)))(*efs); ra = (C.c_float * max(1, len(efs)))()
+                self.lib.kci_vec_graph_recall.restype = C.c_int
+                self.lib.kci_vec_graph_recall.argtypes = [C.c_void_p, C.c_int, C.c_int, C.POINTER(C.c_int), C.c_int, C.c_int, C.POINTER(C.c_float)]
+                if efs and self.lib.kci_vec_graph_recall(self._v, int(k), len(Qa), ea, len(efs), int(threads), ra) >= 8:
+                    j = next((j for j in range(len(efs)) if ra[j] >= target), len(efs) - 1)
+                    _, ms = measure(ef=efs[j], rerank_n=efs[j], **kw); out[name] = (efs[j], float(ra[j]), ms)
+                    continue
+            for x in ladder:
+                r, ms = measure(**{key: x}, **(dict(kw, rerank_n=max(x, k1)) if name == "graph" else kw)); pick = (x, r, ms)
+                if r >= need[name]: break
+            out[name] = pick
+        g, l = out["graph"], out["lists"]
+        g_ok, l_ok = g[1] >= need["graph"], l[1] >= need["lists"]
+        if g_ok != l_ok: use = "graph" if g_ok else "lists"
+        elif g_ok: use = "graph" if g[2] <= l[2] else "lists"
+        else: use = "graph" if g[1] >= l[1] else "lists"
+        self._prefer = use; self._graph_rn = 0
+        if use == "lists": self.nprobe = int(l[0])
+        elif hasattr(self.lib, "kci_vec_set_default_ef") and self.lib.kci_vec_set_default_ef(self._v, int(g[0])) == 0:
+            self._graph_rn = int(g[0])
+        return {"method": use, "graph": {"ef": g[0], "recall": g[1], "ms": g[2]}, "lists": {"nprobe": l[0], "recall": l[1], "ms": l[2]}}
 
     def default_ef(self):
         """The ef search() uses when none is given: the calibrated width, or 100 when the index was never calibrated."""
@@ -513,7 +619,7 @@ class KciVec:
 
     def _query(self, q, k, ef, nprobe, rn, cb, method, ctx=None):
         s = self._searcher()
-        use_lists = self._lists if method == "auto" else (method == "lists")
+        use_lists = self._use_lists(method)
         if use_lists:
             if cb is not None:
                 return self.lib.kci_vec_search_ivf_filtered(s, q, k, nprobe, rn, cb, ctx, self._ob, self._os)
@@ -547,16 +653,21 @@ class KciVec:
             _, q = _f32(np.reshape(query, -1))
             n = self.lib.kci_vec_search_exact_filtered(self._v, q, k, 1, cb, ctx, self._ob, self._os)
             return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]
-        ef = ef or max(k, self.default_ef()); nprobe = int(nprobe or self.nprobe)
+        jd = (ef is None and cb is None and self.rerank and not self._use_lists(method)
+              and hasattr(self.lib, "kci_vec_judged") and self.lib.kci_vec_judged(self._v) == 1)
+        ef_given = ef; ef = ef or max(k, self.default_ef()); nprobe = int(nprobe or self.nprobe)
         rn = self.rerank if rerank_n is None else rerank_n
         if rerank_n is None and rn:
             wide = self.default_rerank()
             if wide > rn and ef >= wide:
                 rn = wide
-        if method == "lists" or (method == "auto" and self._lists):
+            g_rn = getattr(self, "_graph_rn", 0)
+            if g_rn and ef_given is None and not self._use_lists(method) and self.default_ef() == g_rn:
+                rn = max(k, g_rn)
+        if self._use_lists(method):
             rn = max(int(rn or 0), 2 * k)
         _, q = _f32(np.reshape(query, -1))
-        n = self._query(q, k, ef, nprobe, int(rn or 0), cb, method, ctx)
+        n = self._query(q, k, 0 if jd else ef, nprobe, int(rn or 0), cb, method, ctx)
         return [(int(self._ob[i]), float(self._os[i])) for i in range(max(n, 0))]
 
     def _small_exact(self):

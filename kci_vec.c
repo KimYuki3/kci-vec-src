@@ -73,6 +73,7 @@ struct KciVec {
     int def_ef;
     uint32_t unreached;
     int def_rr;
+    struct KvJudge *jg;
     int8_t   *vq;       /* [cap*dim] signed int8 codes (x*gs), row-major */
     float     gs;       /* global quantization scale: code = round(x*gs), x unit-norm */
     float    *vf;       /* [cap*dim] retained unit floats (re-rank); malloc'd or mmap'd */
@@ -536,16 +537,18 @@ static inline void nlock(KciVec *v, uint32_t i){ while(__atomic_test_and_set(&v-
 static inline void nunlock(KciVec *v, uint32_t i){ __atomic_clear(&v->lock[i], __ATOMIC_RELEASE); }
 
 /* per-thread search scratch */
-typedef struct { Heap C, W; uint64_t *bm; uint32_t *bl; uint32_t bn, visn; uint16_t *vis; uint32_t vis16n; uint16_t epoch; He *tmp; int tmpcap; float eps;   /* eps: see kci_vec_searcher_set_eps */
+typedef struct { Heap C, W; He *jl, *jr; int jn, jcap, jrn, jrcap; uint32_t jskip;   /* jhid / jhsc (at the end of the struct): the float scores of the first pass, so that kv_jg_more does not read those rows again */   /* jskip: row + 1 that the walk must not enter (kci_vec_judge asks stored vectors as questions); */
+                 uint64_t *bm; uint32_t *bl; uint32_t bn, visn; uint16_t *vis; uint32_t vis16n; uint16_t epoch; He *tmp; int tmpcap; float eps;   /* eps: see kci_vec_searcher_set_eps */
                  const float *qf; int use_qg; int qgx; uint8_t *lut; float *lutf; int lutM; struct KvBq *bq;
                  const uint32_t *seeds; int nseeds;
-                 int (*filt)(uint64_t, void *); void *fctx; int fbudget, fvis; } Scr;   /* bq: the quantized graph's candidate buckets */
+                 int (*filt)(uint64_t, void *); void *fctx; int fbudget, fvis;
+                 int jhuse; uint32_t jhid[512]; float jhsc[512]; } Scr;   /* bq: the quantized graph's candidate buckets */
 static inline size_t kv_bm_words(uint32_t N){ return ((size_t)N+63)/64+1; }
 static inline int scr_ok(const Scr *s){ return s->bm && s->bl && s->C.a && s->W.a && s->tmp; }
-static void scr_init(Scr *s, uint32_t N, int wcap){ hp_init(&s->C,4096,0); hp_init(&s->W,wcap,1); s->bm=calloc(kv_bm_words(N),sizeof(uint64_t)); s->bl=malloc(kv_bm_words(N)*sizeof(uint32_t)); s->bn=0; s->visn=N;
+static void scr_init(Scr *s, uint32_t N, int wcap){ hp_init(&s->C,4096,0); hp_init(&s->W,wcap,1); s->jl=NULL; s->jr=NULL; s->jn=s->jcap=s->jrn=s->jrcap=0; s->jskip=0; s->bm=calloc(kv_bm_words(N),sizeof(uint64_t)); s->bl=malloc(kv_bm_words(N)*sizeof(uint32_t)); s->bn=0; s->visn=N;
                                                     s->vis=NULL; s->vis16n=0; s->epoch=0; s->tmpcap=wcap+16; s->tmp=malloc(sizeof(He)*s->tmpcap); s->eps=0;
                                                     s->qf=NULL; s->use_qg=0; s->qgx=0; s->filt=NULL; s->fctx=NULL; s->fbudget=0; s->fvis=0; s->lut=NULL; s->lutf=NULL; s->lutM=0; s->bq=NULL; s->seeds=NULL; s->nseeds=0; }
-static void scr_free(Scr *s){ free(s->C.a); free(s->W.a); free(s->bm); free(s->bl); free(s->vis); free(s->tmp);
+static void scr_free(Scr *s){ free(s->C.a); free(s->W.a); free(s->jl); free(s->jr); free(s->bm); free(s->bl); free(s->vis); free(s->tmp);
                               if(s->lut) kv_wipe(s->lut, (size_t)(s->lutM+4)*16); if(s->lutf) kv_wipe(s->lutf, (size_t)s->lutM*16*sizeof(float)); free(s->lut); free(s->lutf); kv_bq_free(s->bq); }
 static inline void scr_next(Scr *s){ for(uint32_t i=0;i<s->bn;i++) s->bm[s->bl[i]]=0; s->bn=0; }
 static inline int visited(Scr *s, uint32_t id){ uint64_t *w=&s->bm[id>>6], m=1ULL<<(id&63);
@@ -575,18 +578,22 @@ static inline float sl_bound(Heap *W, int ef, float k1, float gs2){
     if(W->n<ef) return FLT_MAX;
     float t=hp_top(W).d; return k1>0 ? k1*(gs2+t)-gs2 : t;
 }
-static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int layer, Scr *s){
-    Heap *C=&s->C, *W=&s->W; scr_next(s); C->n=0; W->n=0;
+static inline void kv_jput(He **a, int *n, int *cap, float d, uint32_t id){
+    if(*n>=*cap){ int nc=*cap ? *cap*2 : 1024; He *na=realloc(*a,sizeof(He)*(size_t)nc); if(!na) return; *a=na; *cap=nc; }
+    (*a)[*n].d=d; (*a)[(*n)++].id=id; }
+static inline __attribute__((always_inline)) void sl_go(KciVec *v, const int8_t *q, uint32_t ep, int ef, int layer, Scr *s, const int more, const int rec){
+    Heap *C=&s->C, *W=&s->W;
+    if(!more){ scr_next(s); C->n=0; W->n=0; if(rec){ s->jn=0; s->jrn=0; } if(s->jskip) (void)visited(s, s->jskip-1); }
     const float gs2=v->gs*v->gs, k1=(layer==0 && s->eps>0) ? 1.0f+s->eps : 0.0f;
     const size_t l0b=(size_t)(v->M0+1)*sizeof(uint32_t); const int dim=v->dim;
-    float d0=vdist(v,q,vrow(v,ep)); visited(s,ep);
-    hp_push(C,d0,ep); hp_push(W,d0,ep);
-    if(layer==0) for(int i=0;i<s->nseeds;i++){ uint32_t nb=s->seeds[i]; if(nb>=v->gN || visited(s,nb)) continue;
-        float d=vdist(v,q,vrow(v,nb)); hp_push(C,d,nb);
+    if(!more){ float d0=vdist(v,q,vrow(v,ep)); visited(s,ep);
+    hp_push(C,d0,ep); hp_push(W,d0,ep); if(rec) kv_jput(&s->jl,&s->jn,&s->jcap,d0,ep); }
+    if(layer==0 && !more) for(int i=0;i<s->nseeds;i++){ uint32_t nb=s->seeds[i]; if(nb>=v->gN || visited(s,nb)) continue;
+        float d=vdist(v,q,vrow(v,nb)); hp_push(C,d,nb); if(rec) kv_jput(&s->jl,&s->jn,&s->jcap,d,nb);
         if(W->n<ef || d<hp_top(W).d){ if(W->n<ef) hp_push(W,d,nb); else hp_replace_top(W,d,nb); } }
     while(C->n){
         He c=hp_top(C); hp_pop(C);
-        if(c.d>sl_bound(W,ef,k1,gs2)) break;
+        if(c.d>sl_bound(W,ef,k1,gs2)){ if(rec) hp_push(C,c.d,c.id); break; }
         if(layer==0 && C->n){ const char *nx=(const char*)g_l0(v,hp_top(C).id); for(size_t o=0;o<l0b;o+=64) __builtin_prefetch(nx+o); }
         uint32_t *lk=g_links(v,c.id,layer);
         uint32_t cnt=__atomic_load_n(&lk[0], __ATOMIC_ACQUIRE);
@@ -604,13 +611,15 @@ static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int la
         for(int i=0;i<nc;i++){
             uint32_t nb=cand[i];
             float d=vdist(v,q,vrow(v,nb));
+            if(rec) kv_jput(&s->jl,&s->jn,&s->jcap,d,nb);
             if(d<bound){                                 /* within the bound: explore from it ... */
                 hp_push(C,d,nb);
                 if(W->n<ef || d<hp_top(W).d){ if(W->n<ef) hp_push(W,d,nb); else hp_replace_top(W,d,nb); bound=sl_bound(W,ef,k1,gs2); }   /* ... and keep it if among the ef best */
-            }
+            } else if(rec) kv_jput(&s->jr,&s->jrn,&s->jrcap,d,nb);
         }
     }
 }
+static void search_layer(KciVec *v, const int8_t *q, uint32_t ep, int ef, int layer, Scr *s){ sl_go(v,q,ep,ef,layer,s,0,0); }
 
 static int select_neighbors(KciVec *v, const int8_t *q, Heap *W, int M, uint32_t *out){
     int m=W->n; He *cand=malloc(sizeof(He)*m); float *cn=malloc(sizeof(float)*(m+1)), on[512];
@@ -833,6 +842,7 @@ static inline double kv_level_u(uint32_t i){
 static void graph_free(KciVec *v){
     kv_vh_free(v);
     v->rowgen++; kv_ql_free(v->ql); v->ql=NULL;
+    free(v->jg); v->jg=NULL;
     kv_vt_free(v->vt); v->vt=NULL;
     kv_qg_free(v->qg); v->qg=NULL;
     if(v->lu){ for(uint32_t i=0;i<v->gN;i++) if(v->lu[i]){
@@ -899,7 +909,7 @@ static void vf_free(KciVec *v){
 void kci_vec_free(KciVec *v){
     if(!v) return;
     if(v->img){
-        kv_ivf_free(v->ivf); kv_qg_free(v->qg); kv_ql_free(v->ql); kv_vt_free(v->vt); free(v->ipm);
+        kv_ivf_free(v->ivf); kv_qg_free(v->qg); kv_ql_free(v->ql); kv_vt_free(v->vt); free(v->ipm); free(v->jg);
         free(v->lu); free(v->lock);
         if(v->img_mmap) munmap((void*)v->img, v->imglen);
         pthread_mutex_destroy(&v->epmtx);
@@ -1507,7 +1517,8 @@ static int kci_vec_search_0(KciVec *v, const float *query, int k, int ef,
 }
 
 /* reusable per-thread searcher: amortizes the visited-set allocation */
-struct KciVecSearcher { int uniq; int nofill; KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
+struct KciVecSearcher { int jmode;
+                        int uniq; int nofill; KciVec *v; Scr s; int8_t *q; float *qf; void *ivf; int rerank_i8; KciVecFilter filt; void *fctx; int dim; float gap; int minp; float *l2q; uint32_t *lseed; int lseedcap; int8_t *lq8; int lseedR; int lpages; int lhot; };   /* lseedR: kci_vec_searcher_set_learned_seeds */
 static int kv_l2_qs(KciVecSearcher *s, const float **q, double *qn2){
     if(!s || !s->v->l2 || !s->l2q || *q==s->l2q) return 0;
     *qn2 = kv_l2_query(s->v, *q, s->l2q); *q = s->l2q;
@@ -1559,10 +1570,92 @@ static int kv_search_r_(KciVecSearcher *s, const float *query, int k, int ef,
     return search_with_scr(s->v, s->q, k, ef, &s->s, out_ids, out_scores);
 }
 
+#define KV_JG_F  6
+#define KV_JG_NC 16
+#define KV_JG_NW 7
+typedef struct KvJudge { int ef0, k, on, wmax; float target, gain, rec;
+                         float mu[KV_JG_F], sd[KV_JG_F], w[2*KV_JG_F+1], cut[KV_JG_NC-1]; int width[KV_JG_NC]; } KvJudge;
+static int kv_jg_score(KciVecSearcher *s, int first){
+    KciVec *v=s->v; Scr *S=&s->s; int m=S->W.n;
+    if(m>S->tmpcap){ He *nt=realloc(S->tmp,sizeof(He)*(size_t)m); if(!nt) return 0; S->tmp=nt; S->tmpcap=m; }
+    memcpy(S->tmp, S->W.a, sizeof(He)*(size_t)m); He *t=S->tmp;
+    if(first){ S->jhuse = m<=200; if(S->jhuse) memset(S->jhid, 0xFF, sizeof S->jhid); }
+    const int look = !first && S->jhuse; const size_t rb = v->vh ? (size_t)v->dim*sizeof(uint16_t) : (size_t)v->dim*sizeof(float);
+    for(int i=0;i<m;i++){ uint32_t id=t[i].id; unsigned p=(id*2654435761u)>>23; t[i].d=2.0f;      /* 2 = not scored yet */
+        if(look){ while(S->jhid[p]!=0xFFFFFFFFu){ if(S->jhid[p]==id){ t[i].d=S->jhsc[p]; break; } p=(p+1)&511; } }
+        if(t[i].d==2.0f){ const char *r = v->vh ? (const char*)(v->vh + (size_t)id*v->dim) : (const char*)(v->vf + (size_t)id*v->dim);
+            for(size_t o=0;o<rb;o+=64) __builtin_prefetch(r+o); } }
+    for(int i=0;i<m;i++){ uint32_t id=t[i].id;
+        if(t[i].d!=2.0f) continue;
+        t[i].d = v->vh ? -hdot(v->dim, s->qf, v->vh + (size_t)id*v->dim) : -fdot(v->dim, s->qf, v->vf + (size_t)id*v->dim);
+        if(first && S->jhuse){ unsigned p=(id*2654435761u)>>23; while(S->jhid[p]!=0xFFFFFFFFu) p=(p+1)&511; S->jhid[p]=id; S->jhsc[p]=t[i].d; } }
+    return m;
+}
+static int kv_jg_first(KciVecSearcher *s, int ef0){
+    KciVec *v=s->v; Scr *S=&s->s;
+    if(scr_fit(S, v->gN)!=0) return 0;
+    uint32_t ep=v->ep;
+    for(int l=v->maxlevel;l>0;l--){ search_layer(v,s->q,ep,1,l,S); ep=hp_top(&S->W).id; }
+    sl_go(v,s->q,ep,ef0,0,S,0,1);
+    return kv_jg_score(s, 1);
+}
+/* go on to width ef: W becomes the ef best of every row scored so far, the rows that were beyond the old bound join C */
+static int kv_jg_more(KciVecSearcher *s, int ef){
+    KciVec *v=s->v; Scr *S=&s->s; Heap *W=&S->W;
+    W->n=0;
+    for(int i=0;i<S->jn;i++){ He e=S->jl[i]; if(W->n<ef) hp_push(W,e.d,e.id); else if(e.d<hp_top(W).d) hp_replace_top(W,e.d,e.id); }
+    for(int i=0;i<S->jrn;i++) hp_push(&S->C, S->jr[i].d, S->jr[i].id);
+    S->jrn=0;
+    sl_go(v,s->q,0,ef,0,S,1,1);
+    return kv_jg_score(s, 0);
+}
+/* the six signs of a first pass. t[0..m): its candidates with float scores; qn2: |q|^2 in the caller's space (L2),
+ * qlen: the query's length. 0, or -1 when the pass came back with fewer than ef0 rows */
+static int kv_jg_signs(const KciVec *v, const He *t, int m, int k, int ef0, double qn2, double qlen, float *f){
+    float d[256];
+    if(m<ef0 || ef0>256 || k<2 || ef0<=k) return -1;
+    for(int i=0;i<ef0;i++) d[i] = -t[i].d;                       /* cosine */
+    if(v->l2==1){ kv_l2_scores(v, ef0, d, qn2); for(int i=0;i<ef0;i++) d[i]=sqrtf(d[i]>0?d[i]:0); }
+    else for(int i=0;i<ef0;i++) d[i]=1.0f-d[i];
+    for(int i=0;i<ef0;i++) if(!(d[i]>1e-9f)) d[i]=1e-9f;
+    for(int i=1;i<ef0;i++){ float x=d[i]; int j=i; while(j>0 && d[j-1]>x){ d[j]=d[j-1]; j--; } d[j]=x; }
+    double a=0; for(int i=0;i<ef0-1;i++) a+=log((double)d[i]/d[ef0-1]);
+    a/=(double)(ef0-1); if(a>-1e-9) a=-1e-9;
+    f[0]=logf(d[0]); f[1]=logf(d[k-1]/d[0]+1e-9f); f[2]=logf((d[ef0-1]-d[k-1])/d[k-1]+1e-6f);
+    f[3]=logf((d[k-1]-d[k/2])/d[k-1]+1e-6f); f[4]=(float)(-1.0/a); f[5]=(float)log(qlen+1e-9);
+    return 0;
+}
+static inline double kv_jg_z(const KvJudge *g, const float *f, int j){
+    double z=((double)f[j]-g->mu[j])/g->sd[j]; return z>4.0 ? 4.0 : (z<-4.0 ? -4.0 : z); }
+static double kv_jg_est(const KvJudge *g, const float *f){
+    double p=g->w[2*KV_JG_F];
+    for(int j=0;j<KV_JG_F;j++){ double z=kv_jg_z(g,f,j); p += g->w[j]*z + g->w[KV_JG_F+j]*z*z; }
+    return p;
+}
+static int kv_jg_class(const KvJudge *g, double p){ int c=0; while(c<KV_JG_NC-1 && p>g->cut[c]) c++; return c; }
+/* |q|^2 in the caller's space from the engine's query (L2: [q s, 1/lam, 0]) and the query's length */
+static void kv_jg_qlen(const KciVec *v, const float *query, double *qn2, double *qlen){
+    double n2=0; for(int d=0;d<v->dim;d++) n2+=(double)query[d]*query[d];
+    *qn2=0; *qlen=sqrt(n2);
+    if(v->l2==1){ double q2=(n2-1.0/((double)v->l2lam*v->l2lam))/((double)v->l2s*v->l2s); if(q2<0) q2=0; *qn2=q2; *qlen=sqrt(q2); }
+}
+/* the search of kv_search_rerank_ with the width judged (enc_query is done). -9 = not for this call: the usual path */
+static int kv_jg_search(KciVecSearcher *s, const float *query, int k, uint64_t *out_ids, float *out_scores){
+    KciVec *v=s->v; const KvJudge *g=v->jg;
+    if(!g || !g->on || k>g->k || v->so || v->l2==2 || (s->s.use_qg && v->qg) || s->s.eps>0 || s->filt || s->s.nseeds
+       || (!v->vf && !v->vh) || v->gN<(uint32_t)g->ef0*4) return -9;
+    int m=kv_jg_first(s, g->ef0); float f[KV_JG_F]; double qn2, qlen;
+    kv_jg_qlen(v, query, &qn2, &qlen);
+    int w = kv_jg_signs(v, s->s.tmp, m, g->k, g->ef0, qn2, qlen, f)==0 ? g->width[kv_jg_class(g, kv_jg_est(g, f))] : g->wmax;
+    if(w>g->ef0) m=kv_jg_more(s, w);
+    return emit_topk(v, s->s.tmp, m, k, 1.0f, out_ids, out_scores);
+}
+
 static int kv_search_rerank_(KciVecSearcher *s, const float *query, int k, int ef,
                              int rerank_n, uint64_t *out_ids, float *out_scores){
     if(!s || !s->v->built) return -1;
     KciVec *v=s->v;
+    int jm=s->jmode; s->jmode=0;
     if((!v->keepf || !v->vf) && !v->vh)     /* no retained floats → plain SQ8 search */
         return kci_vec_search_r(s, query, k, ef, out_ids, out_scores);
     if(k<1) k=1;
@@ -1572,6 +1665,7 @@ static int kv_search_rerank_(KciVecSearcher *s, const float *query, int k, int e
         if(!(s->s.use_qg && v->qg)) return -1;      /* the plain graph is gone */
         if(!kv_qg_has_short(v) && rerank_n<ef) rerank_n=ef; }   /* no short rows: a narrow pass would need the int8 rows to pick its rows */
     enc_query(v, query, s->qf, s->q);       /* s->qf = unit query; s->q = code */
+    if(jm){ int jr=kv_jg_search(s, query, k, out_ids, out_scores); if(jr!=-9) return jr; }
     int m = (s->s.use_qg && v->qg) ? kv_qg_collect(v, &s->s, s->q, ef, rerank_n<ef ? 2 : 0) : search_collect(v, s->q, ef, &s->s);
     He *t=s->s.tmp;
     if(m>rerank_n){ select_smallest(t, m, rerank_n); m=rerank_n; }
@@ -3316,7 +3410,7 @@ int kci_vec_forget(KciVec *v, uint64_t id){
 /* Rebuild the graph over only the live (non-tombstoned) vectors, reclaiming
  * tombstoned slots. Returns the new live count. Requires retained floats. */
 uint32_t kci_vec_compact(KciVec *v){
-    if(v){ v->rowgen++; kv_ql_free(v->ql); v->ql=NULL; kv_vt_free(v->vt); v->vt=NULL; }
+    if(v){ v->rowgen++; kv_ql_free(v->ql); v->ql=NULL; kv_vt_free(v->vt); v->vt=NULL; free(v->jg); v->jg=NULL; }
     if(!v || (!v->built && !v->ivf)) return 0;
     if(KV_RO(v)) return v->count;
     if(v->ndead==0) return v->count;
@@ -4713,6 +4807,192 @@ int kci_vec_calibrate(KciVec *v, int k, int rerank_n, float target, int samples,
 int kci_vec_calibrate_queries(KciVec *v, const float *queries, int nq, int k, int rerank_n, float target, int threads, float *out_recall){
     if(!queries) return -1;
     return kv_calibrate(v, queries, nq, k, rerank_n, target, 0, threads, out_recall); }
+static int kv_jg_topk(const He *t, int m, int k, uint32_t *out){      /* the k best ids (smallest d) of t[0..m) */
+    int n=0;
+    for(int i=0;i<m;i++){ int p=n;
+        if(n<k) n++; else if(t[i].d>=t[out[k-1]].d) continue; else p=k-1;
+        while(p>0 && t[out[p-1]].d>t[i].d){ out[p]=out[p-1]; p--; }
+        out[p]=(uint32_t)i; }
+    for(int i=0;i<n;i++) out[i]=t[out[i]].id;
+    return n;
+}
+static int kv_jg_solve(double *A, double *b, int n){                    /* A x = b, Gaussian elimination, x in b */
+    for(int c=0;c<n;c++){ int p=c;
+        for(int r=c+1;r<n;r++) if(fabs(A[r*n+c])>fabs(A[p*n+c])) p=r;
+        if(fabs(A[p*n+c])<1e-12) return -1;
+        if(p!=c){ for(int j=0;j<n;j++){ double t=A[c*n+j]; A[c*n+j]=A[p*n+j]; A[p*n+j]=t; } double t=b[c]; b[c]=b[p]; b[p]=t; }
+        for(int r=c+1;r<n;r++){ double f=A[r*n+c]/A[c*n+c]; if(f==0) continue;
+            for(int j=c;j<n;j++) A[r*n+j]-=f*A[c*n+j];
+            b[r]-=f*b[c]; } }
+    for(int c=n-1;c>=0;c--){ double x=b[c]; for(int j=c+1;j<n;j++) x-=A[c*n+j]*b[j]; b[c]=x/A[c*n+c]; }
+    return 0;
+}
+static int kv_jg_cmpd(const void *a, const void *b){ double x=*(const double*)a, y=*(const double*)b; return x<y?-1:(x>y?1:0); }
+/* the rule from the samples i with i % 2 == par: the line (signs centred and scaled first; a little ridge keeps the
+ * squares tame), the classes' bounds, and a width for every class. pr[i]: the rule's estimate for every sample */
+static int kv_jg_fit(KvJudge *g, const float *Fm, const double *y, const uint8_t *hit, int S, int ns, const int *st, int k, int par, double *pr, double *srt){
+    enum { F=KV_JG_F, NC=KV_JG_NC, P=2*KV_JG_F+1 };
+    int nA=0; for(int i=par;i<S;i+=2) nA++;
+    if(nA<50) return -1;
+    for(int j=0;j<F;j++){ double m1=0, m2=0;
+        for(int i=par;i<S;i+=2) m1+=Fm[(size_t)i*F+j];
+        m1/=nA;
+        for(int i=par;i<S;i+=2){ double d=Fm[(size_t)i*F+j]-m1; m2+=d*d; }
+        g->mu[j]=(float)m1; g->sd[j] = sqrt(m2/nA) > 1e-4*(fabs(m1)+1.0) ? (float)sqrt(m2/nA) : 1e30f; }   /* 1e30: a sign without spread is left out (kv_jg_z) */
+    { double A[P*P], b[P]; memset(A,0,sizeof A); memset(b,0,sizeof b);
+      for(int i=par;i<S;i+=2){ double r[P];
+          for(int j=0;j<F;j++){ double z=kv_jg_z(g, Fm+(size_t)i*F, j); r[j]=z; r[F+j]=z*z; }
+          r[P-1]=1;
+          for(int a=0;a<P;a++){ b[a]+=r[a]*y[i]; for(int c=0;c<P;c++) A[a*P+c]+=r[a]*r[c]; } }
+      for(int a=0;a<P-1;a++) A[a*P+a]+=1e-4*nA;
+      if(kv_jg_solve(A, b, P)!=0) return -1;
+      for(int a=0;a<P;a++) g->w[a]=(float)b[a]; }
+    for(int i=0;i<S;i++) pr[i]=kv_jg_est(g, Fm+(size_t)i*F);
+    { int n=0; for(int i=par;i<S;i+=2) srt[n++]=pr[i];
+      qsort(srt, (size_t)n, sizeof(double), kv_jg_cmpd);
+      for(int c=0;c<NC-1;c++) g->cut[c]=(float)srt[(size_t)(c+1)*n/NC]; }
+    /* a width for every class: the first stage whose share of the answer, over the class's samples, reaches the target */
+    for(int c=0;c<NC;c++){ long h[KV_JG_NW]={0}, n=0; int pick=ns-1;
+        for(int i=par;i<S;i+=2) if(kv_jg_class(g, pr[i])==c){ n++; for(int j=0;j<ns;j++) h[j]+=hit[(size_t)i*ns+j]; }
+        for(int j=0;j<ns && n;j++) if((double)h[j]>=(double)g->target*(double)(n*k)){ pick=j; break; }
+        g->width[c] = pick==0 ? 0 : st[pick]; }
+    return 0;
+}
+/* the check on the samples i % 2 == par, added to acc: [0] samples, [1] the rule's hits, [2] its cost, then every
+ * fixed stage's hits and costs */
+static void kv_jg_check(const KvJudge *g, const double *pr, const uint8_t *hit, const float *cost, int S, int ns, const int *st, int par, double *acc){
+    for(int i=par;i<S;i+=2){ int w=g->width[kv_jg_class(g, pr[i])], j=0;
+        while(j<ns-1 && st[j]<w) j++;
+        acc[0]+=1; acc[1]+=hit[(size_t)i*ns+j]; acc[2]+=cost[(size_t)i*ns+j];
+        for(int a=0;a<ns;a++){ acc[3+a]+=hit[(size_t)i*ns+a]; acc[3+KV_JG_NW+a]+=cost[(size_t)i*ns+a]; } }
+}
+static int kv_judge(KciVec *v, const float *queries, int nq, int k, float target, int samples, float *out_gain){
+    static const int wide[KV_JG_NW-1]={ 50, 100, 200, 400, 800, 1600 };
+    enum { F=KV_JG_F, NC=KV_JG_NC, P=2*KV_JG_F+1 };
+    if(!v || !v->built || v->so || !(v->keepf && v->vf) || v->l2==2 || KV_RO(v)) return -1;
+    if(k<=0) k=10;
+    if(k<2 || k>64) return -1;
+    if(!(target>0) || target>1) target=0.99f;
+    int ef0 = 3*k>32 ? 3*k : 32, st[KV_JG_NW], ns=0;
+    st[ns++]=ef0;
+    for(int i=0;i<KV_JG_NW-1;i++) if(wide[i]>ef0 && (uint32_t)wide[i]<=v->gN) st[ns++]=wide[i];
+    if(ns<3 || v->gN<(uint32_t)ef0*4) return -1;                        /* too small an index to judge anything */
+    if(queries){ if(nq<200) return -1; samples = nq>8192 ? 8192 : nq; }
+    else { if(samples<=0) samples=4096;
+           if(samples<200) samples=200;
+           if((uint32_t)samples>v->count/2) samples=(int)(v->count/2); }
+    if(samples<200) return -1;
+    int ud=kci_vec_dim(v), S=0, ret=-1;
+    float *qb=malloc((size_t)ud*sizeof(float)), *Fm=malloc((size_t)samples*F*sizeof(float));
+    uint8_t *hit=malloc((size_t)samples*ns); float *cost=malloc((size_t)samples*ns*sizeof(float));
+    double *y=malloc((size_t)samples*sizeof(double)), *pr=malloc((size_t)samples*sizeof(double)), *srt=malloc((size_t)samples*sizeof(double));
+    uint32_t *ids=malloc((size_t)ns*k*sizeof(uint32_t));
+    KvJudge *g=calloc(1,sizeof(KvJudge));
+    KciVecSearcher *s=kci_vec_searcher_new(v);
+    if(!qb || !Fm || !hit || !cost || !y || !pr || !srt || !ids || !g || !s) goto done;
+    s->s.use_qg=0;
+    uint64_t x=0x9E3779B97F4A7C15ull;
+    for(int tries=0; S<samples && tries<samples*8; tries++){
+        const float *q; uint32_t mask=0;
+        if(queries){ if(tries>=samples) break; q=queries+(size_t)tries*ud; }
+        else { x = x*6364136223846793005ull + 1442695040888963407ull;
+               uint32_t row=(uint32_t)((x>>33) % v->count);
+               if(row>=v->gN || row==v->ep || (v->dead && v->dead[row])) continue;
+               if(kci_vec_get_float(v, row, qb)!=0) continue;
+               q=qb; mask=row+1; }
+        double qn2=0, qlen; (void)kv_l2_qs(s, &q, &qn2);
+        enc_query(v, q, s->qf, s->q);
+        s->s.jskip=mask;
+        int m=kv_jg_first(s, ef0), ok;
+        kv_jg_qlen(v, q, &qn2, &qlen);
+        ok = kv_jg_signs(v, s->s.tmp, m, k, ef0, qn2, qlen, Fm+(size_t)S*F)==0 && kv_jg_topk(s->s.tmp, m, k, ids)==k;
+        cost[(size_t)S*ns] = (float)s->s.jn + 3.0f*(float)ef0;
+        for(int j=1;j<ns && ok;j++){
+            m=kv_jg_more(s, st[j]);
+            ok = kv_jg_topk(s->s.tmp, m, k, ids+(size_t)j*k)==k;
+            cost[(size_t)S*ns+j] = (float)s->s.jn + 3.0f*(float)st[j]; }
+        s->s.jskip=0;
+        if(!ok) continue;
+        const uint32_t *tr=ids+(size_t)(ns-1)*k; int need=ns-1;
+        for(int j=ns-1;j>=0;j--){ int h=0;
+            for(int a=0;a<k;a++) for(int b=0;b<k;b++) if(ids[(size_t)j*k+a]==tr[b]){ h++; break; }
+            hit[(size_t)S*ns+j]=(uint8_t)h;
+            if(h==k) need=j; }
+        y[S]=log2((double)st[need]); S++;
+    }
+    if(S<200) goto done;
+    g->ef0=ef0; g->k=k; g->wmax=st[ns-1]; g->target=target;
+    { double acc[3+2*KV_JG_NW]; memset(acc,0,sizeof acc);
+      if(kv_jg_fit(g, Fm, y, hit, S, ns, st, k, 1, pr, srt)!=0) goto done;
+      kv_jg_check(g, pr, hit, cost, S, ns, st, 0, acc);
+      if(kv_jg_fit(g, Fm, y, hit, S, ns, st, k, 0, pr, srt)!=0) goto done;      /* the rule that is kept */
+      kv_jg_check(g, pr, hit, cost, S, ns, st, 1, acc);
+      double n=acc[0], rj, cj, rf[KV_JG_NW], cf[KV_JG_NW];
+      if(!(n>0)) goto done;
+      rj=acc[1]/(n*k); cj=acc[2]/n;
+      for(int a=0;a<ns;a++){ rf[a]=acc[3+a]/(n*k); cf[a]=acc[3+KV_JG_NW+a]/n; }
+      double cfx=cf[ns-1];
+      if(rj<=rf[0]) cfx=cf[0];
+      else for(int a=1;a<ns;a++) if(rj<=rf[a]){ double t = rf[a]>rf[a-1] ? (rj-rf[a-1])/(rf[a]-rf[a-1]) : 1.0;
+              cfx=exp(log(cf[a-1])+t*(log(cf[a])-log(cf[a-1]))); break; }
+      g->rec=(float)rj; g->gain=(float)(cfx/cj);
+      g->on = g->gain>=1.20f && rj>=(double)target-0.01; }
+    if(out_gain) *out_gain=g->gain;
+    free(v->jg); v->jg=g; g=NULL; ret=v->jg->on;
+done:
+    if(s) kci_vec_searcher_free(s);
+    if(qb) kv_wipe(qb,(size_t)ud*sizeof(float));
+    free(qb); free(Fm); free(hit); free(cost); free(y); free(pr); free(srt); free(ids); free(g);
+    return ret;
+}
+int kci_vec_judge(KciVec *v, int k, float target, int samples, float *out_gain){ return kv_judge(v, NULL, 0, k, target, samples, out_gain); }
+int kci_vec_judge_queries(KciVec *v, const float *queries, int nq, int k, float target, float *out_gain){
+    if(!queries) return -1;
+    return kv_judge(v, queries, nq, k, target, 0, out_gain); }
+uint64_t kci_vec_row_id(const KciVec *v, uint32_t i){ return (v && i<v->count && v->vid) ? v->vid[i] : UINT64_MAX; }
+int kci_vec_judged(const KciVec *v){ return v && v->jg && v->jg->on; }
+int kci_vec_judge_off(KciVec *v){ if(!v) return -1; free(v->jg); v->jg=NULL; return 0; }
+int kci_vec_graph_recall(KciVec *v, int k, int samples, const int *ef, int n, int threads, float *out_recall){
+    if(!v || !v->built || v->so || !(v->keepf && v->vf) || v->l2==2 || !ef || !out_recall || n<1 || n>64) return -1;
+    if(k<1 || k>64) return -1;
+    for(int j=0;j<n;j++) if(ef[j]<=k || (uint32_t)ef[j]>v->gN || ef[j]>32767 || (j && ef[j]<=ef[j-1])) return -1;
+    if(samples<=0) samples=1000;
+    if((uint32_t)samples>v->count/2) samples=(int)(v->count/2);
+    if(samples<8) return -1;
+    int ud=kci_vec_dim(v), k1=k+1, S=0, ret=-1;
+    float *qb=malloc((size_t)ud*sizeof(float));
+    uint64_t *got=malloc((size_t)(k1+64)*sizeof(uint64_t)*8), tr[65];
+    long *hit=calloc((size_t)n,sizeof(long)), tot=0; uint32_t ids[64];
+    KciVecSearcher *s=kci_vec_searcher_new(v);
+    if(!qb || !got || !hit || !s) goto done;
+    s->s.use_qg=0;
+    uint64_t x=0xD1B54A32D192ED03ull;
+    for(int tries=0; S<samples && tries<samples*8; tries++){
+        x = x*6364136223846793005ull + 1442695040888963407ull;
+        uint32_t row=(uint32_t)((x>>33) % v->count);
+        if(row>=v->gN || row==v->ep || (v->dead && v->dead[row])) continue;
+        if(kci_vec_get_float(v, row, qb)!=0) continue;
+        int nt=kci_vec_search_exact(v, qb, k1, threads, got, NULL), m=0;
+        if(nt<2) continue;
+        if(nt>k1) nt=k1;
+        for(int i=0;i<nt && m<k;i++) if(got[i]!=v->vid[row]) tr[m++]=got[i];
+        const float *q=qb; double qn2=0; (void)kv_l2_qs(s, &q, &qn2);
+        enc_query(v, q, s->qf, s->q);
+        s->s.jskip=row+1;
+        for(int j=0;j<n;j++){
+            int c = j ? kv_jg_more(s, ef[j]) : kv_jg_first(s, ef[0]), g=kv_jg_topk(s->s.tmp, c, k, ids);
+            for(int a=0;a<g;a++){ uint64_t id=v->vid[ids[a]]; for(int t=0;t<m;t++) if(tr[t]==id){ hit[j]++; break; } } }
+        s->s.jskip=0;
+        tot+=m; S++;
+    }
+    if(S<8 || tot==0) goto done;
+    for(int j=0;j<n;j++) out_recall[j]=(float)hit[j]/(float)tot;
+    ret=S;
+done:
+    if(s) kci_vec_searcher_free(s);
+    free(qb); free(got); free(hit);
+    return ret;
+}
 uint32_t kci_vec_unreached(const KciVec *v){ return v ? v->unreached : 0; }
 static inline void kv_def_width(const KciVecSearcher *s, int *ef, int *rerank_n){
     if(*ef>0 || !s || !s->v || s->v->def_ef<=0) return;
@@ -4723,8 +5003,11 @@ int kci_vec_search_r(KciVecSearcher *s, const float *query, int k, int ef, uint6
     kv_tw_depth++; int r=kci_vec_search_r_0(s, query, k, ef, out_ids, out_scores);
     return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
 int kci_vec_search_rerank(KciVecSearcher *s, const float *query, int k, int ef, int rerank_n, uint64_t *out_ids, float *out_scores){
+    const int judged = ef<=0 && s && s->v && s->v->jg && s->v->jg->on;
     kv_def_width(s, &ef, &rerank_n);
+    if(s) s->jmode=judged;
     kv_tw_depth++; int r=kci_vec_search_rerank_0(s, query, k, ef, rerank_n, out_ids, out_scores);
+    if(s) s->jmode=0;
     return kv_tw_out(KV_TW_S(s), NULL, NULL, r, k, out_ids, out_scores); }
 int kci_vec_search_ivf(KciVecSearcher *s, const float *query, int k, int nprobe, int rerank_n, uint64_t *out_ids, float *out_scores){
     kv_tw_depth++; int r=kci_vec_search_ivf_0(s, query, k, nprobe, rerank_n, out_ids, out_scores);

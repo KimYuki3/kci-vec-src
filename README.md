@@ -10,7 +10,7 @@ or images. There is no search server to run, the data does not leave your machin
 | Form | One C file (`kci_vec.c` + `kci_vec.h`), no dependencies. Callable from Python |
 | Where it fits | In-house systems, on-device software, search shipped inside a product: places where the data cannot go to an outside service |
 | Size it is meant for | Tens of thousands to a few million items. The search runs on one byte per dimension. By default the float vectors are kept beside them, to score the best candidates exactly; with `rerank=0` only the bytes are kept, about a quarter of the memory of float, at a lower recall |
-| Current version | 0.2.19 (2026-11-28). Changes per version: the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases). The evaluation package (wheel) is in [kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist) |
+| Current version | 0.2.20 (2026-11-28). Changes per version: the [releases page](https://github.com/KimYuki3/kci-vec-dist/releases). The evaluation package (wheel) is in [kci-vec-dist](https://github.com/KimYuki3/kci-vec-dist) |
 | Stage | Research stage. Every figure was measured by the developer; none has been confirmed by a third party yet |
 
 ## The first ten minutes: put texts in, ask a question
