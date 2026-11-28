@@ -729,43 +729,65 @@ static void* build_worker(void *arg){
 }
 
 /* mark (seen=1) every node reachable on layer 0 from `from`, using queue q;
- * returns how many were newly marked */
-static uint32_t reach_mark(KciVec *v, uint32_t from, uint8_t *seen, uint32_t *q){
+ * returns how many were newly marked. par[x] = the node x was first reached from. */
+static uint32_t reach_mark(KciVec *v, uint32_t from, uint8_t *seen, uint32_t *q, uint32_t *par){
     if(seen[from]) return 0;
     uint32_t h=0,t=0; q[t++]=from; seen[from]=1;
-    while(h<t){ uint32_t *lk=g_l0(v,q[h++]);
-        for(uint32_t e=1;e<=lk[0];e++) if(!seen[lk[e]]){ seen[lk[e]]=1; q[t++]=lk[e]; } }
+    while(h<t){ uint32_t c=q[h++], *lk=g_l0(v,c);
+        for(uint32_t e=1;e<=lk[0];e++) if(!seen[lk[e]]){ seen[lk[e]]=1; par[lk[e]]=c; q[t++]=lk[e]; } }
     return t;
 }
 static uint32_t repair_reach(KciVec *v){
     uint32_t n=v->gN; if(n<2) return 0;
-    uint8_t *seen=malloc(n); uint32_t *q=malloc((size_t)n*sizeof(uint32_t));
-    if(!seen||!q){ free(seen); free(q); return n; }
+    uint8_t *seen=malloc(n); uint32_t *q=malloc((size_t)n*sizeof(uint32_t)), *par=malloc((size_t)n*sizeof(uint32_t));
+    if(!seen||!q||!par){ free(seen); free(q); free(par); return n; }
     Scr s; scr_init(&s, n, v->efc+16);
-    uint32_t left=0;
+    uint32_t left=0, recent[16]; unsigned nrec=0;
     for(int round=0; round<8; round++){
-        memset(seen,0,n);
-        left = n - reach_mark(v, v->ep, seen, q);
+        memset(seen,0,n); par[v->ep]=UINT32_MAX;
+        left = n - reach_mark(v, v->ep, seen, q, par);
         if(left==0 || round==7) break;
         for(uint32_t u=0;u<n && left;u++){
             if(seen[u]) continue;
             const int8_t *x=vrow(v,u); uint32_t ep=v->ep;
             for(int l=v->maxlevel;l>0;l--){ search_layer(v,x,ep,1,l,&s); ep=hp_top(&s.W).id; }
             search_layer(v,x,ep,v->efc,0,&s);
-            uint32_t best=UINT32_MAX; float bd=0;
-            for(int i=0;i<s.W.n;i++){ He c=s.W.a[i];
-                if(c.id!=u && seen[c.id] && (best==UINT32_MAX || c.d<bd)){ best=c.id; bd=c.d; } }
+            uint32_t best=UINT32_MAX, any=UINT32_MAX; float bd=0, ad=0;
+            for(int pass=0; pass<2 && any==UINT32_MAX; pass++){
+                if(pass) search_layer(v,x,v->ep,v->efc,0,&s);
+                for(int i=0;i<s.W.n;i++){ He c=s.W.a[i];
+                    if(c.id==u || !seen[c.id]) continue;
+                    if(any==UINT32_MAX || c.d<ad){ any=c.id; ad=c.d; }
+                    if(best!=UINT32_MAX && c.d>=bd) continue;
+                    uint32_t *ck=g_l0(v,c.id); int ok = ck[0]<(uint32_t)v->M0;
+                    for(uint32_t e=1;e<=ck[0] && !ok;e++) ok = par[ck[e]]!=c.id;
+                    if(ok){ best=c.id; bd=c.d; } } }
+            for(unsigned r=0; best==UINT32_MAX && r<(nrec<16?nrec:16); r++){ uint32_t c=recent[r];
+                if(c==u || !seen[c]) continue;
+                uint32_t *ck=g_l0(v,c); int ok = ck[0]<(uint32_t)v->M0;
+                for(uint32_t e=1;e<=ck[0] && !ok;e++) ok = par[ck[e]]!=c;
+                if(!ok) continue;
+                float d=vdist(v,x,vrow(v,c));
+                for(unsigned r2=r+1; r2<(nrec<16?nrec:16); r2++){ uint32_t c2=recent[r2]; if(c2==u || !seen[c2]) continue;
+                    uint32_t *k2=g_l0(v,c2); int ok2 = k2[0]<(uint32_t)v->M0;
+                    for(uint32_t e=1;e<=k2[0] && !ok2;e++) ok2 = par[k2[e]]!=c2;
+                    if(ok2){ float d2=vdist(v,x,vrow(v,c2)); if(d2<d){ d=d2; c=c2; } } }
+                best=c; }
+            int safe = best!=UINT32_MAX;
+            if(!safe) best=any;
             if(best==UINT32_MAX) continue;
             uint32_t *lk=g_l0(v,best);
             if(lk[0]<(uint32_t)v->M0){ lk[lk[0]+1]=u; lk[0]++; }
-            else { uint32_t farthest=1; float fd=vdist(v,vrow(v,best),vrow(v,lk[1]));
-                for(uint32_t e=2;e<=lk[0];e++){ float d=vdist(v,vrow(v,best),vrow(v,lk[e])); if(d>fd){ fd=d; farthest=e; } }
+            else { uint32_t farthest=0; float fd=0;
+                for(uint32_t e=1;e<=lk[0];e++){ if(safe && par[lk[e]]==best) continue;
+                    float d=vdist(v,vrow(v,best),vrow(v,lk[e])); if(!farthest || d>fd){ fd=d; farthest=e; } }
                 lk[farthest]=u; }
-            left -= reach_mark(v, u, seen, q);              /* u and all it reaches */
+            par[u]=best; recent[nrec++ & 15]=u;
+            left -= reach_mark(v, u, seen, q, par);         /* u and all it reaches */
         }
         /* next round re-counts: a replaced edge may have cut another node off */
     }
-    scr_free(&s); free(seen); free(q);
+    scr_free(&s); free(seen); free(q); free(par);
     return left;
 }
 
@@ -1443,6 +1465,45 @@ static inline float fdot(int dim, const float *a, const float *b){
     for(; i<dim; i++) s+=a[i]*b[i];
     return s;
 }
+static double kv_dscore(const KciVec *v, const float *qf, uint32_t row){
+    const float *x=v->vf+(size_t)row*v->dim; double s=0, n=0;
+    for(int d=0;d<v->dim;d++){ s+=(double)qf[d]*x[d]; n+=(double)x[d]*x[d]; }
+    return (v->l2 || !(n>0)) ? s : s/sqrt(n);
+}
+typedef struct { double d; float f; uint32_t at; } KvDs;
+static int kv_ds_cmp_f(const void *a, const void *b){ float x=((const KvDs*)a)->f, y=((const KvDs*)b)->f; return x<y ? -1 : x>y; }
+static int kv_ds_cmp_d(const void *a, const void *b){ double x=((const KvDs*)a)->d, y=((const KvDs*)b)->d; return x>y ? -1 : x<y; }
+#define KV_RF_MAX 2048
+static void kv_refine_close(const KciVec *v, const float *qf, He *t, int m, int k){
+    if(!v->vf || v->vh || m<2 || k<1) return;
+    float top[64]; int nt=0; const int kt = k<64 ? k : 64;                     /* the kt best d, ascending */
+    for(int i=0;i<m;i++){ float d=t[i].d;
+        if(v->dead && v->dead[t[i].id]) continue;
+        if(nt==kt && d>=top[nt-1]) continue;
+        int j = nt<kt ? nt++ : nt-1; while(j>0 && top[j-1]>d){ top[j]=top[j-1]; j--; } top[j]=d; }
+    if(nt<2) return;
+    const float tol = sqrtf(fdot(v->dim,qf,qf)) * (4e-6f + 1e-6f*sqrtf((float)v->dim));
+    float lim;
+    if(k<=64){ int any=0; lim=top[nt-1]+tol;                                  /* nothing close at the top or at the edge: done */
+        for(int i=1;i<nt && !any;i++) any = top[i]-top[i-1] < tol;
+        if(!any){ int c=0; for(int i=0;i<m && c<=nt;i++) c += t[i].d<=lim; if(c<=nt) return; } }
+    else { lim=t[0].d; for(int i=1;i<m;i++) if(t[i].d>lim) lim=t[i].d; }        /* a large k: every row is looked at */
+    int c=0; for(int i=0;i<m;i++) c += t[i].d<=lim;
+    KvDs *ds=malloc(sizeof(KvDs)*(size_t)(c?c:1)); if(!ds) return;
+    c=0; for(int i=0;i<m;i++) if(t[i].d<=lim){ ds[c].f=t[i].d; ds[c].at=(uint32_t)i; c++; }
+    qsort(ds,(size_t)c,sizeof(KvDs),kv_ds_cmp_f);
+    if(c>KV_RF_MAX) c=KV_RF_MAX;
+    for(int a=0;a<c;){ int b=a+1; while(b<c && ds[b].f-ds[b-1].f<tol) b++;
+        if(b-a>1){ float fv[64], *f = b-a<=64 ? fv : malloc(sizeof(float)*(size_t)(b-a));
+            if(f){ for(int i=a;i<b;i++){ f[i-a]=ds[i].f; ds[i].d=kv_dscore(v,qf,t[ds[i].at].id); }
+                qsort(ds+a,(size_t)(b-a),sizeof(KvDs),kv_ds_cmp_d);
+                { int top = b-a-1; if(top>k) top=k; if(top>32) top=32;
+                  for(int i=top-1;i>=0;i--){ float lo=nextafterf(f[i+1], -INFINITY); if(f[i]>lo) f[i]=lo; } }
+                for(int i=a;i<b;i++) t[ds[i].at].d=f[i-a];
+                if(f!=fv) free(f); } }
+        a=b; }
+    free(ds);
+}
 static inline uint16_t kv_f2h(float f){
     uint32_t x; memcpy(&x,&f,4); uint32_t sg=(x>>16)&0x8000u, m=x&0x7FFFFFu; int e=(int)((x>>23)&0xFF)-127+15;
     if(e>=31) return (uint16_t)(sg | 0x7C00u | (((x>>23)&0xFF)==0xFF && m ? 0x200u : 0));   /* too large / inf / NaN */
@@ -1648,6 +1709,7 @@ static int kv_jg_search(KciVecSearcher *s, const float *query, int k, uint64_t *
     kv_jg_qlen(v, query, &qn2, &qlen);
     int w = kv_jg_signs(v, s->s.tmp, m, g->k, g->ef0, qn2, qlen, f)==0 ? g->width[kv_jg_class(g, kv_jg_est(g, f))] : g->wmax;
     if(w>g->ef0) m=kv_jg_more(s, w);
+    kv_refine_close(v, s->qf, s->s.tmp, m, k);
     return emit_topk(v, s->s.tmp, m, k, 1.0f, out_ids, out_scores);
 }
 
@@ -1676,6 +1738,7 @@ static int kv_search_rerank_(KciVecSearcher *s, const float *query, int k, int e
     { size_t rb=(size_t)v->dim*sizeof(float);
       for(int i=0;i<m;i++){ const char *p=(const char*)(v->vf + (size_t)t[i].id*v->dim); for(size_t o=0;o<rb;o+=64) __builtin_prefetch(p+o); } }
     for(int i=0;i<m;i++) t[i].d = -fdot(v->dim, s->qf, v->vf + (size_t)t[i].id*v->dim);
+    kv_refine_close(v, s->qf, t, m, k);
     return emit_topk(v, t, m, k, 1.0f, out_ids, out_scores);   /* top-k live by float score */
 }
 
@@ -1741,7 +1804,8 @@ static int kv_search_filtered_(KciVecSearcher *s, const float *query, int k, int
     else m = search_collect_filtered(v, s->q, ef, &s->s, filt, ctx, budget);
     He *t=s->s.tmp;
     if(reranked){ if(v->vh) for(int i=0;i<m;i++) t[i].d = -hdot(v->dim, s->qf, v->vh + (size_t)t[i].id*v->dim);
-                  else for(int i=0;i<m;i++) t[i].d = -fdot(v->dim, s->qf, v->vf + (size_t)t[i].id*v->dim); }
+                  else { for(int i=0;i<m;i++) t[i].d = -fdot(v->dim, s->qf, v->vf + (size_t)t[i].id*v->dim);
+                         kv_refine_close(v, s->qf, t, m, k); } }
     float invgs2 = (v->gs>0) ? 1.0f/(v->gs*v->gs) : 1.0f;
     int no=0;
     for(int slot=0; slot<m && no<k; slot++){
@@ -2718,6 +2782,7 @@ static int kv_search_ivf_(KciVecSearcher *ks, const float *query, int k, int npr
     { size_t rb=(size_t)D*sizeof(float);
       for(int i=0;i<m;i++){ const char *p=(const char*)(v->vf+(size_t)t[i].id*D); for(size_t o=0;o<rb;o+=64) __builtin_prefetch(p+o); } }
     for(int i=0;i<m;i++) t[i].d=-fdot(D, q, v->vf+(size_t)t[i].id*D);
+    kv_refine_close(v, q, t, m, k);
     return emit_topk(v, t, m, k, 1.0f, out_ids, out_scores);
 }
 
@@ -3232,10 +3297,11 @@ static int kv_search_exact_(KciVec *v, const float *query, int k, int threads, K
     if(usef) l2norm(v->dim, query, tmp); else enc_query(v, query, tmp, q);
     int T = default_threads(threads);
     if((uint32_t)T > v->count) T = 1;
+    const int kk = (usef && v->vf && k <= 1<<20) ? k+1024 : k;
     pthread_t th[64]; ExactJob jobs[64];
     uint32_t per = v->count / T;
     for(int t=0;t<T;t++){
-        jobs[t].v=v; jobs[t].q=q; jobs[t].qf=usef?tmp:NULL; jobs[t].k=k; jobs[t].filt=filt; jobs[t].fctx=fctx;
+        jobs[t].v=v; jobs[t].q=q; jobs[t].qf=usef?tmp:NULL; jobs[t].k=kk; jobs[t].filt=filt; jobs[t].fctx=fctx;
         jobs[t].lo = (uint32_t)t*per;
         jobs[t].hi = (t==T-1)? v->count : (uint32_t)(t+1)*per;
         if(t<T-1) pthread_create(&th[t],NULL,exact_worker,&jobs[t]);
@@ -3243,16 +3309,21 @@ static int kv_search_exact_(KciVec *v, const float *query, int k, int threads, K
     exact_worker(&jobs[T-1]);
     for(int t=0;t<T-1;t++) pthread_join(th[t],NULL);
     /* merge per-thread heaps into a global top-k */
-    Heap g; hp_init(&g, k, 0);
+    Heap g; hp_init(&g, kk, 0);
     for(int t=0;t<T;t++) for(int i=0;i<jobs[t].h.n;i++){
         He e=jobs[t].h.a[i];
-        if(g.n<k) hp_push(&g, e.d, e.id);
+        if(g.n<kk) hp_push(&g, e.d, e.id);
         else if(e.d>hp_top(&g).d){ hp_pop(&g); hp_push(&g, e.d, e.id); }
     }
     int total=g.n;
     /* extract ascending then reverse → best (largest score) first */
     He *arr=malloc(sizeof(He)*total);
     for(int i=total-1;i>=0;i--){ arr[i]=hp_top(&g); hp_pop(&g); }
+    if(kk>k){ for(int i=0;i<total;i++) arr[i].d=-arr[i].d;
+        kv_refine_close(v, tmp, arr, total, k);
+        for(int i=1;i<total;i++){ He x=arr[i]; int j=i; while(j>0 && arr[j-1].d>x.d){ arr[j]=arr[j-1]; j--; } arr[j]=x; }   /* nearly sorted already */
+        for(int i=0;i<total;i++) arr[i].d=-arr[i].d;
+        if(total>k) total=k; }
     for(int i=0;i<total;i++){ out_ids[i]=v->vid[arr[i].id]; if(out_scores) out_scores[i]=arr[i].d; }
     free(arr); free(g.a);
     for(int t=0;t<T;t++) free(jobs[t].h.a);
@@ -4501,6 +4572,7 @@ static int kv_search_learned_(KciVecSearcher *s, const float *uq, const float *q
         if(ef<0){                                        /* ... and scored exactly */
             for(int i=0;i<hn;i++) __builtin_prefetch(v->vf+(size_t)h[i].id*dim);
             for(int i=0;i<hn;i++) h[i].d=-fdot(dim, s->qf, v->vf+(size_t)h[i].id*dim);
+            kv_refine_close(v, s->qf, h, hn, k);
             return emit_topk(v, h, hn, k, 1.0f, out_ids, out_scores); }
         if((size_t)s->lseedcap<(size_t)hn){ uint32_t *nb=realloc(s->lseed,((size_t)hn+64)*sizeof(uint32_t)); if(!nb) return -1; s->lseed=nb; s->lseedcap=hn+64; }
         for(int i=0;i<hn;i++) s->lseed[i]=h[i].id;
@@ -4512,6 +4584,7 @@ static int kv_search_learned_(KciVecSearcher *s, const float *uq, const float *q
         for(int i=0;i<ns;i++){ uint32_t r=s->lseed[i];
             if(i+4<ns) __builtin_prefetch(v->vf+(size_t)s->lseed[i+4]*dim);
             t[i].id=r; t[i].d=-fdot(dim, s->qf, v->vf+(size_t)r*dim); }
+        kv_refine_close(v, s->qf, t, ns, k);
         return emit_topk(v, t, ns, k, 1.0f, out_ids, out_scores); }
     if(!v->built) return -1;                             /* seeds for the graph */
     s->s.seeds=s->lseed; s->s.nseeds=ns;
@@ -4653,6 +4726,7 @@ static int kv_search_voted_(KciVecSearcher *s, const float *query, const float *
                 h[j].d=sc; h[j].id=r; } } }
     for(int i=0;i<hn;i++) __builtin_prefetch(v->vf+(size_t)h[i].id*dim);
     for(int i=0;i<hn;i++) h[i].d=-fdot(dim, s->qf, v->vf+(size_t)h[i].id*dim);
+    kv_refine_close(v, s->qf, h, hn, k);
     int r=emit_topk(v, h, hn, k, 1.0f, out_ids, out_scores);
     if(t) kv_l2_scores(v, r, out_scores, qn2);
     return r;
